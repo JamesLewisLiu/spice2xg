@@ -1,0 +1,219 @@
+#include "window.h"
+#include "cfg/configurator.h"
+#include "util/logging.h"
+#include "games/io.h"
+#include "misc/eamuse.h"
+#include "external/imgui/imgui_internal.h"
+
+
+overlay::Window::Window(SpiceOverlay *overlay) : overlay(overlay) {
+}
+
+overlay::Window::~Window() {
+
+    // kill children
+    for (auto &child : this->children) {
+        delete child;
+    }
+}
+
+void overlay::Window::update() {
+
+    // check if toggle is enabled
+    if (this->toggle_button != ~0u) {
+
+        // get state
+        auto overlay_buttons = games::get_buttons_overlay(eamuse_get_game());
+        bool toggle_button_new = overlay_buttons
+                && this->overlay->hotkeys_triggered()
+                && GameAPI::Buttons::getState(RI_MGR, overlay_buttons->at(this->toggle_button));
+        if (toggle_button_new && !this->toggle_button_state) {
+
+            // if the overlay is hidden just reactivate it
+            if (!this->overlay->get_active()) {
+
+                // but don't let the main menu occlude it if it was previously visible
+                if (this->overlay->window_main_menu) {
+                    this->overlay->window_main_menu->set_active(false);
+                }
+
+                this->active = true;
+                this->overlay->set_active(true);
+            } else {
+                this->toggle_active();
+            }
+
+            // raise to the top, but only because the user pressed the hotkey and
+            // the window is now visible
+            if (this->active) {
+                this->bring_to_front();
+            }
+        }
+        this->toggle_button_state = toggle_button_new;
+    }
+
+    // update children
+    auto it = this->children.begin();
+    while (it != this->children.end()) {
+        (*it)->update();
+        if ((*it)->active) {
+            it++;
+        } else {
+            delete (*it);
+            this->children.erase(it);
+        }
+    }
+}
+
+void overlay::Window::build() {
+
+    // check if active
+    if (!this->active) {
+        this->mouse_hovered = false;
+        return;
+    }
+
+    if (this->draws_window) {
+
+        // automatic max window size
+        if (!cfg::CONFIGURATOR_STANDALONE && (size_max.x < 0 || size_max.y < 0)) {
+            auto &display_size = ImGui::GetIO().DisplaySize;
+            ImVec2 size_max_auto(display_size.x - 100, display_size.y - 100);
+            ImGui::SetNextWindowSizeConstraints(size_min, size_max_auto, resize_callback);
+        } else {
+            ImGui::SetNextWindowSizeConstraints(size_min, size_max, resize_callback);
+        }
+
+        // background alpha
+        if (this->bg_alpha != 1.f) {
+            ImGui::SetNextWindowBgAlpha(this->bg_alpha);
+        }
+
+        if (this->remove_window_padding) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        }
+
+        const bool custom_window_padding =
+            !this->remove_window_padding && this->window_padding.x >= 0.f;
+        if (custom_window_padding) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, this->window_padding);
+        }
+
+        // create window
+        // NoFocusOnAppearing: when the overlay is re-shown every window reappears at
+        // once and ImGui would auto-focus whichever is submitted last, stealing the
+        // top spot. suppress that so only an explicit focus request (see below)
+        // decides what comes to the front.
+        const std::string window_id = this->title + "###" + to_string(this);
+        const bool build_contents = ImGui::Begin(
+                window_id.c_str(),
+                &this->active,
+                this->flags | ImGuiWindowFlags_NoFocusOnAppearing);
+
+        // keep the window hovered while its invisible input button is held during a drag
+        this->mouse_hovered =
+            ImGui::IsWindowHovered(
+                ImGuiHoveredFlags_RootAndChildWindows |
+                ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+        if (build_contents) {
+
+            // window attributes - init_pos / init_size are only honored once
+            // (ImGuiCond_Once), so compute them a single time instead of every frame
+            if (!this->initial_window_calculated) {
+                this->initial_window_calculated = true;
+                this->calculate_initial_window();
+            }
+            ImGui::SetWindowPos(this->init_pos, ImGuiCond_Once);
+            ImGui::SetWindowSize(this->init_size, ImGuiCond_Once);
+
+            // add content
+            this->build_content();
+
+            // build children
+            for (auto &child : this->children) {
+                child->build();
+            }
+        }
+        // end window
+        ImGui::End();
+
+        // apply an explicit focus request now that the window exists. FocusWindow
+        // with UnlessBelowModal raises it to the front, but keeps it right below
+        // any blocking popup/modal instead of jumping in front of it (this also
+        // re-orders brand-new windows that ImGui places on top by default).
+        if (this->request_focus) {
+            this->request_focus = false;
+            if (ImGuiWindow *w = ImGui::FindWindowByName(window_id.c_str())) {
+                ImGui::FocusWindow(w, ImGuiFocusRequestFlags_UnlessBelowModal);
+            }
+        }
+
+        if (this->remove_window_padding) {
+            ImGui::PopStyleVar();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleVar();
+        }
+
+        if (custom_window_padding) {
+            ImGui::PopStyleVar();
+        }
+
+    } else {
+
+        // raw content does not have an ImGui window to hover
+        this->mouse_hovered = false;
+
+        // add raw content
+        this->build_content();
+    }
+}
+
+void overlay::Window::toggle_active() {
+
+    // flip bool
+    this->active = !this->active;
+
+    // update children
+    for (auto &child : this->children) {
+        child->toggle_active();
+    }
+}
+
+void overlay::Window::set_active(bool active) {
+
+    // toggle if different
+    if (this->get_active() != active) {
+
+        // flip bool
+        this->active = !this->active;
+
+        // update children
+        for (auto &child : this->children) {
+            child->set_active(this->active);
+        }
+    }
+}
+
+void overlay::Window::bring_to_front() {
+    this->request_focus = true;
+}
+
+bool overlay::Window::get_active() {
+
+    // check for active children
+    for (auto &child : this->children) {
+        if (child->get_active()) {
+            return true;
+        }
+    }
+
+    // now it depends on us
+    return this->active;
+}
+
+bool overlay::Window::is_mouse_hovered() {
+    return this->mouse_hovered;
+}

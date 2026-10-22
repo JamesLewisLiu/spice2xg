@@ -1,0 +1,1575 @@
+#include "d3d9_backend.h"
+
+#include <atomic>
+#include <cassert>
+#include <memory>
+#include <thread>
+#include <vector>
+
+#include <d3d9.h>
+
+#include "avs/game.h"
+#include "cfg/screen_resize.h"
+#include "games/gitadora/gitadora.h"
+#include "games/iidx/iidx.h"
+#include "games/popn/popn.h"
+#include "games/sdvx/sdvx.h"
+#include "games/mfc/mfc.h"
+#include "hooks/graphics/graphics.h"
+#include "launcher/launcher.h"
+#include "launcher/options.h"
+#include "launcher/signal.h"
+#include "launcher/shutdown.h"
+#include "misc/wintouchemu.h"
+#include "overlay/overlay.h"
+#include "sdk/d3d9.h"
+#include "util/detour.h"
+#include "util/deferlog.h"
+#include "util/flags_helper.h"
+#include "util/libutils.h"
+#include "util/logging.h"
+#include "util/utils.h"
+#include "util/memutils.h"
+
+#include "d3d9_device.h"
+#include "d3d9_screenshot.h"
+
+#ifdef min
+#undef min
+#endif
+
+#define D3D9_BACKEND_DEBUG 0
+
+#if D3D9_BACKEND_DEBUG
+#define log_debug(module, format_str, ...) logger::push( \
+    LOG_FORMAT("M", module, format_str, ## __VA_ARGS__), logger::Style::GREY)
+#else
+#define log_debug(module, format_str, ...)
+#endif
+
+#define CHECK_RESULT(x) \
+    do { \
+        HRESULT __ret = (x); \
+        if (GRAPHICS_LOG_HRESULT && FAILED(__ret)) [[unlikely]] { \
+            log_warning("graphics::d3d9", "{} failed, hr={}", __FUNCTION__, FMT_HRESULT(__ret)); \
+        } \
+        return __ret; \
+    } while (0)
+
+/*
+ * 9 on 12
+ */
+
+#define MAX_D3D9ON12_QUEUES 2
+typedef struct _D3D9ON12_ARGS {
+    BOOL Enable9On12;
+    IUnknown *pD3D12Device;
+    IUnknown *ppD3D12Queues[MAX_D3D9ON12_QUEUES];
+    UINT NumQueues;
+    UINT NodeMask;
+} D3D9ON12_ARGS;
+
+typedef HRESULT (WINAPI *Direct3DCreate9On12Ex_t)(
+        UINT SDKVersion, D3D9ON12_ARGS *pOverrideList,
+        UINT NumOverrideEntries, IDirect3D9Ex** ppOutputInterface);
+typedef IDirect3D9* (WINAPI *Direct3DCreate9On12_t)(
+        UINT SDKVersion, D3D9ON12_ARGS *pOverrideList, UINT NumOverrideEntries);
+
+// state
+static void *D3D9_DIRECT3D_CREATE9_ADR = nullptr;
+static char D3D9_DIRECT3D_CREATE9_CONTENTS[16];
+
+// settings
+std::optional<UINT> D3D9_ADAPTER = std::nullopt;
+DWORD D3D9_BEHAVIOR_DISABLE = 0;
+
+static decltype(Direct3DCreate9) *Direct3DCreate9_orig = nullptr;
+static decltype(Direct3DCreate9Ex) *Direct3DCreate9Ex_orig = nullptr;
+static Direct3DCreate9On12_t Direct3DCreate9On12_orig = nullptr;
+static Direct3DCreate9On12Ex_t Direct3DCreate9On12Ex_orig = nullptr;
+
+static bool ATTEMPTED_SUB_SWAP_CHAIN_ACQUIRE = false;
+static IDirect3DSwapChain9 *SUB_SWAP_CHAIN = nullptr;
+
+// main and subscreen presents may occur on different threads.
+static std::atomic_bool SUBSCREEN_PRESENTED_SINCE_LAST_MAIN = false;
+
+// do not mistake the fallback Present below for a game-originated Present.
+static thread_local bool SUBSCREEN_FORCE_REDRAW_IN_PROGRESS = false;
+
+static void graphics_d3d9_ldj_init_sub_screen(
+        IDirect3DDevice9Ex *device,
+        D3DPRESENT_PARAMETERS *present_params,
+        UINT gfdm_small_swapchain);
+
+static std::string behavior2s(DWORD behavior_flags) {
+    FLAGS_START(behavior_flags);
+    FLAG(behavior_flags, D3DCREATE_FPU_PRESERVE);
+    FLAG(behavior_flags, D3DCREATE_MULTITHREADED);
+    FLAG(behavior_flags, D3DCREATE_PUREDEVICE);
+    FLAG(behavior_flags, D3DCREATE_SOFTWARE_VERTEXPROCESSING);
+    FLAG(behavior_flags, D3DCREATE_HARDWARE_VERTEXPROCESSING);
+    FLAG(behavior_flags, D3DCREATE_MIXED_VERTEXPROCESSING);
+    FLAG(behavior_flags, D3DCREATE_DISABLE_DRIVER_MANAGEMENT);
+    FLAG(behavior_flags, D3DCREATE_ADAPTERGROUP_DEVICE);
+    FLAG(behavior_flags, D3DCREATE_DISABLE_DRIVER_MANAGEMENT_EX);
+    FLAG(behavior_flags, D3DCREATE_NOWINDOWCHANGES);
+    FLAG(behavior_flags, D3DCREATE_DISABLE_PSGP_THREADING);
+    FLAG(behavior_flags, D3DCREATE_ENABLE_PRESENTSTATS);
+    FLAG(behavior_flags, D3DCREATE_DISABLE_PRINTSCREEN);
+    FLAG(behavior_flags, D3DCREATE_SCREENSAVER);
+    FLAGS_END(behavior_flags);
+}
+
+static std::string format2s(D3DFORMAT format) {
+    switch (format) {
+        ENUM_VARIANT(D3DFMT_UNKNOWN);
+        ENUM_VARIANT(D3DFMT_R8G8B8);
+        ENUM_VARIANT(D3DFMT_A8R8G8B8);
+        ENUM_VARIANT(D3DFMT_X8R8G8B8);
+        ENUM_VARIANT(D3DFMT_R5G6B5);
+        ENUM_VARIANT(D3DFMT_X1R5G5B5);
+        ENUM_VARIANT(D3DFMT_A1R5G5B5);
+        ENUM_VARIANT(D3DFMT_A4R4G4B4);
+        ENUM_VARIANT(D3DFMT_R3G3B2);
+        ENUM_VARIANT(D3DFMT_A8);
+        ENUM_VARIANT(D3DFMT_A8R3G3B2);
+        ENUM_VARIANT(D3DFMT_X4R4G4B4);
+        ENUM_VARIANT(D3DFMT_A2B10G10R10);
+        ENUM_VARIANT(D3DFMT_A8B8G8R8);
+        ENUM_VARIANT(D3DFMT_X8B8G8R8);
+        ENUM_VARIANT(D3DFMT_G16R16);
+        ENUM_VARIANT(D3DFMT_A2R10G10B10);
+        ENUM_VARIANT(D3DFMT_A16B16G16R16);
+        ENUM_VARIANT(D3DFMT_A8P8);
+        ENUM_VARIANT(D3DFMT_P8);
+        ENUM_VARIANT(D3DFMT_L8);
+        ENUM_VARIANT(D3DFMT_A8L8);
+        ENUM_VARIANT(D3DFMT_A4L4);
+        ENUM_VARIANT(D3DFMT_V8U8);
+        ENUM_VARIANT(D3DFMT_L6V5U5);
+        ENUM_VARIANT(D3DFMT_X8L8V8U8);
+        ENUM_VARIANT(D3DFMT_Q8W8V8U8);
+        ENUM_VARIANT(D3DFMT_V16U16);
+        ENUM_VARIANT(D3DFMT_A2W10V10U10);
+        ENUM_VARIANT(D3DFMT_UYVY);
+        ENUM_VARIANT(D3DFMT_YUY2);
+        ENUM_VARIANT(D3DFMT_DXT1);
+        ENUM_VARIANT(D3DFMT_DXT2);
+        ENUM_VARIANT(D3DFMT_DXT3);
+        ENUM_VARIANT(D3DFMT_DXT4);
+        ENUM_VARIANT(D3DFMT_DXT5);
+        ENUM_VARIANT(D3DFMT_MULTI2_ARGB8);
+        ENUM_VARIANT(D3DFMT_G8R8_G8B8);
+        ENUM_VARIANT(D3DFMT_R8G8_B8G8);
+        ENUM_VARIANT(D3DFMT_D16_LOCKABLE);
+        ENUM_VARIANT(D3DFMT_D32);
+        ENUM_VARIANT(D3DFMT_D15S1);
+        ENUM_VARIANT(D3DFMT_D24S8);
+        ENUM_VARIANT(D3DFMT_D24X8);
+        ENUM_VARIANT(D3DFMT_D24X4S4);
+        ENUM_VARIANT(D3DFMT_D16);
+        ENUM_VARIANT(D3DFMT_L16);
+        ENUM_VARIANT(D3DFMT_D32F_LOCKABLE);
+        ENUM_VARIANT(D3DFMT_D24FS8);
+        ENUM_VARIANT(D3DFMT_D32_LOCKABLE);
+        ENUM_VARIANT(D3DFMT_S8_LOCKABLE);
+        ENUM_VARIANT(D3DFMT_VERTEXDATA);
+        ENUM_VARIANT(D3DFMT_INDEX16);
+        ENUM_VARIANT(D3DFMT_INDEX32);
+        ENUM_VARIANT(D3DFMT_Q16W16V16U16);
+        ENUM_VARIANT(D3DFMT_R16F);
+        ENUM_VARIANT(D3DFMT_G16R16F);
+        ENUM_VARIANT(D3DFMT_A16B16G16R16F);
+        ENUM_VARIANT(D3DFMT_R32F);
+        ENUM_VARIANT(D3DFMT_G32R32F);
+        ENUM_VARIANT(D3DFMT_A32B32G32R32F);
+        ENUM_VARIANT(D3DFMT_CxV8U8);
+        ENUM_VARIANT(D3DFMT_A1);
+        ENUM_VARIANT(D3DFMT_A2B10G10R10_XR_BIAS);
+        ENUM_VARIANT(D3DFMT_BINARYBUFFER);
+        default:
+            return fmt::to_string(static_cast<uint32_t>(format));
+    }
+}
+
+static std::string presentation_interval2s(UINT presentation_interval) {
+    FLAGS_START(presentation_interval);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_DEFAULT);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_ONE);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_TWO);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_THREE);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_FOUR);
+    FLAG(presentation_interval, D3DPRESENT_INTERVAL_IMMEDIATE);
+    FLAGS_END(presentation_interval);
+}
+
+static void update_backbuffer_dimensions(D3DPRESENT_PARAMETERS *params);
+
+static void log_create_device_failure(HRESULT hresult) {
+    // only print once since some games will try CreateDevice multiple times on failure
+    static std::once_flag printed;
+    std::call_once(printed, [hresult]() {
+        // special case for popn
+        if (avs::game::is_model("M39")) {
+            deferredlogs::defer_error_messages({
+                fmt::format("D3D9 CreateDevice/CreateDeviceEx failed with {:#x}!", (UINT)hresult),
+                "    possible popn music HD mode resolution issue",
+                "    popn HD mode launches at 1360x768 (and NOT 1366x768) which is often",
+                "    unsupported by many monitors; here are some possible workarounds:",
+                "      * enable GPU resolution scaling in your GPU settings",
+                "      * use Force Full Screen Resolution option, combined with image scaling (F11)",
+                "      * run in windowed mode",
+                "      * run in SD mode"
+            });
+        } else {
+            deferredlogs::defer_error_messages({
+                fmt::format("D3D9 CreateDevice/CreateDeviceEx failed with {:#x}!", (UINT)hresult),
+                "    this is a common graphics / monitor issue",
+                "    * double check any graphics options you configured in spicecfg",
+                "    * double check that your monitor supports the resolution + refresh rate",
+                "          combination that the game requires",
+                "    * enable GPU-side resolution scaling in your GPU options as needed",
+                "    * if you have three or more monitors, try unplugging them down to one or two,",
+                "          or enable -graphics-force-single-adapter option",
+                "    * failing all that, see if enabling windowed mode helps"
+            });
+        }
+    });
+}
+
+static bool is_dx9_on_12_enabled() {
+    bool result = false;
+    switch (GRAPHICS_9_ON_12_STATE) {
+        case DX9ON12_FORCE_OFF:
+            log_info("graphics::d3d9", "DirectX 9on12: forced OFF by user (-dx9on12)");
+            result = false;
+            break;
+
+        case DX9ON12_FORCE_ON:
+            log_info("graphics::d3d9", "DirectX 9on12: forced ON by user (-9on12 or -dx9on12)");
+            result = true;
+            break;
+
+        case DX9ON12_AUTO:
+        default:
+            if (GRAPHICS_9_ON_12_REQUESTED_BY_GAME) {
+                log_info(
+                    "graphics::d3d9",
+                    "DirectX 9on12: enabled automatically for current game (tip: use -dx9on12 to force on or off)");
+                result = true;
+            } else {
+                log_info(
+                    "graphics::d3d9",
+                    "DirectX 9on12: disabled by default, using DX9 (tip: use -dx9on12 to force on or off)");
+                result = false;
+            }
+            break;
+    }
+
+    if (GRAPHICS_9_ON_12_STATE == DX9ON12_FORCE_ON) {
+        if (avs::game::is_model("LDJ") && avs::game::is_ext(2023091500, INT_MAX)) {
+            deferredlogs::defer_error_messages({
+                "dx9on12 was force enabled by user (-dx9on12)",
+                "    IIDX31+ is known to be incompatible with DX 9on12, leading to blank screen or crashes",
+                "    try again with -dx9on12 option set to default value"
+            });
+        } else {
+            deferredlogs::defer_error_messages({
+                "dx9on12 was force enabled by user (-dx9on12)",
+                "    not very game is compatible with this, and can lead to crashes",
+                "    try without force enabling this if you are seeing issues"
+            });
+        }
+    }
+
+    return result;
+}
+
+static IDirect3D9 *WINAPI Direct3DCreate9_hook(UINT SDKVersion) {
+    log_misc("graphics::d3d9", "Direct3DCreate9 hook hit");
+
+    // remove hook
+    if (D3D9_DIRECT3D_CREATE9_ADR) {
+        detour::inline_restore(D3D9_DIRECT3D_CREATE9_ADR, D3D9_DIRECT3D_CREATE9_CONTENTS);
+
+        if (Direct3DCreate9_orig == nullptr) {
+            Direct3DCreate9_orig = reinterpret_cast<decltype(Direct3DCreate9) *>(D3D9_DIRECT3D_CREATE9_ADR);
+        }
+    }
+
+    // create interface
+    IDirect3D9 *value;
+    if (is_dx9_on_12_enabled()) {
+        if (!Direct3DCreate9On12_orig) {
+            log_fatal("graphics::d3d9", "unable to find Direct3DCreate9On12");
+        } else {
+            D3D9ON12_ARGS args = {};
+            args.Enable9On12 = TRUE;
+            value = Direct3DCreate9On12_orig(SDKVersion, &args, 1);
+        }
+    } else {
+        value = Direct3DCreate9_orig(SDKVersion);
+    }
+    if (value == nullptr) {
+        log_warning("graphics::d3d9", "failed to create Direct3D interface for {}", SDKVersion);
+
+        return value;
+    }
+
+    value = new WrappedIDirect3D9(value);
+
+    // add hook
+    if (D3D9_DIRECT3D_CREATE9_ADR) {
+        detour::inline_noprotect((void *) Direct3DCreate9_hook, D3D9_DIRECT3D_CREATE9_ADR);
+    }
+
+    // return modified interface
+    return value;
+}
+
+static HRESULT WINAPI Direct3DCreate9Ex_hook(UINT SDKVersion, IDirect3D9Ex **d3d9ex) {
+    log_misc("graphics::d3d9", "Direct3DCreate9Ex hook hit");
+
+    // call original
+    HRESULT result;
+    if (is_dx9_on_12_enabled()) {
+        if (!Direct3DCreate9On12Ex_orig) {
+            log_fatal("graphics::d3d9", "unable to find Direct3DCreate9On12Ex");
+        } else {
+            D3D9ON12_ARGS args = {};
+            args.Enable9On12 = TRUE;
+            result = Direct3DCreate9On12Ex_orig(SDKVersion, &args, 1, d3d9ex);
+        }
+    } else {
+        result = Direct3DCreate9Ex_orig(SDKVersion, d3d9ex);
+    }
+    if (FAILED(result) || *d3d9ex == nullptr) {
+        log_warning("graphics::d3d9", "failed to create Direct3D interface for {}, hr={}",
+                SDKVersion,
+                FMT_HRESULT(result));
+
+        return result;
+    }
+
+    *d3d9ex = new WrappedIDirect3D9(*d3d9ex);
+
+    // return original result
+    return result;
+}
+
+void graphics_d3d9_init() {
+    log_info("graphics::d3d9", "initializing");
+
+    // DX9 inline hooks
+    HMODULE d3d9 = libutils::try_module("d3d9.dll");
+    if (!d3d9) {
+        log_info("graphics::d3d9", "skipping inline hooks");
+    } else {
+
+        // 9 on 12
+        Direct3DCreate9On12_orig = (Direct3DCreate9On12_t) libutils::try_proc(d3d9, "Direct3DCreate9On12");
+        Direct3DCreate9On12Ex_orig = (Direct3DCreate9On12Ex_t) libutils::try_proc(d3d9, "Direct3DCreate9On12Ex");
+
+        // inline hooks
+        D3D9_DIRECT3D_CREATE9_ADR = (void *) libutils::get_proc(d3d9, "Direct3DCreate9");
+        detour::inline_preserve(
+                reinterpret_cast<void *>(Direct3DCreate9_hook),
+                D3D9_DIRECT3D_CREATE9_ADR,
+                D3D9_DIRECT3D_CREATE9_CONTENTS);
+    }
+
+    // DX9 IAT hooks
+    Direct3DCreate9_orig = detour::iat_try("Direct3DCreate9", Direct3DCreate9_hook);
+    Direct3DCreate9Ex_orig = detour::iat_try("Direct3DCreate9Ex", Direct3DCreate9Ex_hook);
+}
+
+/*
+ * IUnknown
+ */
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::QueryInterface(
+        REFIID riid,
+        void **ppvObj)
+{
+    if (ppvObj == nullptr) {
+        return E_POINTER;
+    }
+
+    if ((riid == IID_IUnknown && gfdm_two_head_exclusive()) ||
+        riid == IID_WrappedIDirect3D9 ||
+        riid == IID_IDirect3D9 ||
+        riid == IID_IDirect3D9Ex)
+    {
+        // update to IDirect3DDevice9Ex interface
+        if (!is_d3d9ex && riid == IID_IDirect3D9Ex) {
+            IDirect3D9Ex *ex = nullptr;
+
+            HRESULT ret = pReal->QueryInterface(IID_PPV_ARGS(&ex));
+            if (FAILED(ret) || ex == nullptr) {
+                if (ret != E_NOINTERFACE) {
+                    log_warning("graphics::d3d9",
+                            "failed to upgrade to IDirect3DDevice9Ex, hr={}",
+                            FMT_HRESULT(ret));
+                }
+
+                return E_NOINTERFACE;
+            }
+
+            pReal->Release();
+            pReal = ex;
+            is_d3d9ex = true;
+        }
+
+        this->AddRef();
+        *ppvObj = this;
+
+        return S_OK;
+    }
+
+    return pReal->QueryInterface(riid, ppvObj);
+}
+
+ULONG STDMETHODCALLTYPE WrappedIDirect3D9::AddRef() {
+    return pReal->AddRef();
+}
+
+ULONG STDMETHODCALLTYPE WrappedIDirect3D9::Release() {
+    ULONG refs = this->pReal != nullptr ? this->pReal->Release() : 0;
+
+    if (refs == 0) {
+        delete this;
+    }
+
+    return refs;
+}
+
+/*
+ * IDirect3D9
+ */
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::RegisterSoftwareDevice(void *pInitializeFunction) {
+    CHECK_RESULT(pReal->RegisterSoftwareDevice(pInitializeFunction));
+}
+
+UINT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterCount() {
+    UINT result = pReal->GetAdapterCount();
+
+    if (gfdm_two_head_exclusive()) {
+        if (result == 2) {
+            FAKE_SUBSCREEN_ADAPTER = true;
+            return GFDM_LOGICAL_HEAD_COUNT;
+        }
+        log_warning(
+                "graphics::d3d9",
+                "two-head mode requires two native adapters; found {}",
+                result);
+        return result;
+    }
+
+    if (!FAKE_SUBSCREEN_ADAPTER) {
+        if (games::popn::is_pikapika_model() && result == 1) {
+            FAKE_SUBSCREEN_ADAPTER = true;
+            log_info(
+                "graphics::d3d9",
+                "GetAdapterCount returned {}, popn needs 2 adapters - enabling fake submonitor mode", result);
+            return 2;
+
+        } else if (games::gitadora::is_arena_model() && !GRAPHICS_WINDOWED && result < 4) {
+            FAKE_SUBSCREEN_ADAPTER = true;
+            log_info(
+                "graphics::d3d9",
+                "GetAdapterCount returned {}, gfdm needs 4 adapters - enabling fake submonitor mode", result);
+            return 4;
+        }
+    }
+    
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterIdentifier(
+        UINT Adapter,
+        DWORD Flags,
+        D3DADAPTER_IDENTIFIER9 *pIdentifier)
+{
+
+    if (is_fake_subscreen_adapter(Adapter) && pIdentifier) {
+        *pIdentifier = {};
+        const std::string adapter_name = fmt::format("\\\\.\\DISPLAY_SPICE_FAKE_{}", Adapter);
+        strcpy(pIdentifier->DeviceName, adapter_name.c_str()); 
+        log_misc(
+            "graphics::d3d9",
+            "GetAdapterIdentifier called for fake subscreen adapter {}: {}",
+            Adapter,
+            pIdentifier->DeviceName);
+        return S_OK;
+    }
+    
+    CHECK_RESULT(pReal->GetAdapterIdentifier(Adapter, Flags, pIdentifier));
+}
+
+UINT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterModeCount(UINT Adapter, D3DFORMAT Format) {
+    if (is_fake_subscreen_adapter(Adapter)) {
+        log_misc("graphics::d3d9", "GetAdapterModeCount called for fake subscreen adapter {}", Adapter);
+        return 1;
+    }
+
+    return pReal->GetAdapterModeCount(Adapter, Format);
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::EnumAdapterModes(
+        UINT Adapter,
+        D3DFORMAT Format,
+        UINT Mode,
+        D3DDISPLAYMODE *pMode)
+{
+    if (is_fake_subscreen_adapter(Adapter)) {
+        log_misc("graphics::d3d9", "EnumAdapterModes called for fake subscreen adapter {}", Adapter);
+        if (Mode == 0 && pMode) {
+            get_fake_subscreen_display_mode(Adapter, pMode);
+            return S_OK;
+        } else {
+            return D3DERR_INVALIDCALL;
+        }
+    }
+
+    HRESULT ret = pReal->EnumAdapterModes(Adapter, Format, Mode, pMode);
+
+    if (SUCCEEDED(ret) && pMode) {
+        /*
+        log_misc("graphics::d3d9", "IDirect3D9::EnumAdapterMode({}, {}, {}) => {}x{} @ {} Hz ({})",
+                Adapter,
+                format2s(Format),
+                Mode,
+                pMode->Width,
+                pMode->Height,
+                pMode->RefreshRate,
+                format2s(pMode->Format));
+                */
+
+        bool modified = false;
+        auto width = pMode->Width;
+        auto height = pMode->Height;
+        auto refresh = pMode->RefreshRate;
+
+        if (avs::game::is_model("LDJ")) {
+            if (Mode == 0 && games::iidx::TDJ_MODE) {
+                if (games::iidx::is_tdj_fhd()) {
+                    log_misc("graphics::d3d9", "overriding mode 0 to 1920x1080 @ 120 Hz (for TDJ FHD)");
+                    pMode->Width = 1920;
+                    pMode->Height = 1080;
+                    pMode->RefreshRate = 120;
+                    modified = true;
+                } else {
+                    log_misc("graphics::d3d9", "overriding mode 0 to 1280x720 @ 120 Hz (for TDJ HD)");
+                    pMode->Width = 1280;
+                    pMode->Height = 720;
+                    pMode->RefreshRate = 120;
+                    modified = true;
+                }
+            }
+
+            // For whatever reason, TDJ FHD mode prefers to pick lower (~60Hz) resolutions instead
+            // of 1080p@120Hz. Remove them here and try to force 120+ Hz.
+            if (!modified && games::iidx::is_tdj_fhd() && refresh < 110) {
+                if ((width == 1920 && height == 1080) ||
+                    (width == 1280 && height == 720)){
+                    log_debug(
+                        "graphics::d3d9", "removing mode {}, {}x{} @ {}Hz (for TDJ FHD)",
+                        Mode, width, height, refresh);
+                    memset(pMode, 0, sizeof(*pMode));
+                    modified = true;
+                }
+            }
+
+            // zero out display mode for bad entries
+            // - skip non-native resolutions
+            // - skip 75 and 90 Hz entries because LDJ game timing is messed up with it
+            //   (TDJ should be fine as it assumes a fixed 60 Hz timing)
+            if (!modified && (width == 1360 || width == 1366 || refresh == 75 || refresh == 90)) {
+                log_debug(
+                    "graphics::d3d9", "removing mode {}, {}x{} @ {}Hz (for LDJ/TDJ)",
+                    Mode, width, height, refresh);
+                memset(pMode, 0, sizeof(*pMode));
+                modified = true;
+            }
+
+            if (!modified && !games::iidx::TDJ_MODE && games::iidx::FORCE_720P && (height > 720)) {
+                log_debug(
+                    "graphics::d3d9", "removing mode {}, {}x{} @ {}Hz (-iidxforce720p)",
+                    Mode, width, height, refresh);
+                memset(pMode, 0, sizeof(*pMode));
+                modified = true;
+            }
+        }
+    }
+
+    CHECK_RESULT(ret);
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterDisplayMode(UINT Adapter, D3DDISPLAYMODE *pMode) {
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        if (pMode == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        get_fake_subscreen_display_mode(Adapter, pMode);
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->GetAdapterDisplayMode(Adapter, pMode));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CheckDeviceType(
+        UINT iAdapter,
+        D3DDEVTYPE DevType,
+        D3DFORMAT DisplayFormat,
+        D3DFORMAT BackBufferFormat,
+        BOOL bWindowed)
+{
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(iAdapter)) {
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->CheckDeviceType(iAdapter, DevType, DisplayFormat, BackBufferFormat, bWindowed));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CheckDeviceFormat(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        D3DFORMAT AdapterFormat,
+        DWORD Usage,
+        D3DRESOURCETYPE RType,
+        D3DFORMAT CheckFormat)
+{
+    if (is_fake_subscreen_adapter(Adapter)) {
+        log_misc("graphics::d3d9", "CheckDeviceFormat called for fake subscreen adapter {}", Adapter);
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->CheckDeviceFormat(Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CheckDeviceMultiSampleType(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        D3DFORMAT SurfaceFormat,
+        BOOL Windowed,
+        D3DMULTISAMPLE_TYPE MultiSampleType,
+        DWORD *pQualityLevels)
+{
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        if (pQualityLevels != nullptr) {
+            *pQualityLevels = 1;
+        }
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->CheckDeviceMultiSampleType(
+            Adapter,
+            DeviceType,
+            SurfaceFormat,
+            Windowed,
+            MultiSampleType,
+            pQualityLevels));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CheckDepthStencilMatch(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        D3DFORMAT AdapterFormat,
+        D3DFORMAT RenderTargetFormat,
+        D3DFORMAT DepthStencilFormat)
+{
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->CheckDepthStencilMatch(
+            Adapter,
+            DeviceType,
+            AdapterFormat,
+            RenderTargetFormat,
+            DepthStencilFormat));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CheckDeviceFormatConversion(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        D3DFORMAT SourceFormat,
+        D3DFORMAT TargetFormat)
+{
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(pReal->CheckDeviceFormatConversion(Adapter, DeviceType, SourceFormat, TargetFormat));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9 *pCaps) {
+    log_misc("graphics::d3d9", "IDirect3D9::GetDeviceCaps hook hit");
+
+    if (!pCaps) {
+        log_warning("graphics::d3d9", "NULL pointer passed in for required parameter");
+        return D3DERR_INVALIDCALL;
+    }
+
+    if (gfdm_two_head_exclusive() && Adapter < GFDM_LOGICAL_HEAD_COUNT) {
+        HRESULT ret = this->pReal->GetDeviceCaps(
+                Adapter >= 2 ? 0 : Adapter,
+                DeviceType,
+                pCaps);
+        if (SUCCEEDED(ret)) {
+            pCaps->NumberOfAdaptersInGroup =
+                    Adapter == 0 ? GFDM_LOGICAL_HEAD_COUNT : 0;
+            pCaps->MasterAdapterOrdinal = 0;
+            pCaps->AdapterOrdinalInGroup = Adapter;
+        }
+        return ret;
+    }
+
+    // SDVX uses `NumberOfAdaptersInGroup` to allocate a vector and the Microsoft documentation states:
+    // "The value will be 0 for a subordinate adapter of a multihead card. Each card can have at most one
+    // master, but may have many subordinates." Therefore, this must point to the master adapter.
+    if (Adapter == 0 && D3D9_ADAPTER.has_value()) {
+        Adapter = D3D9_ADAPTER.value();
+
+        // Get the master adapter ordinal
+        HRESULT result = this->pReal->GetDeviceCaps(Adapter, DeviceType, pCaps);
+        if (FAILED(result)) {
+            log_warning("graphics::d3d9", "GetDeviceCaps failed, hr={}", FMT_HRESULT(result));
+            return result;
+        }
+
+        // Now get the device caps for the master adapter
+        Adapter = pCaps->MasterAdapterOrdinal;
+    }
+
+    HRESULT ret = this->pReal->GetDeviceCaps(Adapter, DeviceType, pCaps);
+    if (FAILED(ret)) {
+        return ret;
+    }
+
+    if (avs::game::is_model("LDJ")) {
+        if (!GRAPHICS_WINDOWED) {
+            // use 2 so that the subscreen overlay can be drawn in full screen with single monitor
+            pCaps->NumberOfAdaptersInGroup = 2;
+        }
+        // in windowed mode, LDJ will always launch two windows, no special handling needed here
+    } else if (avs::game::is_model("KFC")) {
+        if (GRAPHICS_WINDOWED && GRAPHICS_PREVENT_SECONDARY_WINDOWS) {
+            // user wants windowed mode but does not want subscreen at all
+            pCaps->NumberOfAdaptersInGroup = 1;
+        } else {
+            // in both full screen and windowed mode, use 2 so that the game draws the subscreen
+            // (if this is 1, the game won't even draw the second window, causing subscreen overlay to not work)
+            pCaps->NumberOfAdaptersInGroup = 2;
+        }
+    } else if (avs::game::is_model({"NBT", "PAN"})) {
+        // beatstream, nostalgia
+        if (GRAPHICS_WINDOWED) {
+            pCaps->NumberOfAdaptersInGroup = std::min(pCaps->NumberOfAdaptersInGroup, 1u);
+        } else if (GRAPHICS_FORCE_SINGLE_ADAPTER) {
+            pCaps->NumberOfAdaptersInGroup = 1;
+        }
+    } else if (games::popn::is_pikapika_model()) {
+        pCaps->NumberOfAdaptersInGroup = 2;
+    }
+
+    return ret;
+}
+
+HMONITOR STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterMonitor(UINT Adapter) {
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        return pReal->GetAdapterMonitor(0);
+    }
+
+    return pReal->GetAdapterMonitor(Adapter);
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CreateDevice(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        HWND hFocusWindow,
+        DWORD BehaviorFlags,
+        D3DPRESENT_PARAMETERS *pPresentationParameters,
+        IDirect3DDevice9 **ppReturnedDeviceInterface)
+{
+    log_misc("graphics::d3d9", "IDirect3D9::CreateDevice hook hit ({}, {}, {}, {}, {}, {})",
+            Adapter,
+            static_cast<uint32_t>(DeviceType),
+            fmt::ptr(hFocusWindow),
+            behavior2s(BehaviorFlags),
+            fmt::ptr(pPresentationParameters),
+            fmt::ptr(ppReturnedDeviceInterface));
+
+    // check parameters
+    if (!pPresentationParameters || !ppReturnedDeviceInterface) {
+        log_warning("graphics::d3d9", "NULL pointer passed in for required parameter");
+        return D3DERR_INVALIDCALL;
+    }
+
+    DWORD orig_behavior_flags = BehaviorFlags;
+    size_t num_adapters = 1;
+
+    // behavior flags
+    if (D3D9_BEHAVIOR_DISABLE) {
+        BehaviorFlags &= ~D3D9_BEHAVIOR_DISABLE;
+    }
+
+    // when rendering via software, disable pure device
+    if (BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) {
+        BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
+    }
+
+    // override adapter used
+    if (D3D9_ADAPTER.has_value()) {
+        Adapter = D3D9_ADAPTER.value();
+    }
+
+    // get number of adapters for info dump
+    if (orig_behavior_flags & D3DCREATE_ADAPTERGROUP_DEVICE) {
+        D3DCAPS9 device_caps {};
+
+        if (SUCCEEDED(this->pReal->GetDeviceCaps(Adapter, DeviceType, &device_caps))) {
+            num_adapters = device_caps.NumberOfAdaptersInGroup;
+        }
+    }
+
+    // dump presentation parameters
+    for (size_t i = 0; i < num_adapters; i++) {
+        auto *params = &pPresentationParameters[i];
+        if (!GRAPHICS_WINDOWED && i == 0) {
+            GRAPHICS_FS_ORIGINAL_WIDTH = params->BackBufferWidth;
+            GRAPHICS_FS_ORIGINAL_HEIGHT = params->BackBufferHeight;
+            log_misc("graphics::d3d9", "original resolution: {}x{}", GRAPHICS_FS_ORIGINAL_WIDTH, GRAPHICS_FS_ORIGINAL_HEIGHT);
+            if (GRAPHICS_FS_CUSTOM_RESOLUTION.has_value()) {
+                log_misc(
+                    "graphics::d3d9",
+                    "use custom resolution {}x{} => {}x{}",
+                    params->BackBufferWidth, params->BackBufferHeight,
+                    GRAPHICS_FS_CUSTOM_RESOLUTION.value().first,
+                    GRAPHICS_FS_CUSTOM_RESOLUTION.value().second);
+                params->BackBufferWidth = GRAPHICS_FS_CUSTOM_RESOLUTION.value().first;
+                params->BackBufferHeight = GRAPHICS_FS_CUSTOM_RESOLUTION.value().second;
+            } else if (GRAPHICS_FS_ORIENTATION_SWAP) {
+                log_misc(
+                    "graphics::d3d9",
+                    "swap full orientation {}x{} => {}x{}",
+                    params->BackBufferWidth, params->BackBufferHeight,
+                    params->BackBufferHeight, params->BackBufferWidth);
+                std::swap(params->BackBufferWidth, params->BackBufferHeight);
+            }
+        }
+
+        log_info("graphics::d3d9",
+                "D3D9 presentation parameters for adapter {}: BackBufferWidth: {}, BackBufferHeight: {}, "
+                "Format: {}, BackBufferCount: {}, MultiSampleType: {}, MultiSampleQuality: {}, "
+                "SwapEffect: {}, Windowed: {}, EnableAutoDepthStencil: {}, AutoDepthStencilFormat: {}, "
+                "Flags: {}, FullScreen_RefreshRateInHz: {}, PresentationInterval: {}",
+                i,
+                params->BackBufferWidth,
+                params->BackBufferHeight,
+                format2s(params->BackBufferFormat),
+                params->BackBufferCount,
+                static_cast<uint32_t>(params->MultiSampleType),
+                params->MultiSampleQuality,
+                static_cast<uint32_t>(params->SwapEffect),
+                params->Windowed,
+                params->EnableAutoDepthStencil,
+                format2s(params->AutoDepthStencilFormat),
+                params->Flags,
+                params->FullScreen_RefreshRateInHz,
+                presentation_interval2s(params->PresentationInterval));
+    }
+
+    // set windowed
+    if (GRAPHICS_WINDOWED) {
+        pPresentationParameters->Windowed = true;
+        pPresentationParameters->FullScreen_RefreshRateInHz = 0;
+        update_backbuffer_dimensions(pPresentationParameters);
+
+    } else if (GRAPHICS_FORCE_REFRESH > 0) {
+        log_info("graphics::d3d9", "force refresh rate: {} => {} Hz (-graphics-force-refresh option)",
+                pPresentationParameters->FullScreen_RefreshRateInHz,
+                GRAPHICS_FORCE_REFRESH);
+
+        pPresentationParameters->FullScreen_RefreshRateInHz = GRAPHICS_FORCE_REFRESH;
+
+    } else if (pPresentationParameters->FullScreen_RefreshRateInHz == 0) {
+        log_warning(
+            "graphics::d3d9",
+            "This game sets FullScreen_RefreshRateInHz to 0, which means it will boot with whatever "
+            "refresh rate you have set in the desktop. If the game is launching at the wrong Hz, "
+            "either use -graphics-force-refresh option or change the desktop resolution beforehand.");
+    }
+
+    if (!GRAPHICS_WINDOWED && num_adapters >= 2
+            && GRAPHICS_FORCE_REFRESH_SUB.has_value()) {
+        log_info("graphics::d3d9", "force sub refresh rate: {} => {} Hz (-graphics-force-refresh-sub option)",
+                pPresentationParameters[1].FullScreen_RefreshRateInHz,
+                GRAPHICS_FORCE_REFRESH_SUB.value());
+
+        pPresentationParameters[1].FullScreen_RefreshRateInHz = GRAPHICS_FORCE_REFRESH_SUB.value();
+    }
+
+    // force single adapter
+    if (GRAPHICS_FORCE_SINGLE_ADAPTER) {
+        log_info("graphics::d3d9", "disabling adapter group device with force single adapter mode");
+
+        D3D9_BEHAVIOR_DISABLE |= D3DCREATE_ADAPTERGROUP_DEVICE;
+        BehaviorFlags &= ~D3DCREATE_ADAPTERGROUP_DEVICE;
+    }
+
+    if (GRAPHICS_FORCE_VSYNC_BUFFER.has_value()) {
+        log_info("graphics::d3d9", "force BackBufferCount: {} => {}",
+            pPresentationParameters->BackBufferCount,
+            GRAPHICS_FORCE_VSYNC_BUFFER.value());
+        pPresentationParameters->BackBufferCount = GRAPHICS_FORCE_VSYNC_BUFFER.value();
+    }
+
+    // call original
+    HRESULT ret = this->pReal->CreateDevice(
+            Adapter,
+            DeviceType,
+            hFocusWindow,
+            BehaviorFlags,
+            pPresentationParameters,
+            ppReturnedDeviceInterface);
+
+    // check for error
+    if (ret != D3D_OK) {
+
+        // log error
+        log_info("graphics::d3d9", "IDirect3D9::CreateDevice failed, hr={}", FMT_HRESULT(ret));
+        log_create_device_failure(ret);
+    } else if (!D3D9_DEVICE_HOOK_DISABLE) {
+        graphics_hook_window(hFocusWindow, pPresentationParameters);
+
+        auto *wrapped = new WrappedIDirect3DDevice9(
+                hFocusWindow,
+                *ppReturnedDeviceInterface);
+
+        wrapped->device_multithreaded = (BehaviorFlags & D3DCREATE_MULTITHREADED) != 0;
+        *ppReturnedDeviceInterface = wrapped;
+    }
+
+    // return result
+    return ret;
+}
+
+/*
+ * IDirect3D9Ex
+ */
+
+UINT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterModeCountEx(UINT Adapter, const D3DDISPLAYMODEFILTER *pFilter) {
+    assert(is_d3d9ex);
+
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        return 1;
+    }
+
+    return static_cast<IDirect3D9Ex *>(pReal)->GetAdapterModeCountEx(Adapter, pFilter);
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::EnumAdapterModesEx(
+        UINT Adapter,
+        const D3DDISPLAYMODEFILTER *pFilter,
+        UINT Mode,
+        D3DDISPLAYMODEEX *pMode)
+{
+    assert(is_d3d9ex);
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        if (Mode != 0 || pMode == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        get_fake_subscreen_display_mode_ex(Adapter, pMode);
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(static_cast<IDirect3D9Ex *>(pReal)->EnumAdapterModesEx(Adapter, pFilter, Mode, pMode));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterDisplayModeEx(
+        UINT Adapter,
+        D3DDISPLAYMODEEX *pMode,
+        D3DDISPLAYROTATION *pRotation)
+{
+    assert(is_d3d9ex);
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        if (pMode == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        get_fake_subscreen_display_mode_ex(Adapter, pMode);
+        if (pRotation != nullptr) {
+            *pRotation = D3DDISPLAYROTATION_IDENTITY;
+        }
+        return D3D_OK;
+    }
+
+    CHECK_RESULT(static_cast<IDirect3D9Ex *>(pReal)->GetAdapterDisplayModeEx(Adapter, pMode, pRotation));
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::CreateDeviceEx(
+        UINT Adapter,
+        D3DDEVTYPE DeviceType,
+        HWND hFocusWindow,
+        DWORD BehaviorFlags,
+        D3DPRESENT_PARAMETERS *pPresentationParameters,
+        D3DDISPLAYMODEEX *pFullscreenDisplayMode,
+        IDirect3DDevice9Ex **ppReturnedDeviceInterface)
+{
+    assert(is_d3d9ex);
+
+    log_misc("graphics::d3d9", "IDirect3D9Ex::CreateDeviceEx hook hit ({}, {}, {}, {}, {}, {})",
+             Adapter,
+             static_cast<uint32_t>(DeviceType),
+             fmt::ptr(hFocusWindow),
+             behavior2s(BehaviorFlags),
+             fmt::ptr(pPresentationParameters),
+             fmt::ptr(ppReturnedDeviceInterface));
+
+    // check parameters
+    if (!pPresentationParameters || !ppReturnedDeviceInterface) {
+        log_warning("graphics::d3d9", "NULL pointer passed in required parameter");
+
+        return D3DERR_INVALIDCALL;
+    }
+
+    DWORD orig_behavior_flags = BehaviorFlags;
+    size_t num_adapters = 1;
+
+    // behavior flags
+    if (D3D9_BEHAVIOR_DISABLE) {
+        BehaviorFlags &= ~D3D9_BEHAVIOR_DISABLE;
+    }
+
+    // when rendering via software, disable pure device
+    if (BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) {
+        BehaviorFlags &= ~D3DCREATE_PUREDEVICE;
+    }
+
+    // override adapter used
+    if (D3D9_ADAPTER.has_value()) {
+        Adapter = D3D9_ADAPTER.value();
+    }
+
+    // get number of adapters for info dump
+    if (orig_behavior_flags & D3DCREATE_ADAPTERGROUP_DEVICE) {
+        D3DCAPS9 device_caps {};
+
+        if (SUCCEEDED(this->pReal->GetDeviceCaps(Adapter, DeviceType, &device_caps))) {
+            num_adapters = device_caps.NumberOfAdaptersInGroup;
+        }
+        if (gfdm_two_head_exclusive()) {
+            num_adapters = GFDM_LOGICAL_HEAD_COUNT;
+        }
+    }
+
+    for (size_t i = 0; i < num_adapters; i++) {
+        auto *params = &pPresentationParameters[i];
+        if (!GRAPHICS_WINDOWED){
+            if (i == 0) {
+                GRAPHICS_FS_ORIGINAL_WIDTH = params->BackBufferWidth;
+                GRAPHICS_FS_ORIGINAL_HEIGHT = params->BackBufferHeight;
+                log_misc("graphics::d3d9", "original resolution: {}x{}", GRAPHICS_FS_ORIGINAL_WIDTH, GRAPHICS_FS_ORIGINAL_HEIGHT);
+                if (GRAPHICS_FS_CUSTOM_RESOLUTION.has_value()) {
+                    log_misc(
+                        "graphics::d3d9",
+                        "use custom resolution {}x{} => {}x{}",
+                        params->BackBufferWidth, params->BackBufferHeight,
+                        GRAPHICS_FS_CUSTOM_RESOLUTION.value().first,
+                        GRAPHICS_FS_CUSTOM_RESOLUTION.value().second);
+                    params->BackBufferWidth = GRAPHICS_FS_CUSTOM_RESOLUTION.value().first;
+                    params->BackBufferHeight = GRAPHICS_FS_CUSTOM_RESOLUTION.value().second;
+                } else if (GRAPHICS_FS_ORIENTATION_SWAP) {
+                    log_misc(
+                        "graphics::d3d9",
+                        "swap full orientation {}x{} => {}x{}",
+                        params->BackBufferWidth, params->BackBufferHeight,
+                        params->BackBufferHeight, params->BackBufferWidth);
+                    std::swap(params->BackBufferWidth, params->BackBufferHeight);
+                }
+            } else if (i == 1 && !gfdm_two_head_exclusive()
+                    && GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.has_value()) {
+                log_misc(
+                    "graphics::d3d9",
+                    "use custom sub resolution {}x{} => {}x{}",
+                    params->BackBufferWidth, params->BackBufferHeight,
+                    GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().first,
+                    GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().second);
+                params->BackBufferWidth = GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().first;
+                params->BackBufferHeight = GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().second;
+            }
+        }
+
+        log_info("graphics::d3d9",
+                "D3D9Ex presentation parameters for adapter {}: BackBufferWidth: {}, BackBufferHeight: {}, "
+                "Format: {}, BackBufferCount: {}, MultiSampleType: {}, MultiSampleQuality: {}, "
+                "SwapEffect: {}, Windowed: {}, EnableAutoDepthStencil: {}, AutoDepthStencilFormat: {}, "
+                "Flags: {}, FullScreen_RefreshRateInHz: {}, PresentationInterval: {}",
+                i,
+                params->BackBufferWidth,
+                params->BackBufferHeight,
+                format2s(params->BackBufferFormat),
+                params->BackBufferCount,
+                static_cast<uint32_t>(params->MultiSampleType),
+                params->MultiSampleQuality,
+                static_cast<uint32_t>(params->SwapEffect),
+                params->Windowed,
+                params->EnableAutoDepthStencil,
+                format2s(params->AutoDepthStencilFormat),
+                params->Flags,
+                params->FullScreen_RefreshRateInHz,
+                presentation_interval2s(params->PresentationInterval));
+    }
+    if (pFullscreenDisplayMode) {
+        for (size_t i = 0; i < num_adapters; i++) {
+            auto *fullscreen_display_mode = &pFullscreenDisplayMode[i];
+
+            if (!GRAPHICS_WINDOWED) {
+                if (i == 0) {
+                    if (GRAPHICS_FS_CUSTOM_RESOLUTION.has_value()) {
+                        fullscreen_display_mode->Width = GRAPHICS_FS_CUSTOM_RESOLUTION.value().first;
+                        fullscreen_display_mode->Height = GRAPHICS_FS_CUSTOM_RESOLUTION.value().second;
+                    } else if (GRAPHICS_FS_ORIENTATION_SWAP) {
+                        std::swap(fullscreen_display_mode->Width, fullscreen_display_mode->Height);
+                    }
+                } else if (i == 1 && !gfdm_two_head_exclusive()
+                        && GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.has_value()) {
+                    fullscreen_display_mode->Width = GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().first;
+                    fullscreen_display_mode->Height = GRAPHICS_FS_CUSTOM_RESOLUTION_SUB.value().second;
+                }
+            }
+
+            log_info("graphics::d3d9",
+                    "D3D9Ex fullscreen display mode for adapter {}: Width: {}, Height: {}, RefreshRate: {}, "
+                    "Format: {}, ScanLineOrdering: {}",
+                    i,
+                    fullscreen_display_mode->Width,
+                    fullscreen_display_mode->Height,
+                    fullscreen_display_mode->RefreshRate,
+                    format2s(fullscreen_display_mode->Format),
+                    static_cast<uint32_t>(fullscreen_display_mode->ScanLineOrdering));
+        }
+    }
+
+    // set windowed
+    //
+    // note from MSDN: `pFullscreenDisplayMode` must be NULL for windowed mode.
+    if (GRAPHICS_WINDOWED) {
+        if (avs::game::is_model({"LDJ", "KFC", "M39"}) &&
+            (BehaviorFlags & D3DCREATE_ADAPTERGROUP_DEVICE)) {
+            log_misc("graphics::d3d9", "disabling adapter group device in windowed mode");
+
+            D3D9_BEHAVIOR_DISABLE |= D3DCREATE_ADAPTERGROUP_DEVICE;
+            BehaviorFlags &= ~D3DCREATE_ADAPTERGROUP_DEVICE;
+        }
+
+        pPresentationParameters->Windowed = true;
+        pPresentationParameters->FullScreen_RefreshRateInHz = 0;
+        update_backbuffer_dimensions(pPresentationParameters);
+        pFullscreenDisplayMode = nullptr;
+    } else if (GRAPHICS_FORCE_REFRESH > 0) {
+        log_info("graphics::d3d9", "force refresh rate: {} => {} Hz",
+                pPresentationParameters->FullScreen_RefreshRateInHz,
+                GRAPHICS_FORCE_REFRESH);
+
+        pPresentationParameters->FullScreen_RefreshRateInHz = GRAPHICS_FORCE_REFRESH;
+
+        if (pFullscreenDisplayMode) {
+            pFullscreenDisplayMode->RefreshRate = GRAPHICS_FORCE_REFRESH;
+        }
+    }
+
+    if (!GRAPHICS_WINDOWED && !gfdm_two_head_exclusive()
+            && num_adapters >= 2 && GRAPHICS_FORCE_REFRESH_SUB.has_value()) {
+        log_info("graphics::d3d9", "force sub refresh rate: {} => {} Hz (-graphics-force-refresh-sub option)",
+                pPresentationParameters[1].FullScreen_RefreshRateInHz,
+                GRAPHICS_FORCE_REFRESH_SUB.value());
+
+        pPresentationParameters[1].FullScreen_RefreshRateInHz = GRAPHICS_FORCE_REFRESH_SUB.value();
+        if (pFullscreenDisplayMode) {
+            pFullscreenDisplayMode[1].RefreshRate = GRAPHICS_FORCE_REFRESH_SUB.value();
+        }
+    }
+
+    // force single adapter
+    if (GRAPHICS_FORCE_SINGLE_ADAPTER) {
+        log_info("graphics::d3d9", "disabling adapter group device with force single adapter mode");
+
+        D3D9_BEHAVIOR_DISABLE |= D3DCREATE_ADAPTERGROUP_DEVICE;
+        BehaviorFlags &= ~D3DCREATE_ADAPTERGROUP_DEVICE;
+    }
+
+    if (GRAPHICS_FORCE_VSYNC_BUFFER.has_value()) {
+        log_info("graphics::d3d9", "force BackBufferCount: {} => {}",
+            pPresentationParameters->BackBufferCount,
+            GRAPHICS_FORCE_VSYNC_BUFFER.value());
+        pPresentationParameters->BackBufferCount = GRAPHICS_FORCE_VSYNC_BUFFER.value();
+    }
+
+    GfdmTwoHeadDeviceState gfdm_parameters(
+            pPresentationParameters,
+            pFullscreenDisplayMode);
+    if (gfdm_two_head_exclusive()) {
+        if (!(BehaviorFlags & D3DCREATE_ADAPTERGROUP_DEVICE)) {
+            log_warning(
+                    "graphics::d3d9",
+                    "CreateDeviceEx did not request an adapter-group device");
+            return D3DERR_NOTAVAILABLE;
+        }
+        HRESULT select = graphics_d3d9_gfdm_select_two_head_group_parameters(
+                pPresentationParameters,
+                pFullscreenDisplayMode,
+                gfdm_parameters.native_presentation_parameters.data(),
+                gfdm_parameters.native_fullscreen_display_modes.data(),
+                &gfdm_parameters.logical_small_swapchain,
+                "CreateDeviceEx");
+        if (FAILED(select)) {
+            return select;
+        }
+        if (GRAPHICS_FORCE_REFRESH_SUB.has_value()) {
+            gfdm_parameters.native_presentation_parameters[1]
+                    .FullScreen_RefreshRateInHz =
+                    GRAPHICS_FORCE_REFRESH_SUB.value();
+            if (pFullscreenDisplayMode != nullptr) {
+                gfdm_parameters.native_fullscreen_display_modes[1].RefreshRate =
+                        GRAPHICS_FORCE_REFRESH_SUB.value();
+            }
+        }
+        HRESULT remap = graphics_d3d9_gfdm_remap_two_head_group_parameters(
+                gfdm_parameters.native_presentation_parameters.data(),
+                pFullscreenDisplayMode != nullptr
+                        ? gfdm_parameters.native_fullscreen_display_modes.data()
+                        : nullptr,
+                "CreateDeviceEx");
+        if (FAILED(remap)) {
+            return remap;
+        }
+        if (pFullscreenDisplayMode != nullptr) {
+            graphics_d3d9_gfdm_align_two_head_refresh_to_desktop(
+                    static_cast<IDirect3D9Ex *>(this->pReal),
+                    Adapter,
+                    gfdm_parameters.native_presentation_parameters.data(),
+                    gfdm_parameters.native_fullscreen_display_modes.data(),
+                    "CreateDeviceEx");
+        }
+        if (!graphics_gitadora_prepare_two_head_device_window(
+                    gfdm_parameters.native_presentation_parameters[1].hDeviceWindow,
+                    this->pReal->GetAdapterMonitor(Adapter + 1),
+                    gfdm_parameters.native_presentation_parameters[1].BackBufferWidth,
+                    gfdm_parameters.native_presentation_parameters[1].BackBufferHeight))
+        {
+            return D3DERR_INVALIDCALL;
+        }
+        HRESULT validation = validate_gfdm_two_head_exclusive(
+                this->pReal,
+                Adapter,
+                DeviceType,
+                BehaviorFlags,
+                gfdm_parameters.native_presentation_parameters.data());
+        if (FAILED(validation)) {
+            return validation;
+        }
+        gfdm_parameters.use_native_parameters();
+    }
+
+    // call original
+    HRESULT result = static_cast<IDirect3D9Ex *>(this->pReal)->CreateDeviceEx(
+            Adapter,
+            DeviceType,
+            hFocusWindow,
+            BehaviorFlags,
+            gfdm_parameters.presentation_parameters,
+            gfdm_parameters.fullscreen_display_modes,
+            ppReturnedDeviceInterface);
+
+    if (SUCCEEDED(result) && gfdm_two_head_exclusive()) {
+        gfdm_publish_two_head_parameters(
+                pPresentationParameters,
+                pFullscreenDisplayMode,
+                gfdm_parameters);
+    }
+
+    // check for error
+    if (result != D3D_OK) {
+
+        // log error
+        log_warning("graphics::d3d9", "CreateDeviceEx failed, hr={}", FMT_HRESULT(result));
+        log_create_device_failure(result);
+
+    } else if (!D3D9_DEVICE_HOOK_DISABLE) {
+        graphics_hook_window(hFocusWindow, pPresentationParameters);
+
+        auto *wrapped = new WrappedIDirect3DDevice9(
+                hFocusWindow,
+                *ppReturnedDeviceInterface,
+                gfdm_parameters.logical_small_swapchain,
+                gfdm_two_head_exclusive() ? static_cast<IDirect3D9 *>(this) : nullptr,
+                gfdm_two_head_exclusive() ? pPresentationParameters : nullptr);
+
+        wrapped->device_multithreaded = (BehaviorFlags & D3DCREATE_MULTITHREADED) != 0;
+        *ppReturnedDeviceInterface = wrapped;
+
+        // initialize sub screen if the game requested a multi-head context
+        if (avs::game::is_model({"LDJ", "KFC", "M39", "M32"}) &&
+            (orig_behavior_flags & D3DCREATE_ADAPTERGROUP_DEVICE)) {
+
+            UINT i = games::gitadora::is_arena_model()
+                    ? gfdm_parameters.logical_small_swapchain
+                    : 1;
+            D3DPRESENT_PARAMETERS *subscreen_parameters =
+                    gfdm_two_head_exclusive()
+                    ? &gfdm_parameters.presentation_parameters[1]
+                    : &pPresentationParameters[i];
+            graphics_d3d9_ldj_init_sub_screen(
+                    *ppReturnedDeviceInterface,
+                    subscreen_parameters,
+                    i);
+        }
+    }
+
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE WrappedIDirect3D9::GetAdapterLUID(UINT Adapter, LUID *pLUID) {
+    assert(is_d3d9ex);
+    if (gfdm_two_head_exclusive() && is_fake_subscreen_adapter(Adapter)) {
+        if (pLUID == nullptr) {
+            return D3DERR_INVALIDCALL;
+        }
+        pLUID->LowPart = static_cast<DWORD>(-static_cast<LONG>(Adapter));
+        pLUID->HighPart = -static_cast<LONG>(Adapter);
+        return D3D_OK;
+    }
+    CHECK_RESULT(static_cast<IDirect3D9Ex *>(pReal)->GetAdapterLUID(Adapter, pLUID));
+}
+
+// Create swap chain for TDJ sub screen if needed
+//
+// The sub screen swap chain should be created if:
+// - Running windowed with `NumberOfAdaptersInGroup >= 2` (game expects implicit swap chain to exist)
+// - Running fullscreen with `NumberOfAdaptersInGroup < 2` (overridden `GetDeviceCaps` structure)
+static void graphics_d3d9_ldj_init_sub_screen(
+        IDirect3DDevice9Ex *device,
+        D3DPRESENT_PARAMETERS *present_params,
+        UINT gfdm_small_swapchain)
+{
+    D3DCAPS9 caps {};
+    HRESULT hr = device->GetDeviceCaps(&caps);
+    if (FAILED(hr)) {
+        log_warning("graphics::d3d9", "failed to get device caps, hr={}", FMT_HRESULT(hr));
+        return;
+    }
+
+    // check if sub window swap chain is needed
+    /*
+    if (GRAPHICS_WINDOWED && caps.NumberOfAdaptersInGroup < 2) {
+        log_info("graphics::d3d9", "skipping swap chain creation, running windowed with less than two monitors");
+        return;
+    }
+    if (!GRAPHICS_WINDOWED && caps.NumberOfAdaptersInGroup >= 2) {
+        log_info("graphics::d3d9", "skipping swap chain creation, running fullscreen with two or more monitors");
+        return;
+    }
+    */
+
+    if (GRAPHICS_WINDOWED) {
+        present_params->Windowed = true;
+        present_params->FullScreen_RefreshRateInHz = 0;
+
+        // calling `WrappedIDirect3DDevice9::CreateAdditionalSwapChain` triggers special handling for
+        // LDJ calling `GetSwapChain`
+        hr = device->CreateAdditionalSwapChain(present_params, &SUB_SWAP_CHAIN);
+        if (FAILED(hr)) {
+            log_warning("graphics::d3d9", "failed to create additional swap chain, hr={}", FMT_HRESULT(hr));
+        } else {
+            log_info("graphics::d3d9", "created additional swap chain for windowed mode");
+        }
+    } else {
+
+        const int swapchain = games::gitadora::is_arena_model()
+                ? static_cast<int>(gfdm_small_swapchain)
+                : 1;
+
+        hr = device->GetSwapChain(swapchain, &SUB_SWAP_CHAIN);
+        if (FAILED(hr)) {
+            log_warning("graphics::d3d9", "failed to acquire fullscreen sub swap chain, hr={}", FMT_HRESULT(hr));
+        } else {
+            log_info("graphics::d3d9", "acquired fullscreen sub swap chain");
+            return;
+        }
+
+        hr = device->CreateAdditionalSwapChain(present_params, &SUB_SWAP_CHAIN);
+        if (FAILED(hr)) {
+            log_warning("graphics::d3d9", "failed to get additional swap chain, hr={}", FMT_HRESULT(hr));
+        } else {
+            log_info("graphics::d3d9", "created additional swap chain for fullscreen mode");
+        }
+    }
+}
+
+IDirect3DSurface9 *graphics_d3d9_ldj_get_sub_screen() {
+    if (SUB_SWAP_CHAIN == nullptr) {
+        return nullptr;
+    }
+
+    IDirect3DSurface9 *surface = nullptr;
+    HRESULT hr = SUB_SWAP_CHAIN->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &surface);
+    if (FAILED(hr)) {
+        log_warning("graphics::d3d9", "failed to get back buffer of LDJ sub screen, hr={}", FMT_HRESULT(hr));
+
+        return nullptr;
+    }
+
+    return surface;
+}
+
+void graphics_d3d9_notify_subscreen_present() {
+    if (SUBSCREEN_FORCE_REDRAW && !SUBSCREEN_FORCE_REDRAW_IN_PROGRESS) {
+        SUBSCREEN_PRESENTED_SINCE_LAST_MAIN.store(true, std::memory_order_relaxed);
+    }
+}
+
+static void graphics_d3d9_ldj_on_present(IDirect3DDevice9 *wrapped_device) {
+    // iidx/sdvx
+    int swapchain = 1;
+    if (games::gitadora::is_arena_model()) {
+        swapchain = 2;
+    }
+
+    if (!ATTEMPTED_SUB_SWAP_CHAIN_ACQUIRE && SUB_SWAP_CHAIN == nullptr) {
+        ATTEMPTED_SUB_SWAP_CHAIN_ACQUIRE = true;
+        HRESULT hr = wrapped_device->GetSwapChain(swapchain, &SUB_SWAP_CHAIN);
+        if (FAILED(hr)) {
+            log_warning(
+                "graphics::d3d9",
+                "failed to acquire sub screeen swap chain! hr={}",
+                FMT_HRESULT(hr));
+            return;
+        }
+    }
+
+    if (SUB_SWAP_CHAIN != nullptr) {
+        wintouchemu::update();
+
+        // newer versions of exceed gear needs SUBSCREEN_FORCE_REDRAW
+        // (when enabled on older versions of EG, you end up with graphical glitches on the subscreen)
+        //
+        // early versions of popn HC needs this as well, but not on by default as it can cause
+        // graphical glitches on some GPUs 
+        //
+        // treat forced redraw as a fallback so it does not duplicate a successful game present.
+
+        const bool force_redraw = SUBSCREEN_FORCE_REDRAW &&
+            !SUBSCREEN_PRESENTED_SINCE_LAST_MAIN.exchange(false, std::memory_order_relaxed);
+
+        if (GRAPHICS_WINDOWED || force_redraw) {
+            SUBSCREEN_FORCE_REDRAW_IN_PROGRESS = true;
+            SUB_SWAP_CHAIN->Present(nullptr, nullptr, nullptr, nullptr, 0);
+            SUBSCREEN_FORCE_REDRAW_IN_PROGRESS = false;
+        }
+    }
+}
+
+void graphics_d3d9_on_present(
+        HWND hFocusWindow,
+        IDirect3DDevice9 *device,
+        WrappedIDirect3DDevice9 *wrapped_device) {
+
+    // image resize / orientation swap. run here (the present path) rather than from `EndScene`,
+    // which may fire several times per frame on multi-pass / render-to-texture games. this is the
+    // single point guaranteed to be after the game's last `EndScene` and before the real `Present`,
+    // so the back buffer is fully drawn and the expensive StretchRect work happens exactly once per
+    // frame. it must run before the overlay is rendered so the overlay isn't scaled with the image.
+    if (cfg::SCREENRESIZE->enable_screen_resize || GRAPHICS_FS_ORIENTATION_SWAP) {
+        SurfaceHook(device);
+    }
+
+    graphics_poll_screenshot_hotkey();
+
+    // before the overlay render so the screenshot excludes it
+    if (!GRAPHICS_SCREENSHOT_INCLUDE_OVERLAY) {
+        graphics_d3d9_process_screenshot(device, wrapped_device);
+    }
+
+    // Do overlay init as many d3d9 hooks create a dummy instance to get vtable offsets and never
+    // call `Present`. This avoids race conditions on `IDirect3D9::CreateDevice` like with
+    // `dx9osd.dll` for pfreepanic.
+    if (!overlay::OVERLAY) {
+        IDirect3D9 *d3d = nullptr;
+
+        if (SUCCEEDED(device->GetDirect3D(&d3d)) && d3d != nullptr) {
+            overlay::create_d3d9(hFocusWindow, d3d, device);
+            d3d->Release();
+        }
+    } else if (overlay::OVERLAY->uses_device(device) && SUCCEEDED(device->BeginScene())) {
+
+        // render overlay
+        overlay::OVERLAY->update();
+        overlay::OVERLAY->new_frame();
+        overlay::OVERLAY->render();
+        device->EndScene();
+    }
+
+    sdk::d3d9::draw(hFocusWindow, device);
+
+    // after the overlay render so the screenshot includes toasts / menus
+    if (GRAPHICS_SCREENSHOT_INCLUDE_OVERLAY) {
+        graphics_d3d9_process_screenshot(device, wrapped_device);
+    }
+
+    // API capture always includes the overlay; it must run before the subscreen present
+    // below, which leaves the arena SMALL back buffer black
+    graphics_d3d9_process_capture(device, wrapped_device);
+
+    // for IIDX TDJ / SDVX UFC, handle subscreen
+    const bool is_vm = games::sdvx::is_valkyrie_model();
+    const bool is_tdj = avs::game::is_model("LDJ") && games::iidx::TDJ_MODE;
+    const bool is_gfdm_arena = games::gitadora::is_arena_model() && GRAPHICS_PREVENT_SECONDARY_WINDOWS;
+    const bool is_pika = games::popn::is_pikapika_model();
+    if (is_vm || is_tdj || is_gfdm_arena || is_pika) {
+        graphics_d3d9_ldj_on_present(wrapped_device);
+    }
+
+    const bool is_mfc = avs::game::is_model("KK9") && games::mfc::HG_MODE;
+    if (is_mfc) {
+        wintouchemu::update();
+    }
+}
+
+void update_backbuffer_dimensions(D3DPRESENT_PARAMETERS *params) {
+    if (!GRAPHICS_WINDOW_BACKBUFFER_SCALE) {
+        return;
+    }
+
+    // only do this for primary adapter
+    static bool first_adapter_hooked = false;
+    if (first_adapter_hooked) {
+        return;
+    }
+
+    if (GRAPHICS_WINDOW_SIZE.has_value()) {
+        first_adapter_hooked = true;
+        params->BackBufferWidth = GRAPHICS_WINDOW_SIZE.value().first;
+        params->BackBufferHeight = GRAPHICS_WINDOW_SIZE.value().second;
+        log_info(
+            "graphics::d3d9",
+            "override BackBufferWidth / BackBufferHeight with {}x{} (from -windowresize)",
+            params->BackBufferWidth,
+            params->BackBufferHeight);
+        return;
+    }
+
+    if (cfg::SCREENRESIZE->client_width != 0 && cfg::SCREENRESIZE->client_height != 0) {
+        first_adapter_hooked = true;
+        params->BackBufferWidth = cfg::SCREENRESIZE->client_width;
+        params->BackBufferHeight = cfg::SCREENRESIZE->client_height;
+        log_info(
+            "graphics::d3d9",
+            "override BackBufferWidth / BackBufferHeight with {}x{} (from screen resize config file)",
+            params->BackBufferWidth,
+            params->BackBufferHeight);
+        return;
+    }
+}

@@ -1,0 +1,245 @@
+#pragma once
+
+#include <chrono>
+#include <optional>
+
+#include "cfg/game.h"
+#include "overlay/window.h"
+#include "rawinput/device.h"
+#include "external/imgui/imgui_filebrowser.h"
+#include "patch_manager.h"
+#include "controller_presets.h"
+
+namespace overlay::windows {
+
+    // top-level tabs in the configuration window
+    enum class ConfigTab {
+        CONFIG_TAB_INVALID,
+        CONFIG_TAB_CONTROLLER,
+        CONFIG_TAB_CARDS,
+        CONFIG_TAB_PATCHES,
+        CONFIG_TAB_OPTIONS,
+    };
+
+    // sub-pages shown in the Controller tab's left navigation
+    enum class ControllerPage {
+        CONTROLLER_PAGE_INVALID,
+        CONTROLLER_PAGE_BUTTONS,
+        CONTROLLER_PAGE_KEYPADS,
+        CONTROLLER_PAGE_MODIFIERS,
+        CONTROLLER_PAGE_ANALOGS,
+        CONTROLLER_PAGE_OVERLAY,
+        CONTROLLER_PAGE_LIGHTS,
+        CONTROLLER_PAGE_PRESETS,
+    };
+
+    struct MatchEntry {
+        std::string game_name;
+        std::string device_name;
+        int light_index;
+        int control_index;
+        bool soft;
+    };
+
+    class Config : public Window {
+    private:
+
+        // game selection
+        int games_selected = -1;
+        std::string games_selected_name = "";
+        std::vector<Game> games_list;
+        std::vector<const char *> games_names;
+
+        // currently selected top-level tab and Controller sub-page
+        ConfigTab tab_selected = ConfigTab::CONFIG_TAB_INVALID;
+        ControllerPage controller_page_selected = ControllerPage::CONTROLLER_PAGE_INVALID;
+
+        // buttons tab
+        bool buttons_keyboard_state[0xFF];
+        bool buttons_bind_active = false;
+        bool buttons_many_active = false;
+        std::string buttons_many_active_section = "";
+        bool buttons_many_naive = false;
+        int buttons_many_delay = 0;
+        int buttons_many_index = -1;
+
+        void inc_buttons_many_index(int index_max);
+
+        // analogs tab
+        std::vector<rawinput::Device *> analogs_devices;
+        int analogs_devices_selected = -1;
+        int analogs_devices_control_selected = -1;
+
+        // lights tab
+        std::vector<rawinput::Device *> lights_devices;
+        int lights_devices_selected = -1;
+        int lights_devices_control_selected = -1;
+
+        // lights test all
+        bool lights_testing = false;
+        int lights_test_current = -1;
+        std::chrono::steady_clock::time_point lights_test_time;
+
+        // lights auto match
+        std::vector<rawinput::Device *> auto_match_devices;
+        int auto_match_device_selected = -1;
+        bool auto_match_testing = false;
+        int auto_match_test_current = -1;
+        std::chrono::steady_clock::time_point auto_match_test_time;
+        std::string auto_match_test_device;
+        unsigned int auto_match_test_control = 0;
+        std::chrono::steady_clock::time_point auto_match_copy_time;
+        bool auto_match_copied = false;
+        bool auto_match_soft_enabled = true;
+        bool auto_match_p2 = false;
+
+        // cards tab
+        int keypads_selected[2] {};
+        char keypads_card_path[2][1024] {};
+        std::thread *keypads_card_select = nullptr;
+        bool keypads_card_select_done = false;
+        ImGui::FileBrowser keypads_card_select_browser[2];
+        char keypads_card_number[2][18] {};
+        bool keypads_card_override_valid[2] = { false, false };
+        bool keypads_card_file_contents_valid[2] = { false, false };
+        bool keypads_card_overwrite_confirmed[2];
+
+        // presets tab
+        std::vector<ControllerTemplate> templates_cache;
+        bool templates_cache_dirty = true;
+        int templates_selected = -1;
+        char template_save_name[256] = {};
+        // per-source target mapping: source index -> selected target device index
+        std::vector<int> template_target_selection;
+        // deferred popup flags (to avoid ImGui ID stack mismatch inside tables)
+        bool template_apply_open = false;
+        bool template_edit_open = false;
+        bool template_save_labels_open = false;
+        bool template_delete_open = false;
+        ControllerTemplate template_pending_save;
+        std::vector<std::string> template_save_sources;
+        std::vector<std::string> template_save_labels;
+        bool apply_buttons = true;
+        bool apply_modifiers = true;
+        bool apply_keypads = true;
+        bool apply_analogs = true;
+        bool apply_lights = true;
+        bool save_buttons = true;
+        bool save_modifiers = true;
+        bool save_keypads = true;
+        bool save_analogs = true;
+        bool save_lights = true;
+        bool all_cleared = false;
+        std::vector<bool> template_is_applied;
+
+        // patches tab
+        std::unique_ptr<PatchManager> patch_manager;
+
+        // options tab
+        bool options_show_hidden = false;
+        bool options_dirty = false;
+        int options_category = 0;
+        std::string search_filter = "";
+        std::string search_filter_in_lower_case = "";
+        bool search_active_only = false;
+
+        // Options tab left-nav: selected group, currently highlighted category, and a pending scroll
+        std::string options_group_selected = "";
+        std::string options_category_selected = "";
+        bool options_scroll_pending = false;
+        bool options_scroll_top = false;
+
+        // Controller tab left-nav: selected sub-page
+        std::string controller_page_label = "";
+
+        // Cards tab left-nav: selected sub-page
+        std::string cards_page_label = "";
+
+        std::filesystem::path file_picker_path;
+        std::thread *file_picker_thread = nullptr;
+        bool file_picker_done = false;
+
+        std::pair<std::string, int> analog_as_button_warning_show_next_frame = { "", 0 };
+
+        void build_buttons(const std::string &name, std::vector<Button> *buttons, int min = 0, int max = -1);
+        void build_button(
+            const std::string &name,
+            Button &primary_button,
+            Button *button,
+            const int button_it,
+            const int button_it_max,
+            const int alt_index);
+
+        void bind_button_popup(const std::string &bind_name, Button *button, const int button_it_max, const int alt_index);
+        void naive_button_popup(const std::string &naive_string, Button *button, const int button_it_max, const int alt_index);
+        bool build_modifier_picker(Button &button);
+        void edit_button_popup(
+            const std::string &edit_name,
+            const std::string &button_display,
+            Button *button,
+            const float button_velocity,
+            const int alt_index,
+            const bool allow_modifiers);
+        void clear_button(Button *button, const int alt_index, std::optional<unsigned short> vKey_default = std::nullopt);
+        void reset_button_to_default(Button *button, unsigned short vKey_default);
+        unsigned int get_keypad_top_row(const Button &button);
+
+        void build_analogs(const std::string &name, std::vector<Analog> *analogs);
+        void edit_analog_popup(Analog &analog, std::string title);
+
+        void update() override;
+        void stop_lights_test();
+        void build_lights(const std::string &name, std::vector<Light> *lights);
+        void build_light(Light &primary_light, Light *light, const int light_index, const int alt_index);
+        void clear_light(Light *light, const int alt_index);
+        void edit_light_popup(Light &primary_light, Light *light, const int alt_index);
+        void auto_match_lights_popup(std::vector<Light> *lights);
+
+        std::string match_lights(
+            rawinput::Device *device,
+            std::vector<Light> *lights,
+            std::vector<std::string> &raw_names,
+            std::vector<MatchEntry> &matched,
+            std::vector<MatchEntry> &unmatched);
+
+        void build_presets();
+        void clear_all_bindings();
+        void apply_template_source(const ControllerTemplate &tmpl,
+                                   const std::string &source_filter,
+                                   const std::string &target_device);
+        ControllerTemplate capture_current_bindings(const std::string &name);
+
+        void build_cards_tab(float page_offset);
+        void build_cards_virtual();
+        void build_cards_reader();
+        void build_cards_manager();
+        std::string build_option_value_picker_title(const OptionDefinition& option);
+        void build_option_value_picker(Option& option);
+        void build_options(
+            std::vector<Option> *options, const std::string &category, const std::string *filter=nullptr,
+            bool quick_only=false, bool active_only=false);
+        void build_options_tab(float page_offset);
+        void build_controller_tab(float page_offset, ControllerPage *page_selected_new);
+        bool build_nav_header(const char *label, bool active);
+        void build_about();
+        void build_launcher();
+        void build_keypad_warning();
+
+        void launch_shell(LPCSTR app, LPCSTR file=nullptr);
+        
+        void build_menu(int *game_selected);
+        void shutdown_system(bool force, bool reboot_instead);
+        
+        void set_alternating_row_colors(const int row_index);
+        
+        bool validate_ea_card(char card_number[16]);
+
+    public:
+        Config(SpiceOverlay *overlay);
+        ~Config() override;
+
+        void read_card(int player = -1);
+        void build_content() override;
+
+    };
+}

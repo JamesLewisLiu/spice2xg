@@ -1,0 +1,766 @@
+#include "bi2x_hook.h"
+
+#if SPICE64
+
+#include "util/execexe.h"
+#include "util/logging.h"
+#include "rawinput/rawinput.h"
+#include "misc/eamuse.h"
+#include "games/io.h"
+#include "io.h"
+#include "util/tapeled.h"
+#include "pc.h"
+#include "util/utils.h"
+#include "util/time.h"
+#include "util/socd_cleaner.h"
+
+namespace games::pc {
+
+    constexpr float RELATIVE_DECAY = 0.02f;
+    struct FADER_RELATIVE {
+        // ranges from 0.f to 1.f
+        float previous_raw = 0.5f;
+
+        // ranges from -1.f to +1.f
+        float effective_value = 0.f;
+    };
+
+    FADER_RELATIVE fader_l_relative;
+    FADER_RELATIVE fader_r_relative;
+
+    float calculate_analog_raw_delta(float old_value, float new_value) {
+        // assumed that values are between 0.f and 1.f
+
+        float delta = 0.f;
+        if ((old_value < 0.25f) && (0.75f < new_value)) {
+            // wrapped around: going left
+            delta = -((1.f - new_value) + old_value);
+            
+        } else if ((new_value < 0.25f) && (0.75f < old_value)) {
+            // wrapped around: going right
+            delta = (1.f - old_value) + new_value;
+
+        } else {
+            delta = new_value - old_value;
+        }
+        return delta;
+    }
+
+    float apply_decay(float val) {
+        // return to center over time
+        if (RELATIVE_DECAY < val) {
+            return val - RELATIVE_DECAY;
+        } else if (val < -RELATIVE_DECAY) {
+            return val + RELATIVE_DECAY;
+        } else {
+            return 0.f;
+        }
+    }
+
+    float get_fader_knob_mode_value(float raw_analog, FADER_RELATIVE &fader) {
+        // add new value...
+        const float delta = calculate_analog_raw_delta(fader.previous_raw, raw_analog);
+        fader.effective_value += (delta * 20.f);
+        fader.previous_raw = raw_analog;
+
+        // capture the result after adding new input value
+        fader.effective_value = CLAMP(fader.effective_value, -1.f, 1.f);
+        const float result = fader.effective_value;
+
+        // post-process for next iteration: apply decay (return to center over time)
+        fader.effective_value = apply_decay(fader.effective_value);
+
+        return result;
+    }
+
+    /*
+     * class definitions
+     */
+
+    struct AIO_SCI_COMM {
+        uint8_t data[0xf8];
+    };
+
+    struct AIO_NMGR_IOB2 {
+        uint8_t data[0xe30];
+    };
+
+    struct AIO_IOB2_BI2X_AC1 {
+        uint8_t data[0x4538];
+    };
+
+    struct AIO_IOB2_BI2X_AC1__SETTING {
+    };
+
+    struct AIO_IOB2_BI2X_WRFIRM {
+        uint8_t data[0x20f48];
+    };
+
+    struct AIO_IOB2_BI2X_AC1__INPUT
+    {
+        uint8_t DevIoCounter;
+        uint8_t bExIoAErr;
+        uint8_t bExIoBErr;
+        uint8_t bPcPowerOn;
+        uint8_t bPcPowerCheck;
+        uint8_t bCoin1Jam;
+        uint8_t bCoin2Jam;
+        uint8_t bCoin3Jam;
+        uint8_t bCoin4Jam;
+        uint8_t Coin1Count;
+        uint8_t Coin2Count;
+        uint8_t Coin3Count;
+        uint8_t Coin4Count;
+        uint16_t AnalogCh1;
+        uint16_t AnalogCh2;
+        uint16_t AnalogCh3;
+        uint16_t AnalogCh4;
+        uint8_t CN8_8;
+        uint8_t CN8_9;
+        uint8_t CN8_10;
+        uint8_t CN9_8;
+        uint8_t CN9_9;
+        uint8_t CN9_10;
+        uint8_t CN11_11;
+        uint8_t CN11_12;
+        uint8_t CN11_13;
+        uint8_t CN11_14;
+        uint8_t CN11_15;
+        uint8_t CN11_16;
+        uint8_t CN11_17;
+        uint8_t CN11_18;
+        uint8_t CN11_19;
+        uint8_t CN11_20;
+        uint8_t CN12_11;
+        uint8_t CN12_12;
+        uint8_t CN12_13;
+        uint8_t CN12_14;
+        uint8_t CN12_15;
+        uint8_t CN12_16;
+        uint8_t CN12_17;
+        uint8_t CN12_18;
+        uint8_t CN12_19;
+        uint8_t CN12_20;
+        uint8_t CN12_21;
+        uint8_t CN12_22;
+        uint8_t CN12_23;
+        uint8_t CN12_24;
+        uint8_t CN15_3;
+        uint8_t CN15_4;
+        uint8_t CN15_5;
+        uint8_t CN15_6;
+        uint8_t CN15_7;
+        uint8_t CN15_8;
+        uint8_t CN15_9;
+        uint8_t CN15_10;
+        uint8_t CN15_11;
+        uint8_t CN15_12;
+        uint8_t CN15_13;
+        uint8_t CN15_14;
+        uint8_t CN15_15;
+        uint8_t CN15_16;
+        uint8_t CN15_17;
+        uint8_t CN15_18;
+        uint8_t CN15_19;
+        uint8_t CN15_20;
+        uint8_t CN19_8;
+        uint8_t CN19_9;
+        uint8_t CN19_10;
+        uint8_t CN19_11;
+        uint8_t CN19_12;
+        uint8_t CN19_13;
+        uint8_t CN19_14;
+        uint8_t CN19_15;
+    };
+
+    struct AIO_IOB2_BI2X_AC1__INPUTDATA {
+        uint8_t data[247];
+    };
+
+    struct AIO_IOB2_BI2X_AC1__OUTPUTDATA {
+        uint8_t data[48];
+    };
+
+    struct AIO_IOB2_BI2X_AC1__ICNPIN {
+        uint16_t Ain[4];
+        uint64_t CnPin;
+    };
+
+    struct AIO_IOB2_BI2X_AC1__DEVSTATUS {
+        uint8_t InputCounter;
+        uint8_t OutputCounter;
+        uint8_t IoResetCounter;
+        uint8_t TapeLedCounter;
+        uint8_t TapeLedRate[8];
+        AIO_IOB2_BI2X_AC1__INPUT Input;
+        AIO_IOB2_BI2X_AC1__INPUTDATA InputData;
+        AIO_IOB2_BI2X_AC1__OUTPUTDATA OutputData;
+        AIO_IOB2_BI2X_AC1__ICNPIN ICnPinHist[20];
+    };
+
+    // verified with XIF-2024122300
+    static_assert(sizeof(AIO_SCI_COMM) == 0xf8);
+    static_assert(sizeof(AIO_NMGR_IOB2) == 0xe30);
+    static_assert(sizeof(AIO_IOB2_BI2X_AC1) == 0x4538);
+    static_assert(sizeof(AIO_IOB2_BI2X_WRFIRM) == 0x20f48);
+
+    /*
+     * typedefs
+     */
+
+    // libaio-iob2_video.dll
+    typedef AIO_IOB2_BI2X_AC1* (__fastcall *aioIob2Bi2xAC1_Create_t)(AIO_NMGR_IOB2 *i_pNodeMgr, uint32_t i_DevId,
+                                                                     AIO_IOB2_BI2X_AC1__SETTING *i_Setting);
+    typedef void (__fastcall *aioIob2Bi2xAC1_GetDeviceStatus_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl,
+                                                                AIO_IOB2_BI2X_AC1__DEVSTATUS *o_DevStatus);
+    typedef void (__fastcall *aioIob2Bi2xAC1_SetWatchDogTimer_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint8_t i_Count);
+    typedef void (__fastcall *aioIob2Bi2xAC1_AddCounter_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_Counter,
+                                                           uint32_t i_Count);
+    typedef void (__fastcall *aioIob2Bi2xAC1_SetOutputData_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_CnPin,
+                                                              uint8_t i_Data);
+    typedef void (__fastcall *aioIob2Bi2xAC1_SetTapeLedDataPart_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_TapeLedCh,
+                                                                   uint32_t i_Offset, uint8_t *i_pData,
+                                                                   uint32_t i_cntTapeLed, bool i_bReverse);
+    typedef void (__fastcall *aioIob2Bi2x_SetTapeLedDataGroup_t)(AIO_IOB2_BI2X_AC1* i_pNodeCtl, uint32_t i_bfGroup);
+    typedef void (__fastcall *aioIob2Bi2x_SetTapeLedDataLimit_t)(AIO_IOB2_BI2X_AC1* i_pNodeCtl, uint32_t i_Channel,
+                                                                uint8_t i_Scale, uint8_t i_Limit);
+    typedef AIO_IOB2_BI2X_WRFIRM *(__fastcall *aioIob2Bi2x_CreateWriteFirmContext_t)(uint32_t i_SerialNumber,
+                                                                                     uint32_t i_bfIob);
+    typedef AIO_SCI_COMM* (__fastcall *aioIob2Bi2x_OpenSciUsbCdc_t)(uint32_t i_SerialNumber);
+    typedef void (__fastcall *aioIob2Bi2x_DestroyWriteFirmContext_t)(AIO_IOB2_BI2X_WRFIRM *i_pWrFirm);
+    typedef int32_t (__fastcall *aioIob2Bi2x_WriteFirmGetState_t)(AIO_IOB2_BI2X_WRFIRM *i_pWrFirm);
+    typedef bool (__fastcall *aioIob2Bi2x_WriteFirmIsCompleted_t)(int32_t i_State);
+    typedef bool (__fastcall *aioIob2Bi2x_WriteFirmIsError_t)(int32_t i_State);
+
+    // libaio-iob.dll
+    typedef AIO_NMGR_IOB2 *(__fastcall *aioNMgrIob2_Create_t)(AIO_SCI_COMM *i_pSci, uint32_t i_bfMode);
+    typedef void (__fastcall *aioNMgrIob_BeginManage_t)(AIO_NMGR_IOB2 *i_pNodeMgr);
+
+    // libaio.dll
+    typedef void (__fastcall *aioSci_Destroy_t)(AIO_SCI_COMM *i_pNodeMgr);
+    typedef void (__fastcall *aioNodeMgr_Destroy_t)(AIO_NMGR_IOB2 *i_pNodeMgr);
+    typedef int32_t (__fastcall *aioNodeMgr_GetState_t)(AIO_NMGR_IOB2 *i_pNodeMgr);
+    typedef bool (__fastcall *aioNodeMgr_IsReady_t)(AIO_NMGR_IOB2 *i_pNodeMgr, int32_t i_State);
+    typedef bool (__fastcall *aioNodeMgr_IsError_t)(AIO_NMGR_IOB2 *i_pNodeMgr, int32_t i_State);
+    typedef void (__fastcall *aioNodeCtl_Destroy_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl);
+    typedef int32_t (__fastcall *aioNodeCtl_GetState_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl);
+    typedef bool (__fastcall *aioNodeCtl_IsReady_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, int32_t i_State);
+    typedef bool (__fastcall *aioNodeCtl_IsError_t)(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, int32_t i_State);
+
+    /*
+     * function pointers
+     */
+
+    // libaio-iob2_video.dll
+    static aioIob2Bi2xAC1_Create_t aioIob2Bi2xAC1_Create_orig = nullptr;
+    static aioIob2Bi2xAC1_GetDeviceStatus_t aioIob2Bi2xAC1_GetDeviceStatus_orig = nullptr;
+    static aioIob2Bi2xAC1_SetWatchDogTimer_t aioIob2Bi2xAC1_SetWatchDogTimer_orig = nullptr;
+    static aioIob2Bi2xAC1_AddCounter_t aioIob2Bi2xAC1_AddCounter_orig = nullptr;
+    static aioIob2Bi2xAC1_SetOutputData_t aioIob2Bi2xAC1_SetOutputData_orig = nullptr;
+    static aioIob2Bi2xAC1_SetTapeLedDataPart_t aioIob2Bi2xAC1_SetTapeLedDataPart_orig = nullptr;
+    static aioIob2Bi2x_SetTapeLedDataGroup_t aioIob2Bi2x_SetTapeLedDataGroup_orig = nullptr;
+    static aioIob2Bi2x_SetTapeLedDataLimit_t aioIob2Bi2x_SetTapeLedDataLimit_orig = nullptr;
+    static aioIob2Bi2x_OpenSciUsbCdc_t aioIob2Bi2x_OpenSciUsbCdc_orig = nullptr;
+    static aioIob2Bi2x_CreateWriteFirmContext_t aioIob2Bi2x_CreateWriteFirmContext_orig = nullptr;
+    static aioIob2Bi2x_DestroyWriteFirmContext_t aioIob2Bi2x_DestroyWriteFirmContext_orig = nullptr;
+    static aioIob2Bi2x_WriteFirmGetState_t aioIob2Bi2x_WriteFirmGetState_orig = nullptr;
+    static aioIob2Bi2x_WriteFirmIsCompleted_t aioIob2Bi2x_WriteFirmIsCompleted_orig = nullptr;
+    static aioIob2Bi2x_WriteFirmIsError_t aioIob2Bi2x_WriteFirmIsError_orig = nullptr;
+
+    // libaio-iob.dll
+    static aioNMgrIob2_Create_t aioNMgrIob2_Create_orig = nullptr;
+    static aioNMgrIob_BeginManage_t aioNMgrIob_BeginManage_orig = nullptr;
+
+    // libaio.dll
+    static aioSci_Destroy_t aioSci_Destroy_orig = nullptr;
+    static aioNodeMgr_Destroy_t aioNodeMgr_Destroy_orig = nullptr;
+    static aioNodeMgr_GetState_t aioNodeMgr_GetState_orig = nullptr;
+    static aioNodeMgr_IsReady_t aioNodeMgr_IsReady_orig = nullptr;
+    static aioNodeMgr_IsError_t aioNodeMgr_IsError_orig = nullptr;
+    static aioNodeCtl_Destroy_t aioNodeCtl_Destroy_orig = nullptr;
+    static aioNodeCtl_GetState_t aioNodeCtl_GetState_orig = nullptr;
+    static aioNodeCtl_IsReady_t aioNodeCtl_IsReady_orig = nullptr;
+    static aioNodeCtl_IsError_t aioNodeCtl_IsError_orig = nullptr;
+
+    /*
+     * variables
+     */
+
+    static AIO_IOB2_BI2X_AC1 *aioIob2Bi2xAc1;
+    static AIO_SCI_COMM *aioSciComm;
+    static AIO_NMGR_IOB2 *aioNmgrIob2;
+    static AIO_IOB2_BI2X_WRFIRM *aioIob2Bi2xWrfirm;
+
+    /*
+     * implementations
+     */
+
+    // libaio-iob2_video.dll
+
+    static AIO_IOB2_BI2X_AC1* __fastcall aioIob2Bi2xAC1_Create(AIO_NMGR_IOB2 *i_pNodeMgr, uint32_t i_DevId,
+                                                               AIO_IOB2_BI2X_AC1__SETTING *i_Setting) {
+        if (i_pNodeMgr == aioNmgrIob2) {
+            log_info("bi2x_hook", "aioIob2Bi2xAC1_Create hook hit");
+            aioIob2Bi2xAc1 = new AIO_IOB2_BI2X_AC1;
+            return aioIob2Bi2xAc1;
+        } else {
+            return aioIob2Bi2xAC1_Create_orig(i_pNodeMgr, i_DevId, i_Setting);
+        }
+    }
+
+    void __fastcall aioIob2Bi2xAC1_GetDeviceStatus(AIO_IOB2_BI2X_AC1 *i_pNodeCtl,
+                                                   AIO_IOB2_BI2X_AC1__DEVSTATUS *o_DevStatus) {
+        RI_MGR->devices_flush_output();
+
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2xAC1_GetDeviceStatus_orig(i_pNodeCtl, o_DevStatus);
+        }
+
+        memset(o_DevStatus, 0x00, sizeof(AIO_IOB2_BI2X_AC1__DEVSTATUS));
+
+        auto &buttons = get_buttons();
+        o_DevStatus->Input.CN8_8 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Test]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN8_9 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Service]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN8_10 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::CoinMech]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN15_10 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Headphone]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN15_12 = 0xFF; // Recorder off; present in I/O test menu but unused in game
+
+        o_DevStatus->Input.CN12_11 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button1]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_12 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button2]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_13 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button3]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_14 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button4]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_15 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button5]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_16 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button6]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_17 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button7]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_18 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button8]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_19 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button9]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_20 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button10]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_21 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button11]) ? 0 : 0xFF;
+        o_DevStatus->Input.CN12_22 = GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Button12]) ? 0 : 0xFF;
+
+        auto &analogs = get_analogs();
+
+        // FADER-L
+        float val = 0.f;
+        if (analogs[Analogs::FaderL].isSet()) {
+            if (PC_KNOB_MODE) {
+                val = get_fader_knob_mode_value(
+                    GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::FaderL]),
+                    fader_l_relative);
+            } else {
+                val = (GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::FaderL]) - 0.5f) * 2;
+            }
+        }
+
+        const auto now = get_performance_milliseconds();
+
+        const auto fader_l_socd = socd::socd_clean(
+            0, // Fader-L
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FaderL_Left]),
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FaderL_Right]),
+            now);
+
+        if (fader_l_socd == socd::SocdCCW) {
+            val = -1.0f;
+        } else if (fader_l_socd == socd::SocdCW) {
+            val = +1.0f;
+        }
+
+        o_DevStatus->Input.CN15_7 = (val < 0.2f) ? 0xFF : 0;
+        o_DevStatus->Input.CN15_6 = (val > -0.85f && val < 0.35f) ? 0xFF : 0;
+        o_DevStatus->Input.CN15_5 = (val > -0.6f && val < 0.6f) ? 0xFF : 0;
+        o_DevStatus->Input.CN15_4 = (val > -0.35f && val < 0.85f) ? 0xFF : 0;
+        o_DevStatus->Input.CN15_3 = (val > -0.2f) ? 0xFF : 0;
+
+        // FADER-R
+        val = 0.f;
+        if (analogs[Analogs::FaderR].isSet()) {
+            if (PC_KNOB_MODE) {
+                val = get_fader_knob_mode_value(
+                    GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::FaderR]),
+                    fader_r_relative);
+            } else {
+                val = (GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::FaderR]) - 0.5f) * 2;
+            }
+        }
+
+        const auto fader_r_socd = socd::socd_clean(
+            1, // Fader-R
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FaderR_Left]),
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FaderR_Right]),
+            now);
+
+        if (fader_r_socd == socd::SocdCCW) {
+            val = -1.0f;
+        } else if (fader_r_socd == socd::SocdCW) {
+            val = +1.0f;
+        }
+
+        o_DevStatus->Input.CN11_20 = (val < 0.2f) ? 0xFF : 0;
+        o_DevStatus->Input.CN11_19 = (val > -0.85f && val < 0.35f) ? 0xFF : 0;
+        o_DevStatus->Input.CN9_10 = (val > -0.6f && val < 0.6f) ? 0xFF : 0;
+        o_DevStatus->Input.CN9_9 = (val > -0.35f && val < 0.85f) ? 0xFF : 0;
+        o_DevStatus->Input.CN9_8 = (val > -0.2f) ? 0xFF : 0;
+
+        // coin
+        o_DevStatus->Input.Coin1Count = eamuse_coin_get_stock();
+    }
+
+    void __fastcall aioIob2Bi2xAC1_SetWatchDogTimer(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint8_t i_Count) {
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2xAC1_SetWatchDogTimer_orig(i_pNodeCtl, i_Count);
+        }
+    }
+
+    void __fastcall aioIob2Bi2xAC1_AddCounter(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_Counter, uint32_t i_Count) {
+        if (i_pNodeCtl == aioIob2Bi2xAc1 && i_Count == 0) {
+            eamuse_coin_set_stock((uint16_t) i_Count);
+        } else {
+            return aioIob2Bi2xAC1_AddCounter_orig(i_pNodeCtl, i_Counter, i_Count);
+        }
+    }
+
+    void __fastcall aioIob2Bi2xAC1_SetOutputData(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_CnPin, uint8_t i_Data) {
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2xAC1_SetOutputData_orig(i_pNodeCtl, i_CnPin, i_Data);
+        }
+
+        if (i_CnPin == 0x1) {
+            eamuse_coin_set_block(i_Data == 0xFF);
+            return;
+        }
+
+        auto &lights = get_lights();
+        if (i_CnPin == 0x11) {
+            GameAPI::Lights::writeLight(RI_MGR, lights.at(Lights::IC_READER_R), i_Data / 255.0f);
+        } else if (i_CnPin == 0x12) {
+            GameAPI::Lights::writeLight(RI_MGR, lights.at(Lights::IC_READER_G), i_Data / 255.0f);
+        } else if (i_CnPin == 0x13) {
+            GameAPI::Lights::writeLight(RI_MGR, lights.at(Lights::IC_READER_B), i_Data / 255.0f);
+        }
+    }
+
+    struct PolarisChordLight {
+        int data_index;
+        games::pc::Lights::pc_lights_t light;
+        PolarisChordLight(
+            int data_index, games::pc::Lights::pc_lights_t light) :
+                data_index(data_index), light(light) {}
+    };
+
+    static void set_led_value(games::pc::Lights::pc_lights_t light, uint8_t value) {
+        auto &lights = games::pc::get_lights();
+        GameAPI::Lights::writeLight(RI_MGR, lights.at(light), value / 255.f);
+    }
+
+    void __fastcall aioIob2Bi2xAC1_SetTapeLedDataPart(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, uint32_t i_TapeLedCh,
+                                                      uint32_t i_Offset, uint8_t *i_pData,
+                                                      uint32_t i_cntTapeLed, bool i_bReverse) {
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2xAC1_SetTapeLedDataPart_orig(i_pNodeCtl, i_TapeLedCh, i_Offset, i_pData, i_cntTapeLed, i_bReverse);
+        }
+
+        // log_info(
+        //     "pc",
+        //     "lamp [{}] [{}] = {},{},{}, cnt={}",
+        //     i_TapeLedCh,
+        //     i_Offset,
+        //     i_pData[0], i_pData[1], i_pData[2],
+        //     i_cntTapeLed);
+
+        // [channel 0]
+        // these are button lamps; there are 12 buttons (columns) with this layout:
+        //
+        // 0  5   8  11  14  16  |  18  20  22  25  28  31
+        // 1  6   9  12  15  17  |  19  21  23  26  29  32
+        // 2  7  10  13          |          24  27  30  33
+        // 3                     |                      34
+        // 4                     |                      35 
+        //
+        // 36 RGB lamps * 3 = 108 LEDs
+        // each value ranges from [0, 255]
+        // (we only care about the top row)
+
+        static PolarisChordLight button_lights_mapping[] = {
+            {(0 * 3) + 0, games::pc::Lights::pc_lights_t::Button1_R},
+            {(0 * 3) + 1, games::pc::Lights::pc_lights_t::Button1_G},
+            {(0 * 3) + 2, games::pc::Lights::pc_lights_t::Button1_B},
+
+            {(5 * 3) + 0, games::pc::Lights::pc_lights_t::Button2_R},
+            {(5 * 3) + 1, games::pc::Lights::pc_lights_t::Button2_G},
+            {(5 * 3) + 2, games::pc::Lights::pc_lights_t::Button2_B},
+
+            {(8 * 3) + 0, games::pc::Lights::pc_lights_t::Button3_R},
+            {(8 * 3) + 1, games::pc::Lights::pc_lights_t::Button3_G},
+            {(8 * 3) + 2, games::pc::Lights::pc_lights_t::Button3_B},
+
+            {(11 * 3) + 0, games::pc::Lights::pc_lights_t::Button4_R},
+            {(11 * 3) + 1, games::pc::Lights::pc_lights_t::Button4_G},
+            {(11 * 3) + 2, games::pc::Lights::pc_lights_t::Button4_B},
+
+            {(14 * 3) + 0, games::pc::Lights::pc_lights_t::Button5_R},
+            {(14 * 3) + 1, games::pc::Lights::pc_lights_t::Button5_G},
+            {(14 * 3) + 2, games::pc::Lights::pc_lights_t::Button5_B},
+
+            {(16 * 3) + 0, games::pc::Lights::pc_lights_t::Button6_R},
+            {(16 * 3) + 1, games::pc::Lights::pc_lights_t::Button6_G},
+            {(16 * 3) + 2, games::pc::Lights::pc_lights_t::Button6_B},
+
+            {(18 * 3) + 0, games::pc::Lights::pc_lights_t::Button7_R},
+            {(18 * 3) + 1, games::pc::Lights::pc_lights_t::Button7_G},
+            {(18 * 3) + 2, games::pc::Lights::pc_lights_t::Button7_B},
+
+            {(20 * 3) + 0, games::pc::Lights::pc_lights_t::Button8_R},
+            {(20 * 3) + 1, games::pc::Lights::pc_lights_t::Button8_G},
+            {(20 * 3) + 2, games::pc::Lights::pc_lights_t::Button8_B},
+
+            {(22 * 3) + 0, games::pc::Lights::pc_lights_t::Button9_R},
+            {(22 * 3) + 1, games::pc::Lights::pc_lights_t::Button9_G},
+            {(22 * 3) + 2, games::pc::Lights::pc_lights_t::Button9_B},
+
+            {(25 * 3) + 0, games::pc::Lights::pc_lights_t::Button10_R},
+            {(25 * 3) + 1, games::pc::Lights::pc_lights_t::Button10_G},
+            {(25 * 3) + 2, games::pc::Lights::pc_lights_t::Button10_B},
+
+            {(28 * 3) + 0, games::pc::Lights::pc_lights_t::Button11_R},
+            {(28 * 3) + 1, games::pc::Lights::pc_lights_t::Button11_G},
+            {(28 * 3) + 2, games::pc::Lights::pc_lights_t::Button11_B},
+
+            {(31 * 3) + 0, games::pc::Lights::pc_lights_t::Button12_R},
+            {(31 * 3) + 1, games::pc::Lights::pc_lights_t::Button12_G},
+            {(31 * 3) + 2, games::pc::Lights::pc_lights_t::Button12_B},
+        };
+
+        if (i_TapeLedCh == 0 && i_Offset == 0 && i_cntTapeLed == 108) {
+            for (const auto &map : button_lights_mapping) {
+                set_led_value(map.light, i_pData[map.data_index]);
+            }
+        }
+    }
+
+    void __fastcall aioIob2Bi2x_SetTapeLedDataGroup(AIO_IOB2_BI2X_AC1* i_pNodeCtl, uint32_t i_bfGroup) {
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2x_SetTapeLedDataGroup_orig(i_pNodeCtl, i_bfGroup);
+        }
+    }
+
+    void __fastcall aioIob2Bi2x_SetTapeLedDataLimit(AIO_IOB2_BI2X_AC1* i_pNodeCtl, uint32_t i_Channel,
+                                                    uint8_t i_Scale, uint8_t i_Limit) {
+        if (i_pNodeCtl != aioIob2Bi2xAc1) {
+            return aioIob2Bi2x_SetTapeLedDataLimit_orig(i_pNodeCtl, i_Channel, i_Scale, i_Limit);
+        }
+    }
+
+    static AIO_SCI_COMM *__fastcall aioIob2Bi2x_OpenSciUsbCdc(uint32_t i_SerialNumber) {
+        aioSciComm = new AIO_SCI_COMM;
+        return aioSciComm;
+    }
+
+    static AIO_IOB2_BI2X_WRFIRM *__fastcall aioIob2Bi2x_CreateWriteFirmContext(
+            uint32_t i_SerialNumber, uint32_t i_bfIob) {
+
+        aioIob2Bi2xWrfirm = new AIO_IOB2_BI2X_WRFIRM;
+        return aioIob2Bi2xWrfirm;
+    }
+
+    static void __fastcall aioIob2Bi2x_DestroyWriteFirmContext(AIO_IOB2_BI2X_WRFIRM *i_pWrFirm) {
+        if (i_pWrFirm == aioIob2Bi2xWrfirm) {
+            delete aioIob2Bi2xWrfirm;
+            aioIob2Bi2xWrfirm = nullptr;
+        } else {
+            return aioIob2Bi2x_DestroyWriteFirmContext_orig(i_pWrFirm);
+        }
+    }
+
+    static int32_t __fastcall aioIob2Bi2x_WriteFirmGetState(AIO_IOB2_BI2X_WRFIRM *i_pWrFirm) {
+        if (i_pWrFirm == aioIob2Bi2xWrfirm) {
+            return 8;
+        } else {
+            return aioIob2Bi2x_WriteFirmGetState_orig(i_pWrFirm);
+        }
+    }
+
+    static bool __fastcall aioIob2Bi2x_WriteFirmIsCompleted(int32_t i_State) {
+        if (aioIob2Bi2xWrfirm != nullptr) {
+            return true;
+        } else {
+            return aioIob2Bi2x_WriteFirmIsCompleted_orig(i_State);
+        }
+    }
+
+    static bool __fastcall aioIob2Bi2x_WriteFirmIsError(int32_t i_State) {
+        if (aioIob2Bi2xWrfirm != nullptr) {
+            return false;
+        } else {
+            return aioIob2Bi2x_WriteFirmIsError_orig(i_State);
+        }
+    }
+
+    // libaio-iob.dll
+
+    static AIO_NMGR_IOB2 *__fastcall aioNMgrIob2_Create(AIO_SCI_COMM *i_pSci, uint32_t i_bfMode) {
+        if (i_pSci == aioSciComm) {
+            aioNmgrIob2 = new AIO_NMGR_IOB2;
+            return aioNmgrIob2;
+        } else {
+            return aioNMgrIob2_Create_orig(i_pSci, i_bfMode);
+        }
+    }
+
+    static void __fastcall aioNMgrIob_BeginManage(AIO_NMGR_IOB2 *i_pNodeMgr) {
+        if (i_pNodeMgr != aioNmgrIob2) {
+            return aioNMgrIob_BeginManage_orig(i_pNodeMgr);
+        }
+    }
+
+    // libaio.dll
+
+    static void __fastcall aioSci_Destroy(AIO_SCI_COMM *i_pNodeMgr) {
+        if (i_pNodeMgr == aioSciComm) {
+            delete aioSciComm;
+        } else {
+            return aioSci_Destroy_orig(i_pNodeMgr);
+        }
+    }
+
+    static void __fastcall aioNodeMgr_Destroy(AIO_NMGR_IOB2 *i_pNodeMgr) {
+        if (i_pNodeMgr == aioNmgrIob2) {
+            delete aioNmgrIob2;
+            aioNmgrIob2 = nullptr;
+        } else {
+            return aioNodeMgr_Destroy_orig(i_pNodeMgr);
+        }
+    }
+
+    static int32_t __fastcall aioNodeMgr_GetState(AIO_NMGR_IOB2 *i_pNodeMgr) {
+        if (i_pNodeMgr == aioNmgrIob2) {
+            return 1;
+        } else {
+            return aioNodeMgr_GetState_orig(i_pNodeMgr);
+        }
+    }
+
+    static bool __fastcall aioNodeMgr_IsReady(AIO_NMGR_IOB2 *i_pNodeMgr, int32_t i_State) {
+        if (i_pNodeMgr == aioNmgrIob2) {
+            return true;
+        } else {
+            return aioNodeMgr_IsReady_orig(i_pNodeMgr, i_State);
+        }
+    }
+
+    static bool __fastcall aioNodeMgr_IsError(AIO_NMGR_IOB2 *i_pNodeMgr, int32_t i_State) {
+        if (i_pNodeMgr == aioNmgrIob2) {
+            return false;
+        } else {
+            return aioNodeMgr_IsError_orig(i_pNodeMgr, i_State);
+        }
+    }
+
+    static void __fastcall aioNodeCtl_Destroy(AIO_IOB2_BI2X_AC1 *i_pNodeCtl) {
+        if (i_pNodeCtl == aioIob2Bi2xAc1) {
+            delete aioIob2Bi2xAc1;
+            aioIob2Bi2xAc1 = nullptr;
+        } else {
+            return aioNodeCtl_Destroy_orig(i_pNodeCtl);
+        }
+    }
+
+    static int32_t __fastcall aioNodeCtl_GetState(AIO_IOB2_BI2X_AC1 *i_pNodeCtl) {
+        if (i_pNodeCtl == aioIob2Bi2xAc1) {
+            return 1;
+        } else {
+            return aioNodeCtl_GetState_orig(i_pNodeCtl);
+        }
+    }
+
+    static bool __fastcall aioNodeCtl_IsReady(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, int32_t i_State) {
+        if (i_pNodeCtl == aioIob2Bi2xAc1) {
+            return true;
+        } else {
+            return aioNodeCtl_IsReady_orig(i_pNodeCtl, i_State);
+        }
+    }
+
+    static bool __fastcall aioNodeCtl_IsError(AIO_IOB2_BI2X_AC1 *i_pNodeCtl, int32_t i_State) {
+        if (i_pNodeCtl == aioIob2Bi2xAc1) {
+            return false;
+        } else {
+            return aioNodeCtl_IsError_orig(i_pNodeCtl, i_State);
+        }
+    }
+
+    void bi2x_hook_init() {
+        // avoid double init
+        static bool initialized = false;
+        if (initialized) {
+            return;
+        } else {
+            initialized = true;
+        }
+
+        // announce
+        log_info("bi2x_hook", "init");
+
+        // libaio-iob2_video.dll
+        const auto libaioIob2VideoDll = "libaio-iob2_video.dll";
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_Create",
+                                aioIob2Bi2xAC1_Create, &aioIob2Bi2xAC1_Create_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_GetDeviceStatus",
+                                aioIob2Bi2xAC1_GetDeviceStatus, &aioIob2Bi2xAC1_GetDeviceStatus_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_SetWatchDogTimer",
+                                aioIob2Bi2xAC1_SetWatchDogTimer, &aioIob2Bi2xAC1_SetWatchDogTimer_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_AddCounter",
+                                aioIob2Bi2xAC1_AddCounter, &aioIob2Bi2xAC1_AddCounter_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_SetOutputData",
+                                aioIob2Bi2xAC1_SetOutputData, &aioIob2Bi2xAC1_SetOutputData_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xAC1_SetTapeLedDataPart",
+                                aioIob2Bi2xAC1_SetTapeLedDataPart, &aioIob2Bi2xAC1_SetTapeLedDataPart_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_SetTapeLedDataGroup",
+                                aioIob2Bi2x_SetTapeLedDataGroup, &aioIob2Bi2x_SetTapeLedDataGroup_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_SetTapeLedDataLimit",
+                                aioIob2Bi2x_SetTapeLedDataLimit, &aioIob2Bi2x_SetTapeLedDataLimit_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_OpenSciUsbCdc",
+                                aioIob2Bi2x_OpenSciUsbCdc, &aioIob2Bi2x_OpenSciUsbCdc_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_CreateWriteFirmContext",
+                                aioIob2Bi2x_CreateWriteFirmContext, &aioIob2Bi2x_CreateWriteFirmContext_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_DestroyWriteFirmContext",
+                                aioIob2Bi2x_DestroyWriteFirmContext, &aioIob2Bi2x_DestroyWriteFirmContext_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_WriteFirmGetState",
+                                aioIob2Bi2x_WriteFirmGetState, &aioIob2Bi2x_WriteFirmGetState_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_WriteFirmIsCompleted",
+                                aioIob2Bi2x_WriteFirmIsCompleted, &aioIob2Bi2x_WriteFirmIsCompleted_orig);
+        execexe::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2x_WriteFirmIsError",
+                                aioIob2Bi2x_WriteFirmIsError, &aioIob2Bi2x_WriteFirmIsError_orig);
+
+        // libaio-iob.dll
+        const auto libaioIobDll = "libaio-iob.dll";
+        execexe::trampoline_try(libaioIobDll, "aioNMgrIob2_Create",
+                                aioNMgrIob2_Create, &aioNMgrIob2_Create_orig);
+        execexe::trampoline_try(libaioIobDll, "aioNMgrIob_BeginManage",
+                                aioNMgrIob_BeginManage, &aioNMgrIob_BeginManage_orig);
+
+        // libaio.dll
+        const auto libaioDll = "libaio.dll";
+        execexe::trampoline_try(libaioDll, "aioSci_Destroy",
+                                aioSci_Destroy, &aioSci_Destroy_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeMgr_Destroy",
+                                aioNodeMgr_Destroy, &aioNodeMgr_Destroy_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeMgr_GetState",
+                                aioNodeMgr_GetState, &aioNodeMgr_GetState_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeMgr_IsReady",
+                                aioNodeMgr_IsReady, &aioNodeMgr_IsReady_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeMgr_IsError",
+                                aioNodeMgr_IsError, &aioNodeMgr_IsError_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeCtl_Destroy",
+                               aioNodeCtl_Destroy, &aioNodeCtl_Destroy_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeCtl_GetState",
+                               aioNodeCtl_GetState, &aioNodeCtl_GetState_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeCtl_IsReady",
+                               aioNodeCtl_IsReady, &aioNodeCtl_IsReady_orig);
+        execexe::trampoline_try(libaioDll, "aioNodeCtl_IsError",
+                               aioNodeCtl_IsError, &aioNodeCtl_IsError_orig);
+    }
+
+}
+
+#endif

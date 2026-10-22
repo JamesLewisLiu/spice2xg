@@ -1,0 +1,464 @@
+#include "bi2x_hook.h"
+
+#if SPICE64
+
+#include <cstdint>
+#include "api/client.h"
+#include "util/detour.h"
+#include "util/logging.h"
+#include "util/utils.h"
+#include "rawinput/rawinput.h"
+#include "misc/eamuse.h"
+#include "games/io.h"
+#include "launcher/options.h"
+#include "io.h"
+#include "games/sdvx/sdvx.h"
+#include "util/socd_cleaner.h"
+#include "util/tapeled.h"
+#include "util/time.h"
+#include "acioemu/icca.h"
+
+#define DEBUG_VERBOSE 0
+
+#if DEBUG_VERBOSE
+#define log_debug(module, format_str, ...) logger::push( \
+    LOG_FORMAT("M", module, format_str, ## __VA_ARGS__), logger::Style::GREY)
+#else
+#define log_debug(module, format_str, ...)
+#endif
+
+namespace games::sdvx {
+    constexpr bool BI2X_PASSTHROUGH = false;
+
+    /*
+     * class definitions
+     */
+
+    struct AC_HNDLIF {
+        // dummy
+        uint8_t data[0x10];
+    };
+
+    struct AIO_NMGR_IOB2_VTABLE {
+        // other functions here, but they never get called
+        uint8_t dummy[0x50];
+        void (__fastcall *pAIO_NMGR_IOB_BeginManage)(int64_t a1);
+    };
+
+    struct AIO_NMGR_IOB2 {
+        AIO_NMGR_IOB2_VTABLE *vptr;
+        uint8_t dummy[0x9F0];
+    };
+
+    // confirmed in EG final in aioNMgrIob2_Create
+    static_assert(sizeof(AIO_NMGR_IOB2) == 0x9F8);
+
+    struct AIO_IOB2_BI2X_UFC {
+        // who knows
+        uint8_t data[0x39D8];
+    };
+
+    // confirmed in EG final in aioIob2Bi2xUFC_Create
+    static_assert(sizeof(AIO_IOB2_BI2X_UFC) == 0x39D8);
+
+    struct AIO_IOB2_BI2X_UFC__INPUT {
+        uint8_t DevIoCounter;
+        uint8_t bExIoAErr;
+        uint8_t bExIoBErr;
+        uint8_t bPcPowerOn;
+        uint8_t bPcPowerCheck;
+        uint8_t CoinCount;
+        uint8_t bTest;
+        uint8_t bService;
+        uint8_t bCoinSw;
+        uint8_t bCoinJam;
+        uint8_t bHPDetect;
+    };
+
+    struct AIO_IOB2_BI2X_UFC__DEVSTATUS {
+        uint8_t InputCounter;
+        uint8_t OutputCounter;
+        uint8_t IoResetCounter;
+        uint8_t TapeLedCounter;
+        uint8_t TapeLedRate[8];
+        AIO_IOB2_BI2X_UFC__INPUT Input;
+        uint8_t unk_1[289];
+        uint16_t AnalogLeft;
+        uint16_t AnalogRight;
+        uint8_t Buttons;
+        uint8_t unk_2[97];
+    };
+
+    /*
+     * typedefs
+     */
+
+    // libaio-iob2_video.dll
+    typedef AIO_IOB2_BI2X_UFC* (__fastcall *aioIob2Bi2xUFC_Create_t)(AIO_NMGR_IOB2 *nmgr, int a2);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__GetDeviceStatus_t)(AIO_IOB2_BI2X_UFC *This,
+            AIO_IOB2_BI2X_UFC__DEVSTATUS *a2);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__IoReset_t)(AIO_IOB2_BI2X_UFC *This,
+            unsigned int a2);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__SetWatchDogTimer_t)(AIO_IOB2_BI2X_UFC *This, uint8_t a2);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__ControlCoinBlocker_t)(AIO_IOB2_BI2X_UFC *This,
+            uint64_t index, uint8_t state);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__AddCounter_t)(AIO_IOB2_BI2X_UFC *This,
+            unsigned int a2, unsigned int a3);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__SetIccrLed_t)(AIO_IOB2_BI2X_UFC *This, uint32_t color);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp_t)(AIO_IOB2_BI2X_UFC *This,
+            int button, uint8_t state);
+    typedef void (__fastcall *AIO_IOB2_BI2X_UFC__SetTapeLedData_t)(AIO_IOB2_BI2X_UFC *This,
+            unsigned int index, uint8_t *data);
+
+    // libaio-iob.dll
+    typedef AC_HNDLIF* (__fastcall *aioIob2Bi2x_OpenSciUsbCdc_t)(uint8_t device_num);
+    typedef int64_t (__fastcall *aioIob2Bi2x_WriteFirmGetState_t)(int64_t a1);
+    typedef AIO_NMGR_IOB2* (__fastcall *aioNMgrIob2_Create_t)(AC_HNDLIF *a1, unsigned int a2);
+
+    /*
+     * function pointers
+     */
+
+    // libaio-iob2_video.dll
+    static aioIob2Bi2xUFC_Create_t aioIob2Bi2xUFC_Create_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__GetDeviceStatus_t AIO_IOB2_BI2X_UFC__GetDeviceStatus_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__IoReset_t AIO_IOB2_BI2X_UFC__IoReset_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__SetWatchDogTimer_t AIO_IOB2_BI2X_UFC__SetWatchDogTimer_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__ControlCoinBlocker_t AIO_IOB2_BI2X_UFC__ControlCoinBlocker_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__AddCounter_t AIO_IOB2_BI2X_UFC__AddCounter_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__SetIccrLed_t AIO_IOB2_BI2X_UFC__SetIccrLed_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp_t AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp_orig = nullptr;
+    static AIO_IOB2_BI2X_UFC__SetTapeLedData_t AIO_IOB2_BI2X_UFC__SetTapeLedData_orig = nullptr;
+
+    // libaio-iob.dll
+    static aioIob2Bi2x_OpenSciUsbCdc_t aioIob2Bi2x_OpenSciUsbCdc_orig = nullptr;
+    static aioIob2Bi2x_WriteFirmGetState_t aioIob2Bi2x_WriteFirmGetState_orig = nullptr;
+    static aioNMgrIob2_Create_t aioNMgrIob2_Create_orig = nullptr;
+
+    /*
+     * variables
+     */
+
+    AIO_IOB2_BI2X_UFC *custom_node = nullptr;
+    AC_HNDLIF *acHndlif = nullptr;
+    AIO_NMGR_IOB2 *aioNmgrIob2 = nullptr;
+    // state
+    static uint8_t count = 0;
+    static uint16_t VOL_L = 0;
+    static uint16_t VOL_R = 0;
+
+    /*
+     * implementations
+     */
+
+    static AIO_IOB2_BI2X_UFC* __fastcall aioIob2Bi2xUFC_Create(AIO_NMGR_IOB2 *nmgr, int a2) {
+        if (!BI2X_PASSTHROUGH) {
+            custom_node = new AIO_IOB2_BI2X_UFC;
+            memset(&custom_node->data, 0, sizeof(custom_node->data));
+            return custom_node;
+        } else {
+
+            // call original
+            return aioIob2Bi2xUFC_Create_orig(nmgr, a2);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__GetDeviceStatus(AIO_IOB2_BI2X_UFC *This,
+            AIO_IOB2_BI2X_UFC__DEVSTATUS *status) {
+
+        // flush raw input
+        RI_MGR->devices_flush_output();
+
+        // check handle
+        if (This == custom_node) {
+
+            // clear input data
+            memset(status, 0x00, sizeof(AIO_IOB2_BI2X_UFC__DEVSTATUS));
+        } else {
+
+            // get data from real device
+            AIO_IOB2_BI2X_UFC__GetDeviceStatus_orig(This, status);
+        }
+
+        status->InputCounter = count;
+        status->Input.DevIoCounter = count;
+        count++;
+
+        // get buttons
+        auto &buttons = get_buttons();
+
+        // control buttons
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Test]))
+            status->Input.bTest = 0x01;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Service]))
+            status->Input.bService = 0x01;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::CoinMech]))
+            status->Input.bCoinSw = 0x01;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Start]))
+            status->Buttons |= 0x01;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::BT_A]))
+            status->Buttons |= 0x02;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::BT_B]))
+            status->Buttons |= 0x04;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::BT_C]))
+            status->Buttons |= 0x08;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::BT_D]))
+            status->Buttons |= 0x10;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FX_L]))
+            status->Buttons |= 0x20;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::FX_R]))
+            status->Buttons |= 0x40;
+        if (GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::Headphone]))
+            status->Input.bHPDetect = 0x01;
+
+        status->Input.CoinCount += eamuse_coin_get_stock();
+
+        const auto now = get_performance_milliseconds();
+
+        // volume left
+        const auto vol_l_state = socd::socd_clean(0,
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::VOL_L_Left]),
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::VOL_L_Right]),
+            now);
+        if (vol_l_state == socd::SocdCCW) {
+            VOL_L -= ((uint16_t)DIGITAL_KNOB_SENS * 4);
+        } else if (vol_l_state == socd::SocdCW) {
+            VOL_L += ((uint16_t)DIGITAL_KNOB_SENS * 4);
+        }
+
+        // volume right
+        const auto vol_r_state = socd::socd_clean(1,
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::VOL_R_Left]),
+            GameAPI::Buttons::getState(RI_MGR, buttons[Buttons::VOL_R_Right]),
+            now);
+        if (vol_r_state == socd::SocdCCW) {
+            VOL_R -= ((uint16_t)DIGITAL_KNOB_SENS * 4);
+        } else if (vol_r_state == socd::SocdCW) {
+            VOL_R += ((uint16_t)DIGITAL_KNOB_SENS * 4);
+        }
+
+        // update volumes
+        auto &analogs = get_analogs();
+        auto vol_left = VOL_L;
+        auto vol_right = VOL_R;
+        if (analogs[0].isSet() || analogs[1].isSet()) {
+            vol_left += (uint16_t) (GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::VOL_L]) * 65535);
+            vol_right += (uint16_t) (GameAPI::Analogs::getState(RI_MGR, analogs[Analogs::VOL_R]) * 65535);
+        }
+
+        status->AnalogLeft = vol_left;
+        status->AnalogRight = vol_right;
+
+        log_debug(
+            "bi2x_hook",
+            "knobs = {} {}",
+            status->AnalogLeft,
+            status->AnalogRight);
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__IoReset(AIO_IOB2_BI2X_UFC *This,
+            unsigned int a2)
+    {
+        if (This != custom_node) {
+            return AIO_IOB2_BI2X_UFC__IoReset_orig(This, a2);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__SetWatchDogTimer(AIO_IOB2_BI2X_UFC *This,
+            uint8_t a2)
+    {
+        if (This != custom_node) {
+
+            // comment this out if you want to disable the BI2X watchdog timer
+            return AIO_IOB2_BI2X_UFC__SetWatchDogTimer_orig(This, a2);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__ControlCoinBlocker(AIO_IOB2_BI2X_UFC *This,
+            uint64_t index, uint8_t state) {
+
+        // coin blocker is closed when state is zero
+        eamuse_coin_set_block(state == 0);
+
+        if (This != custom_node) {
+            return AIO_IOB2_BI2X_UFC__ControlCoinBlocker_orig(This, index, state);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__AddCounter(AIO_IOB2_BI2X_UFC *This,
+            unsigned int a2, unsigned int a3)
+    {
+        if (This != custom_node) {
+            return AIO_IOB2_BI2X_UFC__AddCounter_orig(This, a2, a3);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__SetIccrLed(AIO_IOB2_BI2X_UFC *This, uint32_t color)
+    {
+        uint32_t col_r = (color & 0xFF0000) >> 16;
+        uint32_t col_g = (color & 0x00FF00) >> 8;
+        uint32_t col_b = (color & 0x0000FF) >> 0;
+
+        auto &lights = get_lights();
+
+        GameAPI::Lights::writeLight(RI_MGR, lights[Lights::ICCR_R], col_r / 255.f);
+        GameAPI::Lights::writeLight(RI_MGR, lights[Lights::ICCR_G], col_g / 255.f);
+        GameAPI::Lights::writeLight(RI_MGR, lights[Lights::ICCR_B], col_b / 255.f);
+
+        if (This != custom_node) {
+            return AIO_IOB2_BI2X_UFC__SetIccrLed_orig(This, color);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp(AIO_IOB2_BI2X_UFC *This,
+            int button, uint8_t state)
+    {
+        auto &lights = get_lights();
+
+        /**
+         * button
+         * 0: START, 1: BT_A, 2: BT_B, 3: BT_C, 4: BT_D, 5: FX_L, 6: FX_R
+         *
+         * state
+         * 0: ON, 1: OFF
+         */
+        if (button == 0) {
+            GameAPI::Lights::writeLight(RI_MGR, lights[Lights::START], state ? 1.f : 0.f);
+        } else {
+            GameAPI::Lights::writeLight(RI_MGR, lights[Lights::BT_A + button - 1], state ? 1.f : 0.f);
+        }
+
+        if (This != custom_node) {
+            return AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp_orig(This, button, state);
+        }
+    }
+
+    static void __fastcall AIO_IOB2_BI2X_UFC__SetTapeLedData(AIO_IOB2_BI2X_UFC *This,
+            unsigned int index, uint8_t *data)
+    {
+        /*
+         * index mapping
+         * 0 - title - 222 bytes - 74 colors
+         * 1 - upper left speaker - 36 bytes - 12 colors
+         * 2 - upper right speaker - 36 bytes - 12 colors
+         * 3 - left wing - 168 bytes - 56 colors
+         * 4 - right wing - 168 bytes - 56 colors
+         * 5 - control panel - 282 bytes - 94 colors
+         * 6 - lower left speaker - 36 bytes - 12 colors
+         * 7 - lower right speaker - 36 bytes - 12 colors
+         * 8 - woofer - 42 bytes - 14 colors
+         * 9 - v unit - 258 bytes - 86 colors
+         *
+         * data is stored in RGB order, 3 bytes per color
+         */
+
+        // check index bounds
+        if (tapeledutils::is_enabled() && index < std::size(TAPELED_MAPPING)) {
+            auto &map = TAPELED_MAPPING[index];
+            const auto data_size = map.data.size();
+
+            // pick a color to use
+            const auto rgb = tapeledutils::pick_color_from_led_tape(data, data_size);
+
+            // program the lights into API
+            auto &lights = get_lights();
+            GameAPI::Lights::writeLight(RI_MGR, lights[map.index_r], rgb.r);
+            GameAPI::Lights::writeLight(RI_MGR, lights[map.index_g], rgb.g);
+            GameAPI::Lights::writeLight(RI_MGR, lights[map.index_b], rgb.b);
+
+            if (api::has_clients()) {
+                for (size_t i = 0; i < data_size; ++i) {
+                    map.data[i].r = data[i * 3];
+                    map.data[i].g = data[i * 3 + 1];
+                    map.data[i].b = data[i * 3 + 2];
+                }
+            }
+        }
+
+        if (This != custom_node) {
+            // send tape data to real device
+            return AIO_IOB2_BI2X_UFC__SetTapeLedData_orig(This, index, data);
+        }
+    }
+
+    static AC_HNDLIF* __fastcall aioIob2Bi2X_OpenSciUsbCdc(uint8_t device_num) {
+        if (acHndlif == nullptr) {
+            acHndlif = new AC_HNDLIF;
+            memset(acHndlif->data, 0x0, sizeof(acHndlif->data));
+        }
+        log_info("bi2x_hook", "aioIob2Bi2x_OpenSciUsbCdc");
+        return acHndlif;
+    }
+
+    static void __fastcall AIO_NMGR_IOB_BeginManageStub(int64_t a1) {
+        log_info("bi2x_hook", "AIO_NMGR_IOB::BeginManage");
+    }
+
+    static AIO_NMGR_IOB2* __fastcall aioNMgrIob2_Create(AC_HNDLIF *a1, unsigned int a2) {
+        if (aioNmgrIob2 == nullptr) {
+            aioNmgrIob2 = new AIO_NMGR_IOB2{};
+            aioNmgrIob2->vptr = new AIO_NMGR_IOB2_VTABLE{};
+            aioNmgrIob2->vptr->pAIO_NMGR_IOB_BeginManage = AIO_NMGR_IOB_BeginManageStub;
+        }
+        log_info("bi2x_hook", "aioNMgrIob2_Create returned {}, size=0x{:x}, vptr @ {}",
+            fmt::ptr(aioNmgrIob2), sizeof(*aioNmgrIob2), fmt::ptr(aioNmgrIob2->vptr));
+
+        // enable hack to make PIN pad work for KFC in BI2X mode
+        // this explicit check in the I/O init path is necessary
+        // (as opposed to just doing a check for "isValkyrieCabMode?")
+        // because there are hex edits that allow you to use legacy (KFC/BIO2) IO while in Valk mode
+        acioemu::ICCA_DEVICE_HACK = true;
+        return aioNmgrIob2;
+    }
+
+    static int64_t __fastcall aioIob2Bi2x_WriteFirmGetState(int64_t a1) {
+        log_info("bi2x_hook", "aioIob2Bi2x_WriteFirmGetState");
+        return 8;
+    }
+
+    void bi2x_hook_init() {
+        
+        // avoid double init
+        static bool initialized = false;
+        if (initialized) {
+            return;
+        } else {
+            initialized = true;
+        }
+
+        // announce
+        log_info("bi2x_hook", "init");
+
+        // hook IOB2 video
+        const auto libaioIob2VideoDll = "libaio-iob2_video.dll";
+        detour::trampoline_try(libaioIob2VideoDll, "aioIob2Bi2xUFC_Create",
+                aioIob2Bi2xUFC_Create, &aioIob2Bi2xUFC_Create_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?GetDeviceStatus@AIO_IOB2_BI2X_UFC@@QEBAXAEAUDEVSTATUS@1@@Z",
+                AIO_IOB2_BI2X_UFC__GetDeviceStatus, &AIO_IOB2_BI2X_UFC__GetDeviceStatus_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?IoReset@AIO_IOB2_BI2X_UFC@@QEAAXI@Z",
+                AIO_IOB2_BI2X_UFC__IoReset, &AIO_IOB2_BI2X_UFC__IoReset_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?SetWatchDogTimer@AIO_IOB2_BI2X_UFC@@QEAAXE@Z",
+                AIO_IOB2_BI2X_UFC__SetWatchDogTimer, &AIO_IOB2_BI2X_UFC__SetWatchDogTimer_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?ControlCoinBlocker@AIO_IOB2_BI2X_UFC@@QEAAXI_N@Z",
+                AIO_IOB2_BI2X_UFC__ControlCoinBlocker, &AIO_IOB2_BI2X_UFC__ControlCoinBlocker_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?AddCounter@AIO_IOB2_BI2X_UFC@@QEAAXII@Z",
+                AIO_IOB2_BI2X_UFC__AddCounter, &AIO_IOB2_BI2X_UFC__AddCounter_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?SetIccrLed@AIO_IOB2_BI2X_UFC@@QEAAXI@Z",
+                AIO_IOB2_BI2X_UFC__SetIccrLed, &AIO_IOB2_BI2X_UFC__SetIccrLed_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?SetPlayerButtonLamp@AIO_IOB2_BI2X_UFC@@QEAAXI_N@Z",
+                AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp, &AIO_IOB2_BI2X_UFC__SetPlayerButtonLamp_orig);
+        detour::trampoline_try(libaioIob2VideoDll, "?SetTapeLedData@AIO_IOB2_BI2X_UFC@@QEAAXIPEBX@Z",
+                AIO_IOB2_BI2X_UFC__SetTapeLedData, &AIO_IOB2_BI2X_UFC__SetTapeLedData_orig);
+
+        // hook IOB
+        const auto libaioIobDll = "libaio-iob.dll";
+        detour::trampoline_try(libaioIobDll, "aioIob2Bi2x_OpenSciUsbCdc",
+                aioIob2Bi2X_OpenSciUsbCdc, &aioIob2Bi2x_OpenSciUsbCdc_orig);
+        detour::trampoline_try(libaioIobDll, "aioIob2Bi2x_WriteFirmGetState",
+                aioIob2Bi2x_WriteFirmGetState, &aioIob2Bi2x_WriteFirmGetState_orig);
+        detour::trampoline_try(libaioIobDll, "aioNMgrIob2_Create",
+                aioNMgrIob2_Create, &aioNMgrIob2_Create_orig);
+    }
+}
+
+#endif

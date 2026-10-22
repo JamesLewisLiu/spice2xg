@@ -1,0 +1,26 @@
+.vscode/*
+
+# JetBrains IDEs
+.idea
+.idea_modules
+*.iws
+
+# CMake
+cmake-build*
+
+# user config
+build_all.local.sh
+build_docker.local.sh
+
+# output from build script
+bin/*
+dist/*
+
+external/cv2pdb/*
+
+.ccache/*
+
+# Visual Studio
+.vs
+out
+CMakeSettings.json

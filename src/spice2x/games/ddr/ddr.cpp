@@ -1,0 +1,340 @@
+#include "ddr.h"
+
+#include "acioemu/handle.h"
+#include "avs/game.h"
+#include "hooks/avshook.h"
+#include "hooks/cfgmgr32hook.h"
+#include "hooks/devicehook.h"
+#include "hooks/setupapihook.h"
+#include "hooks/sleephook.h"
+#include "hooks/input/dinput8/hook.h"
+#include "util/deferlog.h"
+#include "util/utils.h"
+#include "util/libutils.h"
+#include "util/fileutils.h"
+#include "util/detour.h"
+#include "cfg/configurator.h"
+
+#include "io.h"
+
+#include "p3io/foot.h"
+#include "p3io/p3io.h"
+#include "p3io/sate.h"
+#include "p3io/usbmem.h"
+
+#include "p4io/p4io.h"
+#include <cstring>
+
+using namespace acioemu;
+
+namespace games::ddr {
+
+    // settings
+    bool SDMODE = false;
+    bool NO_CODEC_REGISTRATION = false;
+
+    uint8_t DDR_TAPELEDS[TAPELED_DEVICE_COUNT][50][3] {};
+
+    static decltype(SendMessage) *SendMessage_real = nullptr;
+
+    static SHORT WINAPI GetAsyncKeyState_hook(int vKey) {
+
+        // disable debug keys
+        return 0;
+    }
+
+    static LRESULT WINAPI SendMessage_hook(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
+
+        // ignore broadcasts
+        if (hWnd == HWND_BROADCAST) {
+            return 1;
+        }
+
+        // fallback
+        return SendMessage_real(hWnd, Msg, wParam, lParam);
+    }
+
+    bool contains_only_ascii(const std::wstring& str) {
+        for (auto c: str) {
+            if (c > 127) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    DDRGame::DDRGame() : Game("Dance Dance Revolution") {
+    }
+
+    void DDRGame::register_codecs() {
+        // find where spice.exe / spice64.exe is located
+        const auto &spice_bin_path = libutils::module_file_name(nullptr).parent_path();
+
+        // find the com directory
+        std::filesystem::path dir = "";
+        if (MODULE_PATH == spice_bin_path) {
+            // try: \com
+            dir = spice_bin_path / "com";
+        } else {
+            // try: modules\..\com
+            dir = MODULE_PATH / ".." / "com";
+        }
+
+        if (fileutils::dir_exists(dir)) {
+            log_info("ddr", "looking for codecs in this directory: {}", dir);
+        } else {
+            log_info("ddr", "codecs directory not found: {}", dir);
+            return;
+        }
+
+        for (const auto &file : std::filesystem::directory_iterator(dir)) {
+            const auto &filename = file.path().filename();
+            const auto extension = filename.extension().wstring();
+
+            if (wcsicmp(extension.c_str(), L".dll") != 0) {
+                continue;
+            }
+
+            log_info("ddr", "found DLL: {}, size: {} bytes", filename, file.file_size());
+            if (filename == "k-clvsd.dll" || filename.wstring().find(L"xactengine") == 0) {
+                const std::wstring wcmd = L"regsvr32.exe /s \"" + file.path().wstring() + L"\"";
+                const std::string cmd = fmt::format("regsvr32.exe /s \"{}\"", file.path());
+
+                int result = 0;
+                std::thread t([wcmd, &result]() {
+                    result = _wsystem(wcmd.c_str());
+                });
+                t.join();
+
+                if (result == 0) {
+                    log_info("ddr", "`{}` returned {}", cmd, result);
+                } else {
+                    log_warning("ddr", "`{}` failed, returned {}", cmd, result);
+                    deferredlogs::defer_error_messages({
+                        "DDR codec registration failure",
+                        fmt::format("    {} failed to register with error {}", filename, result)});
+                }
+
+                static std::once_flag printed;
+                std::call_once(printed, [file]() {
+                    if (!contains_only_ascii(file.path().wstring())) {
+                        log_warning(
+                            "ddr",
+                            "BAD PATH ERROR\n\n"
+                            "!!!                                                          !!!\n"
+                            "!!! filesystem path to codec contains non-ASCII characters!  !!!\n"
+                            "!!! this may cause failures when loading codecs, and         !!!\n"
+                            "!!! potentially leading the game to crash!                   !!!\n"
+                            "!!!                                                          !!!\n"
+                            );
+
+                        deferredlogs::defer_error_messages({
+                            "path to DDR codecs contain non-Latin characters",
+                            "    this may lead to movies not playing, white screen issue,",
+                            "    game hanging, or potentially a crash",
+                            "    move the game to a directory that does not contain non-Latin characters",
+                            "    if you encountered any issues"});
+                    }
+                });
+            }
+        }
+    }
+
+
+    void DDRGame::pre_attach() {
+        if (!cfg::CONFIGURATOR_STANDALONE && avs::game::is_model("TDX")) {
+            log_warning(
+                "ddr",
+                "BAD MODEL NAME ERROR\n\n\n"
+                "!!! model name set to TDX, this is WRONG and will break your game !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! spice2x does not yet support TDX, use MDX instead.            !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! model name set to TDX, this is WRONG and will break your game !!!\n\n\n"
+                );
+
+            log_fatal("ddr", "BAD MODEL NAME ERROR - TDX specified, should be MDX instead");
+        }
+
+        if (!cfg::CONFIGURATOR_STANDALONE && avs::game::DEST[0] == 'U') {
+            log_warning(
+                "ddr",
+                "U-REGION WARNING\n\n\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! <dest> is set to U region                                     !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! While this is legal, unless you have compatible data, this    !!!\n"
+                "!!! will most likely crash your game or fail to boot.             !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! It is recommended that you stick with J region.               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n"
+                "!!!                                                               !!!\n\n\n"
+                );
+        }
+
+        if (!cfg::CONFIGURATOR_STANDALONE) {
+            if (!NO_CODEC_REGISTRATION) {
+                this->register_codecs();
+            } else {
+                log_warning(
+                    "ddr",
+                    "skipping codec registration (-ddrnocodec), "
+                    "game may crash if you didn't register codecs before launching the game");
+            }
+        }
+    }
+
+    void DDRGame::attach() {
+        Game::attach();
+
+        // dinput hook on this dll since the game dll doesn't load it
+        auto game_mdx = libutils::try_library(MODULE_PATH / "gamemdx.dll");
+        hooks::input::dinput8::init(game_mdx);
+
+        // init device hook
+        devicehook_init();
+
+        // init SETUP API
+        setupapihook_init(avs::game::DLL_INSTANCE);
+
+        // DDR ACE actually uses another DLL for things
+        if (game_mdx != nullptr) {
+            setupapihook_init(game_mdx);
+        }
+
+        // add fake devices
+        if (avs::game::DLL_NAME == "arkmdxbio2.dll") {
+            devicehook_add(new acioemu::ACIOHandle(L"COM1"));
+
+            if (avs::game::SPEC[0] == 'I') {
+                // settings (bio2)
+                SETUPAPI_SETTINGS settingsbio2 {};
+                const char property2[] = "BIO2(VIDEO)";
+                settingsbio2.class_guid[0] = 0x4D36E978;
+                settingsbio2.class_guid[1] = 0x11CEE325;
+                settingsbio2.class_guid[2] = 0x8C1BF;
+                settingsbio2.class_guid[3] = 0x1803E12B;
+                memcpy(settingsbio2.property_devicedesc, property2, sizeof(property2));
+                setupapihook_add(settingsbio2);
+
+                // cfgmgr (bio2)
+                CFGMGR32_HOOK_SETTING settingbio2 {};
+                settingbio2.device_id = "USB\\VID_1CCF&PID_804C";
+                settingbio2.device_node_id = "USB\\VID_1CCF&PID_804C&MI_00\\?&????????&?&????";
+                cfgmgr32hook_init(avs::game::DLL_INSTANCE);
+                cfgmgr32hook_add(settingbio2);
+            }
+        } else if (avs::game::DLL_NAME == "arkmdxp4.dll") {
+            devicehook_add(new DDRP4IOHandle());
+        } else {
+            devicehook_add(new DDRFOOTHandle());
+            devicehook_add(new DDRSATEHandle());
+            devicehook_add(new DDRUSBMEMHandle());
+            devicehook_add(new DDRP3IOHandle());
+        }
+
+        // has nothing to do with P3IO, but is enough to trick the game into SD/HD mode
+        const char *settings_property = ddr::SDMODE ? "Generic Television" : "Generic Monitor";
+        const char settings_detail[] = R"(\\.\P3IO)";
+
+        // settings 1
+        SETUPAPI_SETTINGS settings1 {};
+        settings1.class_guid[0] = 0x1FA4A480;
+        settings1.class_guid[1] = 0x40C7AC60;
+        settings1.class_guid[2] = 0x7952ACA7;
+        settings1.class_guid[3] = 0x5A57340F;
+        memcpy(settings1.property_devicedesc, settings_property, strlen(settings_property) + 1);
+        memcpy(settings1.interface_detail, settings_detail, sizeof(settings_detail));
+
+        // settings 2
+        SETUPAPI_SETTINGS settings2 {};
+        settings2.class_guid[0] = 0x4D36E96E;
+        settings2.class_guid[1] = 0x11CEE325;
+        settings2.class_guid[2] = 0x8C1BF;
+        settings2.class_guid[3] = 0x1803E12B;
+        memcpy(settings2.property_devicedesc, settings_property, strlen(settings_property) + 1);
+        memcpy(settings2.interface_detail, settings_detail, sizeof(settings_detail));
+
+        const char settings_detail_p4io[] = R"(\\.\P4IO)";
+
+        // settings p4io
+        SETUPAPI_SETTINGS settingsp4io {};
+        settingsp4io.class_guid[0] = 0x8B7250A5;
+        settingsp4io.class_guid[1] = 0x46C94F61;
+        settingsp4io.class_guid[2] = 0x68E63A84;
+        settingsp4io.class_guid[3] = 0x206A4706;
+        memcpy(settingsp4io.property_devicedesc, settings_property, strlen(settings_property) + 1);
+        memcpy(settingsp4io.interface_detail, settings_detail_p4io, sizeof(settings_detail_p4io));
+
+        // add settings
+        setupapihook_add(settings1);
+        setupapihook_add(settings2);
+        setupapihook_add(settingsp4io);
+
+        // misc hooks
+        detour::iat_try("GetAsyncKeyState", GetAsyncKeyState_hook, avs::game::DLL_INSTANCE);
+        detour::iat_try("GetKeyState", GetAsyncKeyState_hook, avs::game::DLL_INSTANCE);
+        SendMessage_real = detour::iat_try("SendMessageW", SendMessage_hook, avs::game::DLL_INSTANCE);
+        detour::iat_try("SendMessageA", SendMessage_hook, avs::game::DLL_INSTANCE);
+    }
+
+    void DDRGame::detach() {
+        Game::detach();
+
+        // dispose device hook
+        devicehook_dispose();
+    }
+
+    static void get_analog_xy_axis(Analog &analog, bool &less, bool &more) {
+        if (!analog.isSet()) {
+            return;
+        }
+        const auto value = GameAPI::Analogs::getState(RI_MGR, analog);
+
+        // stepmania linux source:
+        // https://github.com/stepmania/stepmania/blob/d55acb1ba26f1c5b5e3048d6d6c0bd116625216f/src/arch/InputHandler/InputHandler_Linux_Event.cpp#L410
+
+        // for example, value cap with range [0, 255]:
+        // 127 = 0.498, neutral
+        // 128 = 0.502, both
+        // apparently some adapters report values like above; this obviously makes a lot of
+        // assumptions about bit width of the HID value cap and how the adapter reports
+        // neutral/both values, but this is good enough for parity with stepmania and its many forks
+        if (0.5001f < value && value < 0.75f) {
+            less |= true;
+            more |= true;
+
+        } else if (value <= 0.25f) {
+            less |= true;
+        } else if (value >= 0.75f) {
+            more |= true;
+        }
+    }
+
+    void get_analog_x_axis(int player, bool &left, bool &right) {
+        if (player != 1 && player != 2) {
+            log_fatal("ddr", "invalid player number: {}, expected 1 or 2", player);
+            return;
+        }
+
+        auto &analog = get_analogs().at(player == 1 ? Analogs::P1_LEFT_RIGHT : Analogs::P2_LEFT_RIGHT);
+        get_analog_xy_axis(analog, left, right);
+    }
+
+    void get_analog_y_axis(int player, bool &up, bool &down) {
+        if (player != 1 && player != 2) {
+            log_fatal("ddr", "invalid player number: {}, expected 1 or 2", player);
+            return;
+        }
+
+        auto &analog = get_analogs().at(player == 1 ? Analogs::P1_UP_DOWN : Analogs::P2_UP_DOWN);
+        get_analog_xy_axis(analog, up, down);
+    }
+}

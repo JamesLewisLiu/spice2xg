@@ -1,0 +1,3941 @@
+#include "options.h"
+
+#include "external/tinyxml2/tinyxml2.h"
+#include "util/utils.h"
+#include "util/fileutils.h"
+
+#include <fstream>
+#include <mutex>
+#include <set>
+
+#ifdef NO_SCARD
+#define WITH_SCARD 0
+#else
+#define WITH_SCARD 1
+#endif
+
+static const std::vector<std::string> CATEGORY_ORDER_API = {
+    "Companion & API",
+    "Serial API",
+    "API Dev",
+    "BT5 API",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_GAME_OPTIONS = {
+    "DLL Hooks",
+    "Game Options",
+    "Advanced Game Options",
+    "Cab Peripherals",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_DISPLAY = {
+    "Monitor",
+    "Graphics",
+    "Full Screen Settings",
+    "Windowed Settings",
+    "Game Windowed Settings",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_AUDIO = {
+    "Audio",
+    "Audio Conversion",
+    "Audio Hacks",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_NETWORK = {
+    "Network",
+    "Auto PIN",
+    "Advanced Network",
+    "Network Dev",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_OVERLAY = {
+    "General Overlay",
+    "Game Overlay",
+    "OBS Control",
+};
+
+static const std::vector<std::string> CATEGORY_ORDER_ADVANCED = {
+    "Performance",
+    "Miscellaneous",
+    "Mouse",
+    "Touch Parameters",
+    "I/O Options",
+    "NFC Card Readers",
+};
+static const std::vector<std::string> CATEGORY_ORDER_DEV = {
+    "Path Overrides",
+    "I/O Modules",
+    "Development",
+    "Debug Log",
+};
+static const std::vector<std::string> CATEGORY_ORDER_NONE = {
+    ""
+};
+
+// display order for the quick_setting_category names used by the Options tab's
+// "Quick Settings" view (these are independent of the regular option categories)
+static const std::vector<std::string> CATEGORY_ORDER_QUICK = {
+    "Game",
+    "Common",
+    "Network",
+    "Display",
+    "Audio",
+};
+
+static auto format_as(OptionType f) {
+    return fmt::underlying(f);
+}
+
+bool launcher::USE_CMD_OVERRIDE = false;
+
+/*
+ * Option Definitions
+ */
+static const std::vector<OptionDefinition> OPTION_DEFINITIONS = std::invoke([]() {
+    std::vector<OptionDefinition> c{launcher::Options::_Count};
+    c[launcher::Options::GameExecutable] = {
+        .title = "Override Game Executable & Disable Hooks",
+        .name = "exec",
+        .desc = "Path to the game DLL file.\n\n"
+            "This option is typically not needed; leave it empty to allow spice to auto-detect your game.\n\n"
+            "WARNING: this option also disables all game-specific hooks and turns off most I/O modules!",
+        .type = OptionType::Text,
+        .setting_name = "*.dll",
+        .category = "Path Overrides",
+        // intentionally not setting a file picker here to discourage people setting this without a good reason
+    };
+    c[launcher::Options::OpenConfigurator] = {
+        .title = "Open Configurator",
+        .name = "cfg",
+        .desc = "Opens configuration window. This can only be launched via the command line "
+            "(spice -cfg or spice64 -cfg) or just launch spicecfg.exe.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .disabled = true,
+    };
+    c[launcher::Options::OpenKFControl] = {
+        .title = "(REMOVED) Open KFControl",
+        .name = "kfcontrol",
+        .desc = "This feature has been removed; please use an older version.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .disabled = true,
+    };
+    c[launcher::Options::EAmusementEmulation] = {
+        .title = "Basic Local EA Emulation",
+        .name = "ea",
+        .desc = "Enables the integrated local EA server, just enough to boot the game; no card in, no data saving.",
+        .type = OptionType::Bool,
+        .category = "Network",
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::ServiceURL] = {
+        .title = "EA Service URL",
+        .name = "url",
+        .desc = "Sets a custom service URL override.",
+        .type = OptionType::Text,
+        .setting_name = "example.com:8083",
+        .category = "Network",
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::PCBID] = {
+        .title = "PCBID",
+        .name = "p",
+        .desc = "Sets a custom PCBID override.",
+        .type = OptionType::Text,
+        .setting_name = "01201000000000010101",
+        .category = "Network",
+        .sensitive = true,
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::Player1Card] = {
+        .title = "Player 1 Card",
+        .name = "card0",
+        .desc = "Set a card number for reader 1. Overrides the selected card file.",
+        .type = OptionType::Text,
+        .setting_name = "E0040100FFFFFFFF",
+        .category = "Network",
+        .sensitive = true,
+        .picker = OptionPickerType::EACard,
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::Player2Card] = {
+        .title = "Player 2 Card",
+        .name = "card1",
+        .desc = "Set a card number for reader 2. Overrides the selected card file.",
+        .type = OptionType::Text,
+        .setting_name = "E0040100FFFFFFFF",
+        .category = "Network",
+        .sensitive = true,
+        .picker = OptionPickerType::EACard,
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::Player1PinMacro] = {
+        .title = "Player 1 PIN Macro",
+        .name = "pinmacro0",
+        .desc = "Set a PIN for Player 1 that will cause the PIN to be automatically typed when Player 1 PIN Macro overlay key is pressed.",
+        .type = OptionType::Text,
+        .setting_name = "1234",
+        .category = "Auto PIN",
+        .sensitive = true,
+    };
+    c[launcher::Options::Player2PinMacro] = {
+        .title = "Player 2 PIN Macro",
+        .name = "pinmacro1",
+        .desc = "Set a PIN for Player 2 that will cause the PIN to be automatically typed when Player 2 PIN Macro overlay key is pressed.",
+        .type = OptionType::Text,
+        .setting_name = "5678",
+        .category = "Auto PIN",
+        .sensitive = true,
+    };
+    c[launcher::Options::AutoPinMacroTrigger0] = {
+        .title = "Player 1 PIN Macro Auto Trigger on Log",
+        .name = "autopinmacrotrigger0",
+        .desc =
+            "Substring matched against game log output to detect when Player 1's PIN entry "
+            "screen is ready. When the substring appears in any log line, the PIN macro is "
+            "typed for Player 1 only. Leave blank to disable auto-trigger for P1.",
+        .type = OptionType::Text,
+        .category = "Auto PIN",
+    };
+    c[launcher::Options::AutoPinMacroTrigger1] = {
+        .title = "Player 2 PIN Macro Auto Trigger on Log",
+        .name = "autopinmacrotrigger1",
+        .desc =
+            "Substring matched against game log output to detect when Player 2's PIN entry "
+            "screen is ready. When the substring appears in any log line, the PIN macro is "
+            "typed for Player 2 only. Leave blank to disable auto-trigger for P2.",
+        .type = OptionType::Text,
+        .category = "Auto PIN",
+    };
+    c[launcher::Options::WindowedMode] = {
+        .title = "Windowed Mode",
+        .name = "w",
+        .desc = "Enables windowed mode.",
+        .type = OptionType::Bool,
+        .category = "Windowed Settings",
+        .quick_setting_category = "Display",
+    };
+    c[launcher::Options::InjectHook] = {
+        .title = "Inject DLL Hooks",
+        .name = "k",
+        .desc = "Multiple files are allowed; use multiple -k flags, or in SpiceCfg, separate by "
+                "space (foo.dll bar.dll baz.dll). Injects a hook by using LoadLibrary on the "
+                "specified file before running the main game code.",
+        .type = OptionType::Text,
+        .setting_name = "a.dll b.dll c.dll",
+        .category = "DLL Hooks",
+        .quick_setting_category = "Common",
+    };
+    c[launcher::Options::EarlyInjectHook] = {
+        .title = "Inject Early DLL Hooks",
+        .name = "z",
+        .desc = "Equivalent to 'Inject DLL Hooks' option, but ensures hooks are injected before "
+                "the game module has been loaded into the process.",
+        .type = OptionType::Text,
+        .setting_name = "a.dll b.dll c.dll",
+        .category = "DLL Hooks",
+    };
+    c[launcher::Options::ExecuteScript] = {
+        .title = "(REMOVED) Execute Lua Script",
+        .name = "script",
+        .desc = "This feature has been removed.",
+        .type = OptionType::Text,
+        .hidden = true,
+        .category = "Miscellaneous",
+        .disabled = true,
+    };
+    c[launcher::Options::CaptureCursor] = {
+        .title = "Lock Cursor to Window",
+        .name = "c",
+        .desc = "Confines the cursor to be within the game window.",
+        .type = OptionType::Bool,
+        .category = "Mouse",
+    };
+    c[launcher::Options::ShowCursor] = {
+        .title = "Show Cursor & Touch Emulation Enable",
+        .name = "s",
+        .desc = "Shows the cursor in the game window; also turns on touch emulation. Do not enable this if you have a real touch screen.",
+        .type = OptionType::Bool,
+        .category = "Mouse",
+        .quick_setting_category = "Common",
+    };
+    c[launcher::Options::PrimaryMonitor] = {
+        .title = "Change Main Monitor",
+        .name = "mainmonitor",
+        .desc = "Changes the primary monitor before launching the game. It will be restored on exit.\n\n"
+            "This may fail to work properly on hybrid laptops with iGPU + dGPU.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY2",
+        .category = "Monitor",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::DXDisplayAdapter] = {
+        .title = "DX Primary Display Adapter Override",
+        .name = "monitor",
+        .display_name = "dxmainadapter",
+        .aliases = "dxmainadapter",
+        .desc = "Prefer to use Change Main Monitor option instead of this one.\n\n"
+            "Sets the display that the game will be opened in, for multiple monitors.\n\n"
+            "0 is the primary monitor, 1 is the second monitor, and so on.\n\n"
+            "Not all games will respect this. Not recommended for multi-monitor games like Lightning Model / Valkyrie Model modes. "
+            "Disable Full Screen Optimizations for best results.",
+        .type = OptionType::Integer,
+        .category = "Full Screen Settings",
+    };
+    c[launcher::Options::GraphicsForceSingleAdapter] = {
+        .title = "Only Use Main Monitor For Full Screen",
+        .name = "graphics-force-single-adapter",
+        .desc = "Force the graphics device to be opened utilizing only one adapter in multi-monitor systems.\n\n"
+            "May cause unstable framerate and desyncs, especially if monitors have different refresh rates!",
+        .type = OptionType::Bool,
+        .category = "Full Screen Settings",
+        .quick_setting_category = "Display",
+    };
+    c[launcher::Options::GraphicsForceRefresh] = {
+        .title = "Monitor Refresh Rate",
+        .name = "graphics-force-refresh",
+        .desc = "Change the refresh rate for the primary monitor before launching the game. It will be restored on exit.",
+        .type = OptionType::Integer,
+        .category = "Monitor",
+        .quick_setting_category = "Display",
+    };
+    c[launcher::Options::FullscreenResolution] = {
+        .title = "Force Full Screen Resolution",
+        .name = "forceres",
+        .desc =
+            "For full screen mode, forcibly set a custom resolution.\n\n"
+            "Works great for some games, but can COMPLETELY BREAK other games - YMMV!\n\n"
+            "If you are using -forceresswap/-sdvxlandscape, put the TARGET monitor resolution in this field.\n\n"
+            "This should only be used as last resort if your GPU/monitor can't display the resolution required by the game.",
+        .type = OptionType::Text,
+        .setting_name = "1280,720",
+        .category = "Full Screen Settings"
+    };
+    c[launcher::Options::FullscreenOrientationFlip] = {
+        .title = "Full Screen Orientation Swap (EXPERIMENTAL)",
+        .name = "forceresswap",
+        .desc =
+            "Allows you to play portrait games in landscape (and vice versa) by transposing resolution and applying image scaling.\n\n"
+            "Works great for some games, but can COMPLETELY BREAK other games - YMMV!\n\n"
+            "Strongly consider combining this with -forceres option to render at monitor native resolution.\n\n"
+            "For SDVX, use the dedicated -sdvxlandscape option.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Full Screen Settings"
+    };
+    c[launcher::Options::FullscreenSubResolution] = {
+        .title = "Force FS Subscreen Resolution (EXPERIMENTAL)",
+        .name = "forceressub",
+        .desc =
+            "Override fullscreen resolution requested by the game for second monitor, "
+            "useful if you have a sub monitor that is not quite exactly what the game expects.\n\n"
+            "WARNING: experimental as we have not done extensive testing to see if this causes desyncs.",
+        .type = OptionType::Text,
+        .setting_name = "1280,720",
+        .category = "Full Screen Settings"
+    };
+    c[launcher::Options::FullscreenSubRefreshRate] = {
+        .title = "Force FS Subscreen Refresh Rate (EXPERIMENTAL)",
+        .name = "graphics-force-refresh-sub",
+        .desc =
+            "Override fullscreen refresh rate requested by the game for second monitor, "
+            "useful if you have a sub monitor that is not quite exactly 60Hz.\n\n"
+            "WARNING: experimental as we have not done extensive testing to see if this causes desyncs.",
+        .type = OptionType::Integer,
+        .category = "Full Screen Settings"
+    };
+    c[launcher::Options::Graphics9On12] = {
+        .title = "DirectX 9 on 12 (DEPRECATED - use -dx9on12 instead)",
+        .name = "9on12",
+        .desc = "Use D3D9On12 wrapper library, requires Windows 10. Deprecated - use -dx9on12 instead.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Graphics",
+    };
+    c[launcher::Options::spice2x_Dx9On12] = {
+        .title = "DirectX 9 on 12",
+        .name = "sp2x-dx9on12",
+        .display_name = "dx9on12",
+        .aliases= "dx9on12",
+        .desc = "Use D3D9On12 wrapper library, requires Windows 10. Has no effect on games that don't use DX9. Can cause some games to crash.\n\n"
+            "Default: auto (use DX9 for most games, but turn on 9on12 for games that require it on non-NVIDIA GPUs).",
+        .type = OptionType::Enum,
+        .category = "Graphics",
+        .elements = {
+            {"auto", "Automatic"},
+            {"0", "Use DX9"},
+            {"1", "Use DX9on12"},
+        },
+    };
+    c[launcher::Options::NoLegacy] = {
+        .title = "Disable Win/Media/Special Keys",
+        .name = "nolegacy",
+        .desc = "Disables legacy key activation in-game.",
+        .type = OptionType::Bool,
+        .category = "I/O Options",
+    };
+    c[launcher::Options::RichPresence] = {
+        .title = "Discord Rich Presence",
+        .name = "richpresence",
+        .desc = "Enables Discord Rich Presence support.",
+        .type = OptionType::Bool,
+        .category = "Miscellaneous",
+    };
+    c[launcher::Options::DiscordAppID] = {
+        .title = "Discord RPC AppID Override",
+        .name = "discordappid",
+        .desc = "Set the discord RPC AppID override.",
+        .type = OptionType::Text,
+        .category = "Miscellaneous",
+    };
+    c[launcher::Options::SmartEAmusement] = {
+        .title = "Smart Local EA",
+        .name = "smartea",
+        .desc = "Automatically enables -ea when server is offline.",
+        .type = OptionType::Bool,
+        .category = "Advanced Network",
+    };
+    c[launcher::Options::EAmusementMaintenance] = {
+        .title = "EA Maintenance (DEPRECATED - use -forceeamaint instead)",
+        .name = "eamaint",
+        .desc = "Enables EA Maintenance, 1 for on, 0 for off.",
+        .type = OptionType::Enum,
+        .hidden = true,
+        .category = "Advanced Network",
+        .elements = {{"0", "Off"}, {"1", "On"}},
+    };
+    c[launcher::Options::spice2x_EAmusementMaintenance] = {
+        .title = "Local EA Maintenance",
+        .name = "sp2x-eamaint",
+        .display_name = "forceeamaint",
+        .aliases= "forceeamaint",
+        .desc = "Causes local EA to start in maintenance mode. Must be used with -ea or -smartea.",
+        .type = OptionType::Bool,
+        .category = "Advanced Network",
+    };
+    c[launcher::Options::AdapterNetwork] = {
+        .title = "Preferred Network Adapter's IP",
+        .name = "network",
+        .display_name = "netadapterip",
+        .aliases = "netadapterip",
+        .desc = "Instead of using the default network adapter, force the usage of another network adapter "
+            "with the specified IP address. You must also set -netadaptersubnet.",
+        .type = OptionType::Text,
+        .category = "Advanced Network",
+        .sensitive = true,
+    };
+    c[launcher::Options::AdapterSubnet] = {
+        .title = "Preferred Network Adapter's Subnet",
+        .name = "subnet",
+        .display_name = "netadaptersubnet",
+        .aliases = "netadaptersubnet",
+        .desc = "Instead of using the default network adapter, force the usage of another network adapter "
+            "with the specified subnet. You must also set -netadapterip.",
+        .type = OptionType::Text,
+        .category = "Advanced Network",
+    };
+    c[launcher::Options::DisableNetworkFixes] = {
+        .title = "Disable Network Fixes",
+        .name = "netfixdisable",
+        .desc = "Force disables network fixes.",
+        .type = OptionType::Bool,
+        .category = "Network Dev",
+    };
+    c[launcher::Options::HTTP11] = {
+        .title = "HTTP/1.1",
+        .name = "http11",
+        .desc = "Sets EA3 http11 value.",
+        .type = OptionType::Enum,
+        .category = "Network Dev",
+        .elements = {{"0", "Off"}, {"1", "On"}},
+    };
+    c[launcher::Options::DisableSSL] = {
+        .title = "Disable SSL Protocol",
+        .name = "ssldisable",
+        .desc = "Prevents the SSL protocol from being registered.",
+        .type = OptionType::Bool,
+        .category = "Network Dev",
+    };
+    c[launcher::Options::URLSlash] = {
+        .title = "URL Slash",
+        .name = "urlslash",
+        .desc = "Sets EA3 urlslash value.",
+        .type = OptionType::Enum,
+        .category = "Advanced Network",
+        .elements = {{"0", "Off"}, {"1", "On"}},
+    };
+    c[launcher::Options::SOFTID] = {
+        .title = "SOFTID",
+        .name = "r",
+        .desc = "Set custom SOFTID override.",
+        .type = OptionType::Text,
+        .category = "Development",
+        .sensitive = true,
+    };
+    c[launcher::Options::VREnable] = {
+        .title = "(REMOVED) VR controls (experimental)",
+        .name = "vr",
+        .desc = "This feature has been removed.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "DANCERUSH",
+        .category = "Game Options",
+        .disabled = true,
+    };
+    c[launcher::Options::DisableOverlay] = {
+        .title = "Disable Spice Overlay",
+        .name = "overlaydisable",
+        .desc = "Disables the in-game overlay.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::OverlayKeyboardNavigation] = {
+        .title = "Overlay Keyboard Navigation",
+        .name = "keyboardnav",
+        .desc = "Enables keyboard navigation in the in-game overlay.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::OverlayScaling] = {
+        .title = "Spice Overlay UI Scale %",
+        .name = "overlayscale",
+        .desc = "Forces UI scaling for the overlay, "
+            "things can look off since the UI was written for 100% scaling. "
+            "Enter value in percentage, between 10-400, inclusive.",
+        .type = OptionType::Integer,
+        .setting_name = "200",
+        .category = "General Overlay",
+    };
+    c[launcher::Options::NotificationPosition] = {
+        .title = "Notifications",
+        .name = "toast",
+        .desc = "Select where notifications will appear on the screen.",
+        .type = OptionType::Enum,
+        .category = "General Overlay",
+        .elements = {
+            {"off", ""},
+            {"topleft", ""},
+            {"topright", ""},
+            {"bottomleft", ""},
+            {"bottomright", ""},
+        },
+    };
+    c[launcher::Options::spice2x_FpsAutoShow] = {
+        .title = "Auto Show FPS/Clock",
+        .name = "sp2x-autofps",
+        .display_name = "autofps",
+        .aliases= "autofps",
+        .desc = "Automatically show FPS / clock / timer overlay window when the game starts.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::spice2x_FpsOpposite] = {
+        .title = "Show FPS/Clock top-left (DEPRECATED - use -fpslocation instead)",
+        .name = "fpsflip",
+        .desc = "Show FPS / clock / timer overlay on the top left of the screen instead of the top right. "
+            "Deprecated - use -fpslocation instead.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::FpsLocation] = {
+        .title = "FPS/Clock Location",
+        .name = "fpslocation",
+        .desc = "Select which corner of the screen the FPS / clock / timer overlay appears in.",
+        .type = OptionType::Enum,
+        .category = "General Overlay",
+        .elements = {
+            {"topright", ""},
+            {"topleft", ""},
+            {"bottomleft", ""},
+            {"bottomright", ""},
+        },
+    };
+    c[launcher::Options::spice2x_SubScreenAutoShow] = {
+        .title = "Auto Show Subscreen",
+        .name = "sp2x-autosubscreen",
+        .display_name = "autosubscreen",
+        .aliases= "autosubscreen",
+        .desc = "Automatically show the subscreen overlay when the game starts, if the game has one.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::spice2x_IOPanelAutoShow] = {
+        .title = "Auto Show IO Panel",
+        .name = "sp2x-autoiopanel",
+        .display_name = "autoiopanel",
+        .aliases= "autoiopanel",
+        .desc = "Automatically show I/O panel window when the game starts.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::spice2x_KeypadAutoShow] = {
+        .title = "Auto Show Keypad",
+        .name = "sp2x-autokeypad",
+        .display_name = "autokeypad",
+        .aliases= "autokeypad",
+        .desc = "Automatically show virtual keypad window when the game starts.",
+        .type = OptionType::Enum,
+        .category = "General Overlay",
+        .elements = {
+            {"0", "Off"},
+            {"1", "P1"},
+            {"2", "P2"},
+            {"3", "P1 and P2"},
+        },
+    };
+    c[launcher::Options::LoadIIDXModule] = {
+        .title = "Force Load IIDX Module",
+        .name = "iidx",
+        .desc = "Manually enable Beatmania IIDX module.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::IIDXCameraOrderFlip] = {
+        .title = "IIDX Camera Order Flip",
+        .name = "iidxflipcams",
+        .desc = "Flip the camera order.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXDisableCameras] = {
+        .title = "IIDX Disable Cameras (DEPRECATED - no longer needed)",
+        .name = "iidxdisablecams",
+        .desc = "Disables cameras.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXCabCamAccess] = {
+        .title = "IIDX Official AC Camera Access",
+        .name = "iidxcabcams",
+        .desc = "Controls how the game accesses USB cameras for IIDX 25+.\n\n"
+            "auto (default): use [off] when the IIDX module is enabled; otherwise, use [on].\n\n"
+            "on: game discovers and directly accesses cameras; requires official cameras on correct USB ports.\n\n"
+            "legacy: for IIDX 25/26 only; allow camera access with emulated discovery.\n\n"
+            "off: prevent game from accessing USB cameras.",
+        .type = OptionType::Enum,
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+        .elements = {
+            {"auto", ""},
+            {"on", ""},
+            {"legacy", ""},
+            {"off", ""},
+        },
+    };
+    c[launcher::Options::IIDXCamHook] = {
+        .title = "IIDX Cam Hook",
+        .name = "iidxtdjcamhook",
+        .display_name = "iidxcamhook",
+        .aliases = "iidxcamhook",
+        .desc = "Experimental camera support for IIDX 27+ via texture hooking. Requires camera(s) that support YUY2 or NV12 encoding.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXCamHookRatio] = {
+        .title = "IIDX Cam Hook Aspect Ratio",
+        .name = "iidxtdjcamhookratio",
+        .display_name = "iidxcamhookratio",
+        .aliases = "iidxcamhookratio",
+        .desc = "Determine what aspect ratio should be preferred for webcam input. Default: 16:9.",
+        .type = OptionType::Enum,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+        .elements = {
+            {"43", "4:3"},
+            {"169", "16:9"},
+        },
+    };
+    c[launcher::Options::IIDXCamHookOverride] = {
+        .title = "IIDX Cam Hook Offset Override",
+        .name = "iidxtdjcamhookoffset",
+        .display_name = "iidxcamhookoffset",
+        .aliases = "iidxcamhookoffset",
+        .desc = "Override DLL offsets for camera hook; "
+            "format: 5 hex values separated by commas "
+            "(offset_hook_a, offset_textures, offset_camera_manager, offset_d3d_device, offset_afp_texture).",
+        .type = OptionType::Text,
+        .setting_name = "0x5817a0,0x6fffbd8,0xbbae40,0xe0,0x30",
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXCamHookTopId] = {
+        .title = "IIDX Cam Hook Top ID",
+        .name = "iidxtdjcamhooktop",
+        .display_name = "iidxcamhooktop",
+        .aliases = "iidxcamhooktop",
+        .desc =
+            "Specify a partial ID of the camera to use as the TOP camera. Useful if you have more than 3 cameras and need to tell spice which ones to use.\n\n"
+            "To get IDs, launch the game and look for camera IDs from MFEnumDeviceSources.\n\n"
+            "For example, `vid_1234&pid_5678` matches on `\\\\?\\usb#vid_1234&pid_5678&mi_00#7&234123456&1&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global`.",
+        .type = OptionType::Text,
+        .setting_name = "vid_1234&pid_5678",
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXCamHookFrontId] = {
+        .title = "IIDX Cam Hook Front ID",
+        .name = "iidxtdjcamhookfront",
+        .display_name = "iidxcamhookfront",
+        .aliases = "iidxcamhookfront",
+        .desc =
+            "Specify a partial ID of the camera to use as the FRONT camera. Useful if you have more than 3 cameras and need to tell spice which ones to use.\n\n"
+            "To get IDs, launch the game and look for camera IDs from MFEnumDeviceSources.\n\n"
+            "For example, `vid_1234&pid_5678` matches on `\\\\?\\usb#vid_1234&pid_5678&mi_00#7&234123456&1&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\\global`.",
+        .type = OptionType::Text,
+        .setting_name = "vid_90ab&pid_cdef",
+        .game_name = "Beatmania IIDX",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::IIDXSoundOutputDevice] = {
+        .title = "IIDX Sound Output Device",
+        .name = "iidxsounddevice",
+        .desc =
+            "SOUND_OUTPUT_DEVICE environment variable override. Default: auto. "
+            "Auto will use WASAPI, unless -iidxasio is set or if XONAR SOUND CARD is present, then ASIO is used.",
+        .type = OptionType::Enum,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Options",
+        .elements = {
+            {"auto", "Automatic"},
+            {"wasapi", "Windows Audio"},
+            {"asio", "ASIO"},
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::IIDXAsioDriver] = {
+        .title = "IIDX ASIO Driver",
+        .name = "iidxasio",
+        .desc = "ASIO driver name to use, replacing XONAR SOUND CARD(64). "
+            "String should match registry key under HKLM\\SOFTWARE\\ASIO\\ \n\n"
+            "IIDX is very picky about ASIO devices it can support, YMMV.",
+        .type = OptionType::Text,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Options",
+        .picker = OptionPickerType::AsioDriver,
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::IIDXBIO2FW] = {
+        .title = "IIDX BIO2 Firmware Update",
+        .name =  "iidxbio2fw",
+        .desc = "Enables BIO2 firmware updates. WARNING - can cause semi-permanent change to your I/O board.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::IIDXTDJMode] = {
+        .title = "IIDX TDJ Mode (Lightning Model)",
+        .name =  "iidxtdj",
+        .desc = "Enables TDJ mode (Lightning Model cabinet).",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::spice2x_IIDXDigitalTTSensitivity] = {
+        .title = "IIDX Digital TT Sensitivity",
+        .name = "sp2x-iidxdigitalttsens",
+        .display_name = "iidxdigitalttsens",
+        .aliases= "iidxdigitalttsens",
+        .desc = "Adjust sensitivity of turntable when digital input (buttons) is used. Does not affect analog input! Default: 4.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-255)",
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::IIDXDigitalTTSocd] = {
+        .title = "IIDX Digital TT SOCD Cleaner",
+        .name = "iidxsocd",
+        .desc = "SOCD for turntables when using button input; what happens when both directions are pressed.\n\n"
+            "last: most recently pressed direction takes priority\n\n"
+            "first: first pressed direction takes priority\n\n"
+            "neutral (default): TT does not move when both directions are pressed, recommended to avoid excessive POORs.",
+        .type = OptionType::Enum,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+        .elements = {
+            {"last", ""},
+            {"first", ""},
+            {"neutral", ""},
+        },
+    };
+    c[launcher::Options::spice2x_IIDXLDJForce720p] = {
+        .title = "IIDX LDJ Force 720p (HD)",
+        .name = "sp2x-iidxldjforce720p",
+        .display_name = "iidxldjforce720p",
+        .aliases= "iidxldjforce720p",
+        .desc = "Force Definition Type HD (720p) mode instead of FHD (1080p) for IIDX30+. Only for LDJ! TDJ is always FHD in IIDX30+.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_IIDXTDJSubSize] = {
+        .title = "IIDX TDJ Subscreen Size",
+        .name = "sp2x-iidxtdjsubsize",
+        .display_name = "iidxtdjsubsize",
+        .aliases= "iidxtdjsubsize",
+        .desc = "Default size of the subscreen overlay. Default: medium.",
+        .type = OptionType::Enum,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Overlay",
+        .elements = {
+            {"small", ""},
+            {"medium", ""},
+            {"large", ""},
+            {"fullscreen", ""},
+        },
+    };
+    c[launcher::Options::spice2x_IIDXLEDFontSize] = {
+        .title = "IIDX LED Ticker Font Size",
+        .name = "sp2x-iidxledfontsize",
+        .display_name = "iidxledfontsize",
+        .aliases= "iidxledfontsize",
+        .desc = "Configure the font size of the segment display, in pixels. Default: 64 (px).",
+        .type = OptionType::Integer,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Overlay",
+    };
+    c[launcher::Options::spice2x_IIDXLEDColor] = {
+        .title = "IIDX LED Ticker Color",
+        .name = "sp2x-iidxledcolor",
+        .display_name = "iidxledcolor",
+        .aliases= "iidxledcolor",
+        .desc = "Configure the font color of the segment display; specify RGB value in hex. "
+                "Default: 0xff0000 (red).",
+        .type = OptionType::Hex,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Overlay",
+    };
+    c[launcher::Options::spice2x_IIDXLEDPos] = {
+        .title = "IIDX LED Ticker Position",
+        .name = "sp2x-iidxledpos",
+        .display_name = "iidxledpos",
+        .aliases= "iidxledpos",
+        .desc = "Initial position of the segment display. Default: bottom.",
+        .type = OptionType::Enum,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Overlay",
+        .elements = {
+            {"topleft", ""},
+            {"top", ""},
+            {"topright", ""},
+            {"bottomleft", ""},
+            {"bottom", ""},
+            {"bottomright", ""},
+        },
+    };
+    c[launcher::Options::IIDXLEDBorderless] = {
+        .title = "IIDX LED Ticker Borderless",
+        .name = "iidxledborderless",
+        .aliases= "iidxledborderless",
+        .desc = "Make LED ticker overlay window borderless (remove window decoration).",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Overlay",
+    };
+    c[launcher::Options::LoadSoundVoltexModule] = {
+        .title = "Force Load Sound Voltex Module",
+        .name = "sdvx",
+        .desc = "Manually enable Sound Voltex Module.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::SDVXForce720p] = {
+        .title = "SDVX Vivid Wave Force 720p Window (DEPRECATED - use -windowsize instead)",
+        .name = "sdvx720",
+        .desc = "Old & deprecated option for launching Vivid Wave in 720p when using windowed mode.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::SDVXPrinterEmulation] = {
+        .title = "SDVX Printer Emulation",
+        .name = "printer",
+        .desc = "Enable Sound Voltex printer emulation.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXPrinterOutputPath] = {
+        .title = "SDVX Printer Output Path",
+        .name = "printerpath",
+        .desc = "Path to folder where images will be stored.",
+        .type = OptionType::Text,
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+        .picker = OptionPickerType::DirectoryPath,
+    };
+    c[launcher::Options::SDVXPrinterOutputClear] = {
+        .title = "SDVX Printer Output Clear",
+        .name = "printerclear",
+        .desc = "Clean up saved images in the output directory on startup.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXPrinterOutputOverwrite] = {
+        .title = "SDVX Printer Output Overwrite",
+        .name = "printeroverwrite",
+        .desc = "Always overwrite the same file in output directory.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXPrinterOutputFormat] = {
+        .title = "SDVX Printer Output Format",
+        .name = "printerformat",
+        .desc = "File format for printer output.",
+        .type = OptionType::Text,
+        .setting_name = "(png/bmp/tga/jpg)",
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXPrinterJPGQuality] = {
+        .title = "SDVX Printer JPG Quality",
+        .name = "printerjpgquality",
+        .desc = "Quality setting in percent if JPG format is used.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-100)",
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXDisableCameras] = {
+        .title = "SDVX Disable Cameras (DEPRECATED - no longer needed)",
+        .name = "sdvxdisablecams",
+        .desc = "This option does nothing.\n\n"
+            "This option was used in the past to fix cameras in SDVX5 but this is no longer "
+            "needed as camera check will always be skipped with a built-in patch.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Sound Voltex",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::SDVXNativeTouch] = {
+        .title = "SDVX Native Touch (DEPRECATED - no longer needed)",
+        .name = "sdvxnativetouch",
+        .desc = "This option does nothing.\n\n"
+            "Native touch handling is now enabled by default and this option is no longer needed.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_SDVXSubRedraw] = {
+        .title = "SDVX FS Subscreen Force Redraw",
+        .name = "sp2x-sdvxsubredraw",
+        .display_name = "sdvxsubredraw",
+        .aliases= "sdvxsubredraw",
+        .desc = "Check if submonitor in fullscreen mode doesn't update every frame; "
+            "this option presents the subscreen when the game does not.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_SDVXDigitalKnobSensitivity] = {
+        .title = "SDVX Digital Knob Sensitivity",
+        .name = "sp2x-sdvxdigitalknobsens",
+        .display_name = "sdvxdigitalknobsens",
+        .aliases= "sdvxdigitalknobsens",
+        .desc = "Adjust sensitivity of knobs when digital input (buttons) is used. Does not affect analog input! Default: 16.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-255)",
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::SDVXDigitalKnobSocd] = {
+        .title = "SDVX Digital Knob SOCD Cleaner",
+        .name = "sdvxsocd",
+        .desc = "SOCD for knobs when using button input; what happens when both directions are pressed.\n\n"
+            "last (default): most recently pressed direction takes priority, recommended to deal with slams\n\n"
+            "first: first pressed direction takes priority\n\n"
+            "neutral: knob does not move when both directions are pressed.",
+        .type = OptionType::Enum,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+        .elements = {
+            {"last", ""},
+            {"first", ""},
+            {"neutral", ""},
+        },
+    };
+    c[launcher::Options::spice2x_SDVXAsioDriver] = {
+        .title = "SDVX ASIO driver",
+        .name = "sp2x-sdvxasio",
+        .display_name = "sdvxasio",
+        .aliases= "sdvxasio",
+        .desc = "ASIO driver name to use, replacing XONAR SOUND CARD(64). "
+            "String should match registry key under HKLM\\SOFTWARE\\ASIO\\ \n\n"
+            "SDVX is EXTREMELY picky about ASIO devices it can support!",
+        .type = OptionType::Text,
+        .game_name = "Sound Voltex",
+        .category = "Game Options",
+        .picker = OptionPickerType::AsioDriver,
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::SDVXAsioTwoChannel] = {
+        .title = "SDVX ASIO Two Channel Audio",
+        .name = "sdvxasio2ch",
+        .desc = "Force the game to use two channels for ASIO output.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::SDVXDisableLive2D] = {
+        .title = "SDVX Disable Live2D (EXPERIMENTAL)",
+        .name = "sdvxnolive2d",
+        .desc = "Skip rendering the SDVX Live2D graphics to save GPU.\n\n"
+                "off: leave Live2D as-is.\n"
+                "always: hide Live2D (also hides menu navigator).\n"
+                "ingame: only hide Live2D during a song; keeps the menu navigator. Scene detection relies on game logging.",
+        .type = OptionType::Enum,
+        .game_name = "Sound Voltex",
+        .category = "Advanced Game Options",
+        .elements = {
+            {"off", "Show Live2D"},
+            {"always", "Hide Live2D"},
+            {"ingame", "Hide during songs"},
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::spice2x_SDVXSubPos] = {
+        .title = "SDVX Subscreen Overlay Position",
+        .name = "sp2x-sdvxsubpos",
+        .display_name = "sdvxsubpos",
+        .aliases= "sdvxsubpos",
+        .desc = "Location for the subscreen overlay. Default: bottom.",
+        .type = OptionType::Enum,
+        .game_name = "Sound Voltex",
+        .category = "Game Overlay",
+        .elements = {
+            {"top", ""},
+            {"center", ""},
+            {"bottom", ""},
+            {"bottomleft", "for landscape"},
+            {"bottomright", "for landscape"},
+        },
+    };
+    c[launcher::Options::SDVXSubMonitorOverride] = {
+        .title = "SDVX Subscreen Monitor Override",
+        .name = "sdvxsubmonitor",
+        .desc = "If you have three or more monitors, this option can be set to tell the game which monitor is the subscreen.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY3",
+        .game_name = "Sound Voltex",
+        .category = "Full Screen Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::LoadDDRModule] = {
+        .title = "Force Load DDR Module",
+        .name = "ddr",
+        .desc = "Manually enable Dance Dance Revolution module.",
+        .type = OptionType::Bool,
+        .game_name = "Dance Dance Revolution",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::DDR43Mode] = {
+        .title = "DDR 4:3 Mode",
+        .name = "ddrsd/o",
+        .desc = "Enable DDR 4:3 (SD) mode.",
+        .type = OptionType::Bool,
+        .game_name = "Dance Dance Revolution",
+        .category = "Game Options",
+    };
+    c[launcher::Options::DDRSkipCodecRegisteration] = {
+        .title = "DDR Skip Codec Registration",
+        .name = "ddrnocodec",
+        .desc = "Prevent automatic registration of codecs in the com folder.",
+        .type = OptionType::Bool,
+        .game_name = "Dance Dance Revolution",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadPopnMusicModule] = {
+        .title = "Force Load Pop'n Music Module",
+        .name = "pnm",
+        .desc = "Manually enable Pop'n Music module.",
+        .type = OptionType::Bool,
+        .game_name = "Pop'n Music",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::PopnMusicForceHDMode] = {
+        .title = "Pop'n Music Force HD Mode",
+        .name = "pnmhd",
+        .desc = "Force enable Pop'n Music HD mode.",
+        .type = OptionType::Bool,
+        .game_name = "Pop'n Music",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::PopnMusicForceSDMode] = {
+        .title = "Pop'n Music Force SD Mode",
+        .name = "pnmsd",
+        .desc = "Force enable Pop'n Music SD mode.",
+        .type = OptionType::Bool,
+        .game_name = "Pop'n Music",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::PopnNoSub] = {
+        .title = "Pop'n Music PikaPika Subscreen Disable",
+        .name = "popnnosub",
+        .desc = "Prevents PikaPika model subscreen from launching a separate window.",
+        .type = OptionType::Bool,
+        .game_name = "Pop'n Music",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::PopnSubMonitorOverride] = {
+        .title = "Pop'n Music PikaPika Subscreen Monitor Override",
+        .name = "popnsubmonitor",
+        .desc = "If you have three or more monitors, this option can be set to tell the game which monitor is the subscreen.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY3",
+        .game_name = "Pop'n Music",
+        .category = "Full Screen Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::PopnNativeTouch] = {
+        .title = "Pop'n Music Native Touch (DEPRECATED - no longer needed)",
+        .name = "popnnativetouch",
+        .desc = "This option does nothing.\n\n"
+            "Native touch handling is now enabled by default and this option is no longer needed.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Pop'n Music",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::PopnSubRedraw] = {
+        .title = "Pop'n Music PikaPika Subscreen Force Redraw",
+        .name = "popnsubredraw",
+        .desc = "Check if submonitor in fullscreen mode appears stuck; "
+            "this option presents the subscreen when the game does not.",
+        .type = OptionType::Bool,
+        .game_name = "Pop'n Music",
+        .category = "Advanced Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::LoadHelloPopnMusicModule] = {
+        .title = "Force Load HELLO! Pop'n Music Module",
+        .name = "hpm",
+        .desc = "Manually enable HELLO! Pop'n Music module.",
+        .type = OptionType::Bool,
+        .game_name = "HELLO! Pop'n Music",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadGitaDoraModule] = {
+        .title = "Force Load GitaDora Module",
+        .name = "gd",
+        .desc = "Manually enable GitaDora module.",
+        .type = OptionType::Bool,
+        .game_name = "GitaDora",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::GitaDoraTwoChannelAudio] = {
+        .title = "GitaDora Two Channel Audio",
+        .name = "2ch",
+        .desc = "Attempt to reduce audio channels down to just two channels.",
+        .type = OptionType::Bool,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraDisableFrameLimiter] = {
+        .title = "GitaDora Disable Frame Limiter (EXPERIMENTAL)",
+        .name = "gdnoframelimiter",
+        .desc = "Only for GITADORA to GALAXY WAVE; not for XG series or Arena Model.\n\n"
+            "Game engine's built-in frame limiter can result in unstable frame pacing "
+            "(around 56-58 FPS) on modern Windows. Turning this on disables that and "
+            "forces the game to rely on V-Sync instead, resulting in a stable FPS.\n\n"
+            "Ensure your monitors are set to 60Hz.",
+        .type = OptionType::Bool,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraCabinetType] = {
+        .title = "GitaDora Cabinet Type",
+        .name = "gdcabtype",
+        .desc = "Select cabinet type. DX has more input and lights. Pick SD2 for single player guitar mode on white cab.",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .elements = {{"1", "DX"}, {"2", "SD"}, {"3", "SD2 - white cab"}},
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraLefty] = {
+        .title = "GitaDora Lefty Guitar (for Digital Wailing)",
+        .name = "gdlefty",
+        .desc = "Enables lefty mode, flipping motion sensor directions. Default: off.\n\n"
+            "Without this option, enabling LEFT in the game option will continuously trigger UP wail.\n\n"
+            "Has no effect if you are using analog bindings for X/Y axis; most controllers do not handle this correctly.\n\n"
+            "As always, remember to restart the game after changing options. If you need to change in the game, "
+            "use the I/O panel overlay window.",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .elements = {
+            {"off", "both righty"},
+            {"p1", "p1 is lefty"},
+            {"p2", "p2 is lefty"},
+            {"both", "both lefty"},
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraWailHold] = {
+        .title = "GitaDora Digital Wail Hold",
+        .name = "gdwailhold",
+        .desc = "For digital wail input, how long (in milliseconds) to hold the wail state. Practically, this controls "
+            "how sensitive wailing is.\n\n"
+            "Default: 100 (ms)\n\n"
+            "If set to 0, no hold will occur, which means you need to press the wail button longer to register; "
+            "default value of 100ms will cause the game to trigger wail even on a light tap of the button.",
+        .type = OptionType::Integer,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+    };
+    c[launcher::Options::GitaDoraPickAlgo] = {
+        .title = "GitaDora Picking Algorithm",
+        .name = "gdpickalgo",
+        .desc = "Select picking algorithm for guitar.\n\n"
+            "recent (default): use SOCD cleaner algorithm that prioritizes recent input\n\n"
+            "legacy: only the rising edge of the pick input is considered; cannot hold pick for menu navigation\n\n"
+            "neutral: if both up and down are pressed, they cancel out\n\n"
+            "raw: no filtering done by spice; game receives both input as-is, possible to input both up and down at the same time",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .elements = {
+            {"recent", ""},
+            {"legacy", ""},
+            {"neutral", ""},
+            {"raw", ""}
+        },
+    };
+    c[launcher::Options::GitaDoraSubOverlaySize] = {
+        .title = "GitaDora Subscreen Overlay Size",
+        .name = "gdsubsize",
+        .desc = "Default size of the subscreen overlay. Default: medium.",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Overlay",
+        .elements = {
+            {"small", ""},
+            {"medium", ""},
+            {"large", ""}
+        },
+    };
+    c[launcher::Options::GitaDoraArenaSingleWindow] = {
+        .title = "GitaDora Arena Disable Subscreens (DEPRECATED - use -gdalayout)",
+        .name = "gdaonewindow",
+        .desc = "DEPRECATED - use -gdalayout.\n\n"
+            "For Arena Model:\n\n"
+            "Windowed mode: instead of 4 windows, create 1 window.\n\n"
+            "Fullscreen mode: instead of requiring 4 monitors, use only the primary monitor. WARNING: requires 4K monitor.\n\n"
+            "To access the subscreen, use the subscreen overlay.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+    };
+    c[launcher::Options::GitaDoraArenaWindowLayout] = {
+        .title = "GitaDora Arena Layout (EXPERIMENTAL)",
+        .name = "gdalayout",
+        .desc = "For Arena Model: select how many windows to create.\n\n"
+            "1 window: main only; use the subscreen overlay for SMALL.\n\n"
+            "2 windows: main + SMALL. Without -w, this uses native D3D9 adapter-group fullscreen "
+            "with physical MAIN/SMALL and virtual LEFT/RIGHT. It requires two active displays on "
+            "one adapter group. With -w, it uses borderless windows instead.\n\n"
+            "4 windows: main + LEFT + RIGHT + SMALL. Fullscreen requires exactly 4 monitors in the "
+            "right resolution; see wiki for details.",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .elements = {
+            {"1", "1 window"},
+            {"2", "2 windows"},
+            {"4", "4 windows"}
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraArenaSubLayout] = {
+        .title = "GitaDora Arena Subscreen Layout (EXPERIMENTAL)",
+        .name = "gdasublayout",
+        .desc = "For Arena Model full screen two-window mode: select the image layout on the second monitor.\n\n"
+            "portrait (default): default subscreen @ 800x1280\n\n"
+            "landscape: pillarboxed subscreen @ 1920x1080\n\n"
+            "combine: LEFT + SMALL + RIGHT screens side by side @ 1920x1080\n\n"
+            "For landscape and combine, -forceressub can be used to override the resolution.",
+        .type = OptionType::Enum,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .elements = {
+            {"portrait", ""},
+            {"landscape", ""},
+            {"combine", ""}
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraArenaAsioDriver] = {
+        .title = "GitaDora Arena ASIO driver",
+        .name = "gdaasio",
+        .desc = "For Arena Model: ASIO driver name to use in place of XONAR. "
+            "String should match a subkey under HKLM\\SOFTWARE\\ASIO\\\n\n"
+            "Requires 7.1 @ 48kHz; if the game rejects your ASIO device, it will automatically "
+            "fall back to using WASAPI.\n\n"
+            "If the game crashes after successful ASIO init, try enabling -gdafakerealtek.",
+        .type = OptionType::Text,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+        .picker = OptionPickerType::AsioDriver,
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::GitaDoraArenaRealtekAccess] = {
+        .title = "GitaDora Arena ASIO Allow Headphones",
+        .name = "gdarealtek",
+        .desc = "For Arena Model: allow the game to access the Realtek audio for headphone output.\n\n"
+            "After opening ASIO device, the game then tries to look for audio devices named Realtek to open "
+            "a second audio stream. For compatibility, spice prevents the game from doing this, but enabling "
+            "this option will allow the game to access the Realtek audio device again.",
+        .type = OptionType::Bool,
+        .game_name = "GitaDora",
+        .category = "Game Options",
+    };
+    c[launcher::Options::LoadJubeatModule] = {
+        .title = "Force Load Jubeat Module",
+        .name = "jb",
+        .desc = "Manually enable Jubeat module.",
+        .type = OptionType::Bool,
+        .game_name = "Jubeat",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadReflecBeatModule] = {
+        .title = "Force Load Reflec Beat Module",
+        .name = "rb",
+        .desc = "Manually enable Reflec Beat module.",
+        .type = OptionType::Bool,
+        .game_name = "Reflec Beat",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadShogikaiModule] = {
+        .title = "Force Load Tenkaichi Shogikai Module",
+        .name = "shogikai",
+        .desc = "Manually enable Tenkaichi Shogikai module.",
+        .type = OptionType::Bool,
+        .game_name = "Tenkaichi Shogikai",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadBeatstreamModule] = {
+        .title = "Force Load Beatstream Module",
+        .name = "bs",
+        .desc = "Manually enable Beatstream module.",
+        .type = OptionType::Bool,
+        .game_name = "Beatstream",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadNostalgiaModule] = {
+        .title = "Force Load Nostalgia Module",
+        .name = "nostalgia",
+        .desc = "Manually enable Nostalgia module.",
+        .type = OptionType::Bool,
+        .game_name = "Nostalgia",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadDanceEvolutionModule] = {
+        .title = "Force Load Dance Evolution Module",
+        .name = "dea",
+        .desc = "Manually enable Dance Evolution module.",
+        .type = OptionType::Bool,
+        .game_name = "Dance Evolution",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadFutureTomTomModule] = {
+        .title = "Force Load FutureTomTom Module",
+        .name = "ftt",
+        .desc = "Manually enable FutureTomTom module.",
+        .type = OptionType::Bool,
+        .game_name = "FutureTomTom",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadBBCModule] = {
+        .title = "Force Load BBC Module",
+        .name = "bbc",
+        .desc = "Manually enable Bishi Bashi Channel module.",
+        .type = OptionType::Bool,
+        .game_name = "Bishi Bashi Channel",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadMetalGearArcadeModule] = {
+        .title = "Force Load Metal Gear Arcade Module",
+        .name = "mga",
+        .desc = "Manually enable Metal Gear Arcade module.",
+        .type = OptionType::Bool,
+        .game_name = "Metal Gear",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadQuizMagicAcademyModule] = {
+        .title = "Force Load Quiz Magic Academy Module",
+        .name = "qma",
+        .desc = "Manually enable Quiz Magic Academy module.",
+        .type = OptionType::Bool,
+        .game_name = "Quiz Magic Academy",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadRoadFighters3DModule] = {
+        .title = "Force Load Road Fighters 3D Module",
+        .name = "rf3d",
+        .desc = "Manually enable Road Fighters 3D module.",
+        .type = OptionType::Bool,
+        .game_name = "Road Fighters 3D",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadSteelChronicleModule] = {
+        .title = "Force Load Steel Chronicle Module",
+        .name = "sc",
+        .desc = "Manually enable Steel Chronicle module.",
+        .type = OptionType::Bool,
+        .game_name = "Steel Chronicle",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadMahjongFightClubModule] = {
+        .title = "Force Load Mahjong Fight Club Module",
+        .name = "mfc",
+        .desc = "Manually enable Mahjong Fight Club module.",
+        .type = OptionType::Bool,
+        .game_name = "Mahjong Fight Club",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadScottoModule] = {
+        .title = "Force Load Scotto Module",
+        .name = "scotto",
+        .desc = "Manually enable Scotto module.",
+        .type = OptionType::Bool,
+        .game_name = "Scotto",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadDanceRushModule] = {
+        .title = "Force Load Dance Rush Module",
+        .name = "dr",
+        .desc = "Manually enable Dance Rush module.",
+        .type = OptionType::Bool,
+        .game_name = "DANCERUSH",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadWinningElevenModule] = {
+        .title = "Force Load Winning Eleven Module",
+        .name = "we",
+        .desc = "Manually enable Winning Eleven module.",
+        .type = OptionType::Bool,
+        .game_name = "Winning Eleven",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadOtocaModule] = {
+        .title = "Force Load Otoca D'or Module",
+        .name = "otoca",
+        .desc = "Manually enable Otoca D'or module.",
+        .type = OptionType::Bool,
+        .game_name = "Otoca D'or",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadLovePlusModule] = {
+        .title = "Force Load LovePlus Module",
+        .name = "loveplus",
+        .desc = "Manually enable LovePlus module.",
+        .type = OptionType::Bool,
+        .game_name = "LovePlus",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadChargeMachineModule] = {
+        .title = "Force Load Charge Machine Module",
+        .name = "pcm",
+        .desc = "Manually enable Charge Machine module.",
+        .type = OptionType::Bool,
+        .game_name = "Charge Machine",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadOngakuParadiseModule] = {
+        .title = "Force Load Ongaku Paradise Module",
+        .name = "onpara",
+        .desc = "Manually enable Ongaku Paradise module.",
+        .type = OptionType::Bool,
+        .game_name = "Ongaku Paradise",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadBusouShinkiModule] = {
+        .title = "Force Load Busou Shinki Module",
+        .name = "busou",
+        .desc = "Manually enable Busou Shinki module.",
+        .type = OptionType::Bool,
+        .game_name = "Busou Shinki: Armored Princess Battle Conductor",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadCCJModule] = {
+        .title = "Force Load Chase Chase Jokers Module",
+        .name = "ccj",
+        .desc = "Manually enable Chase Chase Jokers module.",
+        .type = OptionType::Bool,
+        .game_name = "Chase Chase Jokers",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadQKSModule] = {
+        .title = "Force Load QuizKnock STADIUM Module",
+        .name = "qks",
+        .desc = "Manually enable QuizKnock STADIUM module.",
+        .type = OptionType::Bool,
+        .game_name = "QuizKnock STADIUM",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadMFGModule] = {
+        .title = "Force Load Mahjong Fight Girl Module",
+        .name = "mfg",
+        .desc = "Manually enable Mahjong Fight Girl module.",
+        .type = OptionType::Bool,
+        .game_name = "Mahjong Fight Girl",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadPCModule] = {
+        .title = "Force Load Polaris Chord Module",
+        .name = "pc",
+        .desc = "Manually enable Polaris Chord module.",
+        .type = OptionType::Bool,
+        .game_name = "Polaris Chord",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadUDNModule] = {
+        .title = "Force Load DANCE aROUND Module",
+        .name = "udn",
+        .desc = "Manually enable DANCE aROUND module.",
+        .type = OptionType::Bool,
+        .game_name = "DANCE aROUND",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadMusecaModule] = {
+        .title = "Force Load Museca Module",
+        .name = "museca",
+        .desc = "Manually enable Museca module.",
+        .type = OptionType::Bool,
+        .game_name = "Museca",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::LoadCardConnectModule] = {
+        .title = "Force Load Card Connect Module",
+        .name = "cardconnect",
+        .desc = "Manually enable Card Connect module.",
+        .type = OptionType::Bool,
+        .game_name = "Card Connect",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::GitaDoraLegacyIdentity] = {
+        .title = "XG1 / XG1CN Configuration",
+        .name = "gdxg",
+        .desc = "Use the native 32-bit XG1 host with a standard ea3-config.xml (<ea3><soft>) or an older ea3-ident XML. Destination J/C selects Japan/China; J33/J32 selects GF/DM. Missing datecodes are read from the original libsystem.dll. Must be passed via the command line.",
+        .type = OptionType::Text,
+        .game_name = "GitaDora",
+        .category = "Advanced Game Options",
+        .disabled = true,
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "XML",
+    };
+    c[launcher::Options::PathToModules] = {
+        .title = "Modules Folder Override",
+        .name = "modules",
+        .desc = "Sets a custom path to the modules folder.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        // intentionally not setting a folder picker here to discourage people setting this without a good reason
+    };
+    c[launcher::Options::ScreenshotFolder] = {
+        .title = "Screenshot Folder Override",
+        .name = "screenshotpath",
+        .desc = "Sets a custom path to the screenshots folder.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::DirectoryPath,
+    };
+    c[launcher::Options::ConfigurationPath] = {
+        .title = "Configuration Path Override",
+        .name = "cfgpath",
+        .desc = "Sets a custom file path for config file. Must be passed via the command line. "
+            "If left empty, %appdata%\\spicetools.xml will be used.",
+        .type = OptionType::Text,
+        .setting_name = "(default)",
+        .category = "Path Overrides",
+        .disabled = true,
+    };
+    c[launcher::Options::ScreenResizeConfigPath] = {
+        .title = "Screen Resize Config Path Override",
+        .name = "resizecfgpath",
+        .desc = "Sets a custom file path for screen resize config file. "
+            "If left empty, %appdata%\\spice2x\\spicetools_screen_resize.json will be used.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "JSON",
+    };
+    c[launcher::Options::PatchManagerConfigPath] = {
+        .title = "Patch Manager Config Path Override",
+        .name = "patchcfgpath",
+        .desc = "Sets a custom file path for patch manager config file. Can be used to manage 'profiles' for auto-patches. "
+            "If left empty, %appdata%\\spice2x\\spicetools_patch_manager.json will be used.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "JSON",
+    };
+    c[launcher::Options::IntelSDEFolder] = {
+        .title = "Intel SDE",
+        .name = "sde",
+        .desc = "Path to Intel SDE kit path for automatic attaching.",
+        .type = OptionType::Text,
+        .category = "Development",
+        .picker = OptionPickerType::DirectoryPath
+    };
+    c[launcher::Options::PathToEa3Config] = {
+        .title = "ea3-config.xml Override",
+        .name = "e",
+        .desc = "Sets a custom path to ea3-config.xml.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "XML",
+    };
+    c[launcher::Options::PathToAppConfig] = {
+        .title = "app-config.xml Override",
+        .name = "a",
+        .desc = "Sets a custom path to app-config.xml.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "XML",
+    };
+    c[launcher::Options::PathToAvsConfig] = {
+        .title = "avs-config.xml Override",
+        .name = "v",
+        .desc = "Sets a custom path to avs-config.xml.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "XML",
+    };
+    c[launcher::Options::PathToBootstrap] = {
+        .title = "bootstrap.xml Override",
+        .name = "b",
+        .desc = "Sets a custom path to bootstrap.xml.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "XML",
+    };
+    c[launcher::Options::PathToLog] = {
+        .title = "log.txt Override",
+        .name = "y",
+        .desc = "Sets a custom path to log.txt.",
+        .type = OptionType::Text,
+        .category = "Path Overrides",
+        .picker = OptionPickerType::FilePath,
+        .file_extension = "TXT",
+    };
+    c[launcher::Options::APITCPPort] = {
+        .title = "API TCP Port",
+        .name = "api",
+        .desc = "Port the API should be listening on.",
+        .type = OptionType::Integer,
+        .category = "Companion & API",
+    };
+    c[launcher::Options::APIPassword] = {
+        .title = "API Password",
+        .name = "apipass",
+        .desc = "Set the custom user password needed to use the API.",
+        .type = OptionType::Text,
+        .category = "Companion & API",
+        .sensitive = true,
+    };
+    c[launcher::Options::APIVerboseLogging] = {
+        .title = "API Verbose Logging",
+        .name = "apilogging",
+        .desc = "Verbose logging of API activity.",
+        .type = OptionType::Bool,
+        .category = "API Dev",
+    };
+    c[launcher::Options::APISerialPort] = {
+        .title = "API Serial Port",
+        .name = "apiserial",
+        .desc = "Serial port the API should be listening on.",
+        .type = OptionType::Text,
+        .category = "Serial API",
+    };
+    c[launcher::Options::APISerialBaud] = {
+        .title = "API Serial Baud",
+        .name = "apiserialbaud",
+        .desc = "Baud rate for the serial port.",
+        .type = OptionType::Integer,
+        .category = "Serial API",
+    };
+    c[launcher::Options::APIPretty] = {
+        .title = "API Pretty",
+        .name = "apipretty",
+        .desc = "Slower, but pretty API output.",
+        .type = OptionType::Bool,
+        .category = "API Dev",
+    };
+    c[launcher::Options::APIDebugMode] = {
+        .title = "API Debug Mode",
+        .name = "apidebug",
+        .desc = "Enables API debugging mode.",
+        .type = OptionType::Bool,
+        .category = "API Dev",
+    };
+    c[launcher::Options::APIScreenMirrorQuality] = {
+        .title = "API Screen Mirror Quality Override",
+        .name = "apiscreenq",
+        .desc = "JPEG compression level of mirrored images, overriding any client request. "
+            "Value must be between 0 (poor quality) and 100 (best quality), inclusive. Default: 70.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-100)",
+        .category = "API Dev",
+    };
+    c[launcher::Options::APIScreenMirrorDivide] = {
+        .title = "API Screen Mirror Divide Override",
+        .name = "apiscreendiv",
+        .desc = "Divide value of mirrored images, overriding any client request. "
+            "Divide of 1 means send every pixel, 2 means every other pixel, 3 means every third pixel, and so on; "
+            "increasing the value drastically reduces transfer size at the cost of image quality. "
+            "Value must be 1 or greater. Default: 1.",
+        .type = OptionType::Integer,
+        .setting_name = "1",
+        .category = "API Dev",
+    };
+    c[launcher::Options::APIStreamEnable] = {
+        .title = "API Video Stream Server Enable (EXPERIMENTAL)",
+        .name = "apistream",
+        .desc = "Allows companion apps to receive compressed video streams over the API. "
+            "Companion app must support this feature to take advantage of it.\n\n"
+            "Video is served unencrypted over the network. "
+            "May cause older games to hang and crash.\n\n"
+            "Developers: see the wiki page for more details.",
+        .type = OptionType::Bool,
+        .category = "Companion & API",
+    };
+    c[launcher::Options::EnableAllIOModules] = {
+        .title = "Enable All IO Modules",
+        .name = "io",
+        .desc = "Manually enable ALL IO emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableACIOModule] = {
+        .title = "Enable ACIO Module",
+        .name = "acio",
+        .desc = "Manually enable ACIO emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableICCAModule] = {
+        .title = "Enable ICCA Module",
+        .name = "icca",
+        .desc = "Manually enable ICCA emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableDEVICEModule] = {
+        .title = "Enable DEVICE Module",
+        .name = "device",
+        .desc = "Manually enable DEVICE emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableEXTDEVModule] = {
+        .title = "Enable EXTDEV Module",
+        .name = "extdev",
+        .desc = "Manually enable EXTDEV emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableAMI2000Module] = {
+        .title = "Enable AMI2000 Module",
+        .name = "ami2000",
+        .desc = "Manually enable AMI2000 emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableSCIUNITModule] = {
+        .title = "Enable SCIUNIT Module",
+        .name = "sciunit",
+        .desc = "Manually enable SCIUNIT emulation.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::EnableDevicePassthrough] = {
+        .title = "Enable device passthrough",
+        .name = "devicehookdisable",
+        .desc = "Disable I/O and serial device hooks.",
+        .type = OptionType::Bool,
+        .category = "I/O Modules",
+    };
+    c[launcher::Options::ForceWinTouch] = {
+        .title = "Touch Compatibility Mode (Disable Raw Input Touch)",
+        .name = "wintouch",
+        .desc = "For touch screen input, disable usage of Raw Input API and instead use "
+                "Win8 Pointer API or Win7 Touch API. Results in better compatibility with some "
+                "touch screens, but may result in worse performance and higher latency.",
+        .type = OptionType::Bool,
+        .category = "Touch Parameters",
+    };
+    c[launcher::Options::ForceTouchEmulation] = {
+        .title = "Force Legacy Touch Emulation",
+        .name = "touchemuforce",
+        .desc = "Force enable hook for GetTouchInputInfo API and inject WM_TOUCH events. "
+            "Do not enable this unless you have trouble with using a mouse to emulate touch input.",
+        .type = OptionType::Bool,
+        .category = "Touch Parameters",
+    };
+    c[launcher::Options::InvertTouchCoordinates] = {
+        .title = "Invert Touch",
+        .name = "touchinvert",
+        .desc = "Inverts touch coordinates; only works for default raw input handler and IIDX/SDVX native touch handler, "
+                "and not Windows Touch API.",
+        .type = OptionType::Bool,
+        .category = "Touch Parameters",
+    };
+    c[launcher::Options::RawInputTouchAspectRatio] = {
+        .title = "Raw Input Touch Fix Aspect Ratio",
+        .name = "rawtouchaspect",
+        .desc = "Compensate for letterboxing/pillarboxing when the game runs at a display mode with a "
+                "different aspect ratio than the touch panel's native resolution. Only affects the default "
+                "raw input touch handler. This is automatically enabled, only force on or off if you have trouble.\n\n"
+                "auto (default): automatically enable on a per-game basis.\n"
+                "on: forced on\n"
+                "off: forced off",
+        .type = OptionType::Enum,
+        .category = "Touch Parameters",
+        .elements = {
+            {"auto", ""},
+            {"on", ""},
+            {"off", ""},
+        },
+    };
+    c[launcher::Options::DisableTouchCardInsert] = {
+        .title = "Disable Touch Card Insert (DEPRECATED - use -touchcard instead)",
+        .name = "touchnocard",
+        .desc = "Disables touch overlay card insert button.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Touch Parameters",
+    };
+    c[launcher::Options::spice2x_TouchCardInsert] = {
+        .title = "Show Insert Card button (DEPRECATED)",
+        .name = "sp2x-touchcard",
+        .display_name = "touchcard",
+        .aliases= "touchcard",
+        .desc = "Show Insert Card touch button on main display. "
+            "DEPRECATED - only works in very specific situations (jubeat + wintouch)",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Touch Parameters",
+    };
+    c[launcher::Options::ICCAReaderPort] = {
+        .title = "ICCA Reader Port",
+        .name = "reader",
+        .desc = "Connects to and uses a ICCA on a given COM port.",
+        .type = OptionType::Text,
+        .category = "NFC Card Readers",
+    };
+    c[launcher::Options::ICCAReaderPortToggle] = {
+        .title = "ICCA Reader Port (with toggle)",
+        .name = "togglereader",
+        .desc = "Connects to and uses a ICCA on a given COM port, and enabled NumLock toggling between P1/P2.",
+        .type = OptionType::Text,
+        .category = "NFC Card Readers",
+    };
+    c[launcher::Options::CardIOHIDReaderSupport] = {
+        .title = "CardIO HID Reader Support",
+        .name = "cardio",
+        .desc = "Enables detection and support of cardio HID readers.",
+        .type = OptionType::Bool,
+        .category = "NFC Card Readers",
+    };
+    c[launcher::Options::CardIOHIDReaderOrderFlip] = {
+        .title = "CardIO HID Reader Order Flip",
+        .name = "cardioflip",
+        .desc = "Flips the order of detection for P1/P2.",
+        .type = OptionType::Bool,
+        .category = "NFC Card Readers",
+    };
+    c[launcher::Options::CardIOHIDReaderOrderToggle] = {
+        .title = "CardIO HID Reader Order Toggle",
+        .name = "cardiotoggle",
+        .desc = "Toggles reader between P1/P2 using the NumLock key state.",
+        .type = OptionType::Bool,
+        .category = "NFC Card Readers",
+    };
+    c[launcher::Options::HIDSmartCard] = {
+        .title = "HID SmartCard (ACR122U)",
+        .name = "scard",
+        .desc = "Detects and uses HID smart card readers for card input. Developed for ACR122U reader.",
+        .type = OptionType::Bool,
+        .hidden = !WITH_SCARD,
+        .category = "NFC Card Readers",
+        .disabled = !WITH_SCARD,
+    };
+    c[launcher::Options::HIDSmartCardOrderFlip] = {
+        .title = "HID SmartCard Order Flip",
+        .name = "scardflip",
+        .desc = "Flips the order of detection for P1/P2.",
+        .type = OptionType::Bool,
+        .hidden = !WITH_SCARD,
+        .category = "NFC Card Readers",
+        .disabled = !WITH_SCARD,
+    };
+    c[launcher::Options::HIDSmartCardOrderToggle] = {
+        .title = "HID SmartCard Order Toggle",
+        .name = "scardtoggle",
+        .desc = "Toggles reader between P1/P2 using the NumLock key state.",
+        .type = OptionType::Bool,
+        .hidden = !WITH_SCARD,
+        .category = "NFC Card Readers",
+        .disabled = !WITH_SCARD,
+    };
+    c[launcher::Options::HIDSmartCardIdConvert] = {
+        .title = "HID SmartCard Fix UID",
+        .name = "scardfix",
+        .desc = "Modify behavior of SmartCard UID logic.\n\n"
+            "legacy (default): Preserve buggy old behavior\n\n"
+            "fix: Add E00401 to non-FeliCa cards, scan FeliCa cards as-is (Recommended for most users)\n\n"
+            "all: Add E00401 to all cards, including FeliCa cards (For really old games only)\n\n"
+            "The algorithm is simple; the prefix is applied, the scanned card number is appended up to 8 bytes, and remaining digits are discarded. "
+            "For example, abcd56780123 is converted to e00401abcd567801 on card in. This results in different card numbers so "
+            "be careful when connecting to servers!",
+        .type = OptionType::Enum,
+        .hidden = !WITH_SCARD,
+        .category = "NFC Card Readers",
+        .elements = {
+            {"legacy", "Use cards as-is"},
+            {"fix", "Fix bad cards only"},
+            {"all", "Force all cards"},
+        },
+        .disabled = !WITH_SCARD,
+    };
+    c[launcher::Options::SextetStreamPort] = {
+        .title = "SextetStream Port",
+        .name = "sextet",
+        .desc = "Use a SextetStream device on a given COM port.",
+        .type = OptionType::Text,
+        .category = "I/O Options",
+    };
+    c[launcher::Options::EnableBemaniTools5API] = {
+        .title = "Enable BemaniTools 5 API",
+        .name = "bt5api",
+        .desc = "Enables partial BemaniTools 5 API compatibility layer.",
+        .type = OptionType::Bool,
+        .category = "BT5 API",
+    };
+    c[launcher::Options::RealtimeProcessPriority] = {
+        .title = "Realtime Process Priority (DEPRECATED - use -processpriority instead)",
+        .name = "realtime",
+        .desc = "Sets the process priority to realtime; can help with odd lag spikes.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Performance",
+    };
+    c[launcher::Options::spice2x_ProcessPriority] = {
+        .title = "Process Priority",
+        .name = "sp2x-processpriority",
+        .display_name = "processpriority",
+        .aliases= "processpriority",
+        .desc = "Sets the process priority, which can help with odd lag spikes. Default: high.",
+        .type = OptionType::Enum,
+        .category = "Performance",
+        .elements = {
+            {"belownormal", ""},
+            {"normal", ""},
+            {"abovenormal", ""},
+            {"high", ""},
+            {"realtime", ""}
+        },
+    };
+    c[launcher::Options::spice2x_ProcessAffinity] = {
+        .title = "Process Affinity",
+        .name = "sp2x-processaffinity",
+        .display_name = "processaffinity",
+        .aliases= "processaffinity",
+        .desc = "Set process affinity by calling SetProcessAffinityMask. "
+                "Must provide a hexadecimal mask (e.g., 0x1ff00).",
+        .type = OptionType::Hex,
+        .category = "Performance",
+        .picker = OptionPickerType::CpuAffinity,
+    };
+    c[launcher::Options::spice2x_ProcessorEfficiencyClass] = {
+        .title = "Process Efficiency Class",
+        .name = "sp2x-processefficiency",
+        .display_name = "processefficiency",
+        .aliases= "processefficiency",
+        .desc = "Has no effect if -processaffinity is set. Default: Use all cores.",
+        .type = OptionType::Enum,
+        .category = "Performance",
+        .elements = {
+            {"all", "Use all cores"},
+            {"pcores", "Performant cores only"},
+            {"ecores", "Efficient cores only"},
+        },
+    };
+    c[launcher::Options::HeapSize] = {
+        .title = "Heap Size",
+        .name = "h",
+        .desc = "Custom heap size in bytes.",
+        .type = OptionType::Integer,
+        .category = "Development",
+    },
+    // TODO: remove this and create an ignore list
+    c[launcher::Options::DisableGSyncDetection] = {
+        .title = "(REMOVED) Disable G-Sync Detection",
+        .name = "keepgsync",
+        .desc = "Broken feature that was not implemented correctly.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Graphics",
+    };
+    c[launcher::Options::spice2x_NvapiProfile] = {
+        .title = "NVIDIA profile optimization",
+        .name = "sp2x-nvprofile",
+        .display_name = "nvprofile",
+        .aliases= "nvprofile",
+        .desc = "Creates an NVIDIA application profile for spice(64).exe and applies GPU tweaks.\n\n"
+                "Disables G-SYNC by setting the Monitor Technology to 'Fixed Refresh', "
+                "sets v-sync to 'Application Controlled', "
+                "and the Power Management Mode to 'Prefer maximum performance'.\n\n"
+                "G-SYNC may fail to disable properly; try enabling full-screen optimizations (FSO) for spice(64).exe.\n\n"
+                "May not work as expected for some games; namely G-SYNC and SDVX.",
+        .type = OptionType::Bool,
+        .category = "Graphics",
+        .quick_setting_category = "Display",
+    };
+    c[launcher::Options::DisableAudioHooks] = {
+        .title = "Disable All Spice Audio Hooks",
+        .name = "audiohookdisable",
+        .desc = "Disables all audio hooks, including device initialization and volume hooks.\n\n"
+            "Default: off (allow Spice to hook IMMDeviceEnumerator for and optionally let "
+                "you use a different backend instead of exclusive WASAPI).\n\n"
+            "Check this to allow games to natively access your audio device.",
+        .type = OptionType::Bool,
+        .category = "Audio Hacks",
+    };
+    c[launcher::Options::spice2x_DisableVolumeHook] = {
+        .title = "Disable Audio Volume Hook",
+        .name = "sp2x-volumehookdisable",
+        .display_name = "volumehookdisable",
+        .aliases= "volumehookdisable",
+        .desc = "Disables audio volume hook.\n\n"
+            "Default: off (prevent games from changing audio volume by hooking IAudioEndpointVolume).\n\n"
+            "Check this to allow games to freely change your volume.",
+        .type = OptionType::Bool,
+        .category = "Audio Hacks",
+    };
+    c[launcher::Options::AudioShared] = {
+        .title = "WASAPI Force Shared Mode & Auto-Resample (EXPERIMENTAL)",
+        .name = "wasapishared",
+        .desc = "This option converts all WASAPI exclusive mode requests to shared mode.\n\n"
+            "Many games have patches that turn on shared mode, but this option is better! "
+            "Windows will automatically perform sample rate conversion - "
+            "you do not need to manually set the sample rate of your audio device before launching the game.",
+        .type = OptionType::Bool,
+        .category = "Audio",
+        .quick_setting_category = "Audio",
+    };
+    c[launcher::Options::spice2x_LowLatencySharedAudio] = {
+        .title = "Low Latency Shared Audio",
+        .name = "sp2x-lowlatencysharedaudio",
+        .display_name = "lowlatencysharedaudio",
+        .aliases= "lowlatencysharedaudio",
+        .desc = "Force the usage of smallest buffer size supported by the device when shared mode audio is used. "
+            "Works for games using DirectSound or shared WASAPI; no effect for exclusive WASAPI and ASIO. "
+            "For best results (under 10ms), use the default Windows inbox audio driver instead of manufacturer supplied driver. "
+            "Requires Windows 10 and above.",
+        .type = OptionType::Bool,
+        .category = "Audio",
+        .quick_setting_category = "Audio",
+    };
+    c[launcher::Options::AudioBackend] = {
+        .title = "Spice Audio Hook Backend (DEPRECATED - use -asioconvert instead)",
+        .name = "audiobackend",
+        .desc = "Selects the audio backend to use when spice audio hook is enabled, overriding exclusive WASAPI. "
+            "Does nothing for games that do not output to exclusive WASAPI.",
+        .type = OptionType::Enum,
+        .hidden = true,
+        .category = "Audio Conversion",
+        .elements = {
+            {"asio", "ASIO"},
+            {"waveout", "broken, do not use"}
+        },
+    };
+    c[launcher::Options::AsioDriverId] = {
+        .title = "Spice Audio Hook ASIO Driver ID (DEPRECATED - use -asioconvert instead)",
+        .name = "asiodriverid",
+        .desc = "Selects the ASIO driver id to use when Spice Audio Backend is set to ASIO.",
+        .type = OptionType::Integer,
+        .hidden = true,
+        .category = "Audio Conversion",
+    };
+    c[launcher::Options::AsioDriverName] = {
+        .title = "WASAPI Exclusive to ASIO Conversion",
+        .name = "asioconvert",
+        .desc = "Converts WASAPI Exclusive audio output to ASIO. Value here should match registry key under HKLM\\SOFTWARE\\ASIO\\\n\n"
+            "Use this if the game is configured to use WASAPI Exclusive but you want to use your ASIO driver instead.\n\n"
+            "This should only be used as last resort if your audio device does not support WASAPI Exclusive.\n\n"
+            "Does nothing for games that do not output to exclusive WASAPI.",
+        .type = OptionType::Text,
+        .category = "Audio Conversion",
+        .picker = OptionPickerType::AsioDriver,
+    };
+    c[launcher::Options::AudioDummy] = {
+        .title = "WASAPI Dummy Context",
+        .name = "audiodummy",
+        .desc = "Uses a dummy `IAudioClient` context to maintain full audio control. "
+            "This is automatically enabled when required and not normally needed.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Audio Hacks",
+    };
+    c[launcher::Options::DownmixAudioToStereo] = {
+        .title = "WASAPI Stereo Downmix",
+        .name = "downmix",
+        .desc = "Downmixes multi-channel (surround) audio output to stereo.\n\n"
+            "Note that in all of the options, subwoofer (LFE) is dropped.\n\n"
+            "ac4 (recommended): AC-4 algorithm (ETSI TS 103 190-1) - front left/right pass "
+            "through, center and surrounds fold in at -3 dB.\n\n"
+            "normalize: all channels equally loud.\n\n"
+            "front: front channels only.\n\n"
+            "rear: rear channels only.\n\n"
+            "side: side channels only.",
+        .type = OptionType::Enum,
+        .category = "Audio Conversion",
+        .elements = {
+            {"ac4", "AC-4 downmix"},
+            {"normalize", "All channels"},
+            {"front", "Front channels only"},
+            {"rear", "Rear channels only"},
+            {"side", "Side channels only"},
+        },
+    };
+    c[launcher::Options::VolumeBoost] = {
+        .title = "WASAPI/ASIO Boost Audio Volume",
+        .name = "volumeboost",
+        .desc = "Artificially amplifies the hooked audio output by the selected amount, applied "
+            "right before the audio reaches the device. Works regardless of channel layout or "
+            "downmixing.\n\n"
+            "Louder settings may cause clipping/distortion, use caution.",
+        .type = OptionType::Enum,
+        .category = "Audio",
+        .elements = {
+            {"3", "+3 dB"},
+            {"6", "+6 dB"},
+            {"9", "+9 dB"},
+            {"12", "+12 dB"},
+            {"15", "+15 dB"},
+            {"20", "+20 dB"},
+            {"25", "+25 dB"},
+            {"30", "+30 dB"},
+        },
+    };
+    c[launcher::Options::AudioResample] = {
+        .title = "WASAPI Exclusive Mode Resampling",
+        .name = "resample",
+        .desc = "Resamples the hooked audio output to a fixed sample rate before it reaches the "
+            "device. Useful when a game requests a sample rate the device cannot output in "
+            "exclusive mode (e.g. the game wants 44100 Hz but the device is locked to 48000 Hz).\n\n"
+            "Select the TARGET sample rate (one that your audio card supports).\n\n"
+            "Will result in couple milliseconds of latency and increased CPU usage when active.",
+        .type = OptionType::Enum,
+        .category = "Audio Conversion",
+        .elements = {
+            {"44100", "44.1 kHz"},
+            {"48000", "48 kHz"},
+            {"88200", "88.2 kHz"},
+            {"96000", "96 kHz"},
+            {"176400", "176.4 kHz"},
+            {"192000", "192 kHz"},
+        },
+    };
+    c[launcher::Options::AudioExclusiveBuffer] = {
+        .title = "WASAPI Exclusive Buffer Size",
+        .name = "exclusivebuffer",
+        .desc = "Enlarges the WASAPI exclusive-mode device buffer to the specified duration in milliseconds.\n\n"
+            "Try setting this to 10 or even 20 if you hear crackling or glitches "
+            "(at the cost of slightly increased latency).",
+        .type = OptionType::Integer,
+        .setting_name = "16",
+        .category = "Audio Conversion",
+    };
+    c[launcher::Options::AsioDownmixToStereo] = {
+        .title = "ASIO 7.1 to Stereo Downmix",
+        .name = "asiodownmix",
+        .desc = "Extracts a single stereo channel pair from a multi-channel ASIO output, "
+            "mapping the selected pair to the device's first two channels.\n\n"
+            "Channel pairs assume a standard 7.1 ASIO layout (0-indexed):\n\n"
+            "front: channels 0/1 (front left/right).\n\n"
+            "center: channel 2 (front center, duplicated to both outputs).\n\n"
+            "rear: channels 4/5 (rear left/right).\n\n"
+            "side: channels 6/7 (side left/right).",
+        .type = OptionType::Enum,
+        .category = "Audio Conversion",
+        .elements = {
+            {"front", "Front (ch 0/1)"},
+            {"center", "Center (ch 2)"},
+            {"rear", "Rear (ch 4/5)"},
+            {"side", "Side (ch 6/7)"},
+        },
+    };
+    c[launcher::Options::DelayBy5Seconds] = {
+        .title = "Delay by 5 Seconds (DEPRECATED - use -sleepduration instead)",
+        .name = "sleep",
+        .desc = "Waits five seconds before starting the game.",
+        .type = OptionType::Bool,
+        .hidden = true, // superseded by sp2x-sleep_duration
+        .category = "Miscellaneous",
+    };
+    c[launcher::Options::spice2x_DelayByNSeconds] = {
+        .title = "Delay Game Launch",
+        .name = "sp2x-sleepduration",
+        .display_name = "sleepduration",
+        .aliases= "sleepduration",
+        .desc = "Wait for N seconds before starting the game.",
+        .type = OptionType::Integer,
+        .category = "Miscellaneous",
+    };
+    c[launcher::Options::LoadStubs] = {
+        .title = "Load KBT/KLD Stubs",
+        .name = "stubs",
+        .desc = "Enables loading kbt/kld stub files.",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::AdjustOrientation] = {
+        .title = "Adjust Display Orientation (DEPRECATED - use -autoorientation instead)",
+        .name = "adjustorientation",
+        .desc = "Automatically adjust the orientation of your display in portrait games. "
+                "WARNING: game may launch at incorrect refresh rate! Use in combination with "
+                "-graphics-force-refresh flag to fix.",
+        .type = OptionType::Bool,
+        .hidden = true, // superseded by sp2x-autoorientation
+        .category = "Graphics",
+    };
+    c[launcher::Options::spice2x_AutoOrientation] = {
+        .title = "Rotate Monitor",
+        .name = "sp2x-autoorientation",
+        .display_name = "autoorientation",
+        .aliases= "autoorientation",
+        .desc = "Change the orientation of the primary display before launching the game. It will be restored on exit",
+        .type = OptionType::Enum,
+        .category = "Monitor",
+        // match graphics_orientation enum
+        .elements = {
+            {"0", "Portrait"},
+            {"1", "Portrait, Flipped"},
+            {"2", "Landscape"},
+            {"3", "Landscape, Flipped"}
+        },
+        .quick_setting_category = "Display",
+    };
+    c[launcher::Options::ChangeResolution] = {
+        .title = "Change Monitor Resolution",
+        .name = "changeres",
+        .desc = "Changes monitor resolution before booting the game.",
+        .type = OptionType::Text,
+        .setting_name = "1280,720",
+        .category = "Monitor"
+    };
+    c[launcher::Options::LogLevel] = {
+        .title = "AVS Log Level",
+        .name = "loglevel",
+        .desc = "Set the level of detail for AVS log messages written to the log. Does not affect logging from spice.",
+        .type = OptionType::Enum,
+        .category = "Debug Log",
+        .elements = {{"fatal", ""}, {"warning", ""}, {"info", ""}, {"misc", ""}, {"all", ""}, {"disable", ""}},
+    };
+    c[launcher::Options::EAAutomap] = {
+        .title = "EA Automap",
+        .name = "automap",
+        .desc = "Enable automap in patch configuration.",
+        .type = OptionType::Bool,
+        .category = "Network Dev",
+    };
+    c[launcher::Options::EANetdump] = {
+        .title = "EA Netdump",
+        .name = "netdump",
+        .desc = "Enable automap in network dumping configuration.",
+        .type = OptionType::Bool,
+        .category = "Network Dev",
+    };
+    c[launcher::Options::BlockingLogger] = {
+        .title = "Blocking Logger",
+        .name = "logblock",
+        .desc = "Slower but safer logging for debugging.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::DebugCreateFile] = {
+        .title = "Debug CreateFile",
+        .name = "createfiledebug",
+        .desc = "Outputs CreateFile debug prints.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::VerboseGraphicsLogging] = {
+        .title = "Verbose Graphics Logging",
+        .name = "graphicsverbose",
+        .desc = "Enable the verbose logging of graphics hook code.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::VerboseAVSLogging] = {
+        .title = "Verbose AVS Logging",
+        .name = "avsverbose",
+        .desc = "Enable the verbose logging of AVS filesystem functions.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::AllowEA3Verbose] = {
+        .title = "Allow EA3 Verbose Debug Logging",
+        .name = "ea3verbose",
+        .desc = "This option is only useful for network developers; leave this OFF.\n\n"
+            "By default, ea3/debug/verbose node is removed by spice to prevent exposing PCBID in the logs. "
+            "When this is enabled, ea3/debug/verbose node in the XML will be kept and exposed to the game.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::DisableColoredOutput] = {
+        .title = "Disable Colored Output",
+        .name = "nocolor",
+        .desc = "Disable terminal colors for log outputs to console.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::DisableACPHook] = {
+        .title = "Disable ACP Hook",
+        .name = "acphookdisable",
+        .desc = "Force disable advanced code pages hooks for encoding.",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::DisableSignalHandling] = {
+        .title = "Disable Signal Handling",
+        .name = "signaldisable",
+        .desc = "Force disable signal handling.",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::DisableDebugHooks] = {
+        .title = "Disable Debug Hooks",
+        .name = "dbghookdisable",
+        .desc = "Disable hooks for debug functions (e.g. OutputDebugString).",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::DisableAvsVfsDriveMountRedirection] = {
+        .title = "Disable AVS VFS Drive Mount Redirection",
+        .name = "avs-redirect-disable",
+        .desc = "Disable D:/E:/F: AVS VFS mount redirection.",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::DisableAvsCache] = {
+        .title = "Disable AVS Cache",
+        .name = "avscachedisable",
+        .desc = "Disable optimization used for some games to cache data file info (only for IIDX32+ for now).",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::OutputPEB] = {
+        .title = "Output PEB",
+        .name = "pebprint",
+        .desc = "Prints PEB on startup to console.",
+        .type = OptionType::Bool,
+        .category = "Debug Log",
+    };
+    c[launcher::Options::DumpSystemInfo] = {
+        .title = "Dump System Information",
+        .name = "sysdump",
+        .desc = "Print system information to the log on startup. Default: basic.",
+        .type = OptionType::Enum,
+        .category = "Debug Log",
+        .elements = {
+            {"none", "Nothing"},
+            {"basic", "OS, CPU, SMBIOS, GPU"},
+            {"all", "basic + HID devices"},
+        },
+    };
+    c[launcher::Options::QKSArgs] = {
+        .title = "QKS Arguments Override",
+        .name = "qksargs",
+        .desc = "Command line arguments passed to the game.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "QuizKnock STADIUM",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::CCJArgs] = {
+        .title = "CCJ Arguments Override",
+        .name = "ccjargs",
+        .desc = "Command line arguments passed to the game. "
+            "If left blank, '-nomatchselect' is applied, which disables matchmaking debug menu.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "Chase Chase Jokers",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::CCJMouseTrackball] = {
+        .title = "CCJ Mouse Trackball",
+        .name = "ccjmousetb",
+        .desc = "Use mouse for trackball input; disables any keyboard / joystick control for the trackball. "\
+            "Hold RMB and move the cursor to control the trackball.",
+        .type = OptionType::Bool,
+        .game_name = "Chase Chase Jokers",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::CCJMouseTrackballWithToggle] = {
+        .title = "CCJ Mouse Trackball Toggle",
+        .name = "ccjmousetbt",
+        .desc = "Instead of holding RMB, click RMB to toggle trackball input.",
+        .type = OptionType::Bool,
+        .game_name = "Chase Chase Jokers",
+        .category = "Game Options",
+    };
+    c[launcher::Options::CCJTrackballSensitivity] = {
+        .title = "CCJ Trackball Sensitivity",
+        .name = "ccjtrackballsens",
+        .desc = "Adjust sensitivity of trackball. Affects both digital and analog input. Default: 10.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-255)",
+        .game_name = "Chase Chase Jokers",
+        .category = "Game Options",
+    };
+    c[launcher::Options::MFGArgs] = {
+        .title = "MFG Arguments Override",
+        .name = "mfgargs",
+        .desc = "Command line arguments passed to the game.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "Mahjong Fight Girl",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::MFGCabType] = {
+        .title = "MFG Cabinet Type",
+        .name = "mfgcabtype",
+        .desc = "MFG Cabinet Type. Default is HG.",
+        .type = OptionType::Enum,
+        .setting_name = "",
+        .game_name = "Mahjong Fight Girl",
+        .category = "Game Options",
+        .elements = {
+            {"HG", "HG"},
+            {"B", "B"},
+            {"C", "C"},
+            {"UKS", "UKS"},
+        },
+    };
+    c[launcher::Options::MFGNoIO] = {
+        .title = "MFG Disable IO Emulation",
+        .name = "mfgnoio",
+        .desc = "Disables BI2X hooks for MFG.",
+        .type = OptionType::Bool,
+        .setting_name = "",
+        .game_name = "Mahjong Fight Girl",
+        .category = "Advanced Game Options"
+    };
+    c[launcher::Options::PCArgs] = {
+        .title = "PC Arguments Override",
+        .name = "pcargs",
+        .desc = "Command line arguments passed to the game.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "Polaris Chord",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::PCNoIO] = {
+        .title = "PC Disable IO Emulation",
+        .name = "pcnoio",
+        .desc = "Disables BI2X hooks for PC.",
+        .type = OptionType::Bool,
+        .setting_name = "",
+        .game_name = "Polaris Chord",
+        .category = "Advanced Game Options"
+    };
+    c[launcher::Options::PCKnobMode] = {
+        .title = "PC Fader Knobs Mode",
+        .name = "pcknobs",
+        .desc = "Allows SDVX knobs and IIDX turntables to be bound as Polaris Chord faders.",
+        .type = OptionType::Bool,
+        .game_name = "Polaris Chord",
+        .category = "Game Options",
+    };
+    c[launcher::Options::UDNArgs] = {
+        .title = "DANCE aROUND Arguments Override",
+        .name = "udnargs",
+        .desc = "Command line arguments passed to the game.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "DANCE aROUND",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::UDNNoIO] = {
+        .title = "DANCE aROUND Disable IO Emulation",
+        .name = "udnnoio",
+        .desc = "Disables BI2X hooks for DANCE aROUND.",
+        .type = OptionType::Bool,
+        .setting_name = "",
+        .game_name = "DANCE aROUND",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::CardConnectArgs] = {
+        .title = "Card Connect Arguments Override",
+        .name = "cardconnectargs",
+        .desc = "Command line arguments passed to the game.",
+        .type = OptionType::Text,
+        .setting_name = "",
+        .game_name = "Card Connect",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::CardConnectNoPrinter] = {
+        .title = "Card Connect Disable Printer Emulation",
+        .name = "cardconnectnoprinter",
+        .desc = "Leave the native printer driver unhooked for use with a real printer.",
+        .type = OptionType::Bool,
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::CardConnectPrinterDelay] = {
+        .title = "Card Connect Simulate Printer Delay",
+        .name = "cardconnectprinterdelay",
+        .desc = "Simulate real printing time: 73 seconds per card, plus hologram and coating delays "
+                "(up to 99 seconds). Off by default (5 seconds per card).",
+        .type = OptionType::Bool,
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::CardConnectPrinterOutputPath] = {
+        .title = "Card Connect Printer Output Path",
+        .name = "cardconnectprinterpath",
+        .desc = "Folder for front/back color images. Defaults to the working directory.",
+        .type = OptionType::Text,
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+        .picker = OptionPickerType::DirectoryPath,
+    };
+    c[launcher::Options::CardConnectPrinterOutputClear] = {
+        .title = "Card Connect Printer Output Clear",
+        .name = "cardconnectprinterclear",
+        .desc = "Delete saved front/back images in the output directory on startup.",
+        .type = OptionType::Bool,
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::CardConnectPrinterOutputOverwrite] = {
+        .title = "Card Connect Printer Output Overwrite",
+        .name = "cardconnectprinteroverwrite",
+        .desc = "Always overwrite the same front/back image pair.",
+        .type = OptionType::Bool,
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::CardConnectPrinterOutputFormat] = {
+        .title = "Card Connect Printer Output Format",
+        .name = "cardconnectprinterformat",
+        .desc = "File format for printer output. Defaults to PNG.",
+        .type = OptionType::Text,
+        .setting_name = "(png/bmp/tga/jpg)",
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::CardConnectPrinterJPGQuality] = {
+        .title = "Card Connect Printer JPG Quality",
+        .name = "cardconnectprinterjpgquality",
+        .desc = "Quality setting in percent if JPG format is used.",
+        .type = OptionType::Integer,
+        .setting_name = "(1-100)",
+        .game_name = "Card Connect",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::spice2x_LightsOverallBrightness] = {
+        .title = "Lights Brightness Adjustment",
+        .name = "sp2x-lights-brightness",
+        .display_name = "lightsbrightness",
+        .aliases= "lightsbrightness",
+        .desc = "Modify HID output values, measured in %. Default is 100. "
+                "Requires compatible hardware, not just any LED.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-100)",
+        .category = "I/O Options",
+    };
+    c[launcher::Options::spice2x_WindowBorder] = {
+        .title = "Window Border Style",
+        .name = "sp2x-windowborder",
+        .display_name = "windowborder",
+        .aliases= "windowborder",
+        .desc = "For windowed mode: overrides window border style. "
+            "Does not work for all games; can possibly make the game crash! "
+            "Can also be changed in Screen Resize window (default F11).",
+        .type = OptionType::Enum,
+        .category = "Windowed Settings",
+        // match cfg::WindowDecorationMode
+        .elements = {
+            {"0", "default"},
+            {"1", "borderless"},
+            {"2", "resizable window"},
+        },
+    };
+    c[launcher::Options::spice2x_WindowSize] = {
+        .title = "Window Size",
+        .name = "sp2x-windowsize",
+        .display_name = "windowsize",
+        .aliases= "windowsize",
+        .desc = "For windowed mode: override for window size, width and height separated by comma. "
+            "Can also be changed in Screen Resize window (default F11).",
+        .type = OptionType::Text,
+        .setting_name = "1280,720",
+        .category = "Windowed Settings",
+    };
+    c[launcher::Options::spice2x_WindowPosition] = {
+        .title = "Window Position",
+        .name = "sp2x-windowpos",
+        .display_name = "windowpos",
+        .aliases= "windowpos",
+        .desc = "For windowed mode: override for window position, x and y separated by comma. "
+            "Can also be changed in Screen Resize window (default F11).",
+        .type = OptionType::Text,
+        .setting_name = "120,240",
+        .category = "Windowed Settings",
+    };
+    c[launcher::Options::spice2x_WindowAlwaysOnTop] = {
+        .title = "Window Always on Top",
+        .name = "sp2x-windowalwaysontop",
+        .display_name = "windowalwaysontop",
+        .aliases= "windowalwaysontop",
+        .desc = "For windowed mode: make window to be always on top of other windows. "
+            "Can also be changed in Screen Resize window (default F11).",
+        .type = OptionType::Bool,
+        .category = "Windowed Settings",
+    };
+    c[launcher::Options::WindowForceScaling] = {
+        .title = "Window Forced Render Scaling",
+        .name = "windowscale",
+        .desc = "For windowed mode: forcibly set DX9 back buffer dimensions to match window size. "
+            "Reduces pixelated scaling artifacts. Works great for some games, but can COMPLETELY BREAK other games - YMMV!",
+        .type = OptionType::Bool,
+        .category = "Windowed Settings",
+    };
+    c[launcher::Options::WindowDisableRoundedCorners] = {
+        .title = "Disable Round Window Corners",
+        .name = "windownoroundcorners",
+        .desc = "Windows 11 and above only: Disables rounded corners on the game window(s).",
+        .type = OptionType::Bool,
+        .category = "Windowed Settings",
+    };
+    c[launcher::Options::GitaDoraWindowedMainMonitor] = {
+        .title = "GitaDora Windowed Main Monitor",
+        .name = "gdwmainmonitor",
+        .desc = "For GITADORA Arena windowed mode: place and size the "
+            "main window to fill this monitor.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY1",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::GitaDoraWindowedLeftMonitor] = {
+        .title = "GitaDora Windowed LEFT Monitor",
+        .name = "gdwleftmonitor",
+        .desc = "For GITADORA Arena windowed mode: place and size the "
+            "LEFT window to fill this monitor.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY2",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::GitaDoraWindowedRightMonitor] = {
+        .title = "GitaDora Windowed RIGHT Monitor",
+        .name = "gdwrightmonitor",
+        .desc = "For GITADORA Arena windowed mode: place and size the "
+            "RIGHT window to fill this monitor.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY3",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::GitaDoraWindowedSmallMonitor] = {
+        .title = "GitaDora Windowed SMALL Monitor",
+        .name = "gdwsmallmonitor",
+        .desc = "For GITADORA Arena windowed mode: place and size the "
+            "SMALL touch window to fill this monitor.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY4",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::GitaDoraWindowedSmallSize] = {
+        .title = "GitaDora Windowed SMALL Size",
+        .name = "gdwsmallsize",
+        .desc = "Size of the GITADORA Arena SMALL touch window. Defaults to (800,1280).",
+        .type = OptionType::Text,
+        .setting_name = "800,1280",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::GitaDoraWindowedSmallPosition] = {
+        .title = "GitaDora Windowed SMALL Position",
+        .name = "gdwsmallpos",
+        .desc = "Initial position of the GITADORA Arena SMALL touch window. Defaults to (0,0).",
+        .type = OptionType::Text,
+        .setting_name = "0,0",
+        .game_name = "GitaDora",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::spice2x_IIDXWindowedSubscreenSize] = {
+        .title = "IIDX Windowed Subscreen Size",
+        .name = "iidxwsubsize",
+        .desc = "Size of the subscreen window. Defaults to (1280,720).",
+        .type = OptionType::Text,
+        .setting_name = "1280,720",
+        .game_name = "Beatmania IIDX",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::spice2x_IIDXWindowedSubscreenPosition] = {
+        .title = "IIDX Windowed Subscreen Position",
+        .name = "iidxwsubpos",
+        .desc = "Initial position of the subscreen window. Defaults to (0,0).",
+        .type = OptionType::Text,
+        .setting_name = "0,0",
+        .game_name = "Beatmania IIDX",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::IIDXWindowedSubscreenBorderless] = {
+        .title = "IIDX Windowed Subscreen Borderless",
+        .name = "iidxwsubborderless",
+        .desc = "Remove window decoration from windowed subscreen.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::IIDXWindowedSubscreenAlwaysOnTop] = {
+        .title = "IIDX Windowed Subscreen Always On Top",
+        .name = "iidxwsubtop",
+        .desc = "Keep windowed subscreen on top.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::spice2x_JubeatLegacyTouch] = {
+        .title = "JB Legacy Touch Targets (Deprecated - use -jubeattouchalgo instead)",
+        .name = "sp2x-jubeatlegacytouch",
+        .display_name = "jubeatlegacytouch",
+        .aliases= "jubeatlegacytouch",
+        .desc = "Deprecated - use -jubeattouchalgo instead.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Jubeat",
+        .category = "Game Options",
+    };
+    c[launcher::Options::JubeatTouchAlgo] = {
+        .title = "JB Touch Algorithm",
+        .name = "jubeattouchalgo",
+        .desc = "For touch screen players: choose the touch algorithm to use.\n\n"
+            "legacy - evenly divide the grid into 16 squares; old spicetools behavior, slightly inaccurate in gaps\n\n"
+            "improved (default) - squares register as-is, gaps will trigger the closest square\n\n"
+            "plus - like improved, but gaps can trigger multiple buttons (like the mobile game)\n\n"
+            "accurate - only touches within squares will trigger; gaps do nothing (for AC size touch screens)",
+        .type = OptionType::Enum,
+        .game_name = "Jubeat",
+        .category = "Game Options",
+        .elements = {
+            {"legacy", ""},
+            {"improved", ""},
+            {"plus", ""},
+            {"accurate", ""},
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::JubeatTouchDebug] = {
+        .title = "JB Touch Debug Overlay",
+        .name = "jubeattouchdebug",
+        .desc = "For touch screen players: draw a debug overlay on the main display. "
+            "Requires the Spice Overlay to be enabled.\n\n"
+            "auto (default) - show boundary boxes when a touch screen is detected; otherwise, none\n\n"
+            "none - draw nothing\n\n"
+            "box - show the 4x4 touch boundary boxes\n\n"
+            "all - show both the boxes and the touch circles",
+        .type = OptionType::Enum,
+        .game_name = "Jubeat",
+        .category = "Game Options",
+        .elements = {
+            {"auto", ""},
+            {"none", ""},
+            {"box", ""},
+            {"all", ""},
+        },
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::JubeatTouchDebounce] = {
+        .title = "JB Touch Debounce",
+        .name = "jubeattouchdebounce",
+        .desc = "For touch screen players: ignore extremely quick touches by requiring a "
+            "touch to be held for at least this many milliseconds before it registers.\n\n"
+            "Useful for filtering phantom touches on a noisy touch screen. A higher value "
+            "adds input latency, so keep it small. Default: off (0).",
+        .type = OptionType::Integer,
+        .setting_name = "8",
+        .game_name = "Jubeat",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::RBTouchDebug] = {
+        .title = "RB Touch Debug Overlay",
+        .name = "rbtouchdebug",
+        .desc = "Draw lines to show IR sensor emulation state.\n\n"
+            "Note: lines will not perfectly align with touches; this is by design, it's showing the "
+            "IR sensor state, before the game applies its own touch detection algorithm.",
+        .type = OptionType::Bool,
+        .game_name = "Reflec Beat",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::spice2x_RBTouchScale] = {
+        .title = "RB Touch Emulation Scale",
+        .name = "sp2x-rbscaletouch",
+        .display_name = "rbscaletouch",
+        .aliases= "rbscaletouch",
+        .desc = "Apply scaling to make touch area smaller than the screen. "
+            "Specify a number out of 1000 (e.g., 800 means 80%). Default: 1000.",
+        .type = OptionType::Integer,
+        .game_name = "Reflec Beat",
+        .category = "Game Options",
+    };
+    c[launcher::Options::RBTouchSize] = {
+        .title = "RB Touch Emulation Size (DEPRECATED - no longer has any effect)",
+        .name = "rbtouchsize",
+        .desc = "This option is deprecated and no longer has any effect. "
+            "Reflec Beat touch emulation always uses the 3x3 sensor model.",
+        .type = OptionType::Enum,
+        .hidden = true,
+        .game_name = "Reflec Beat",
+        .category = "Game Options",
+        .elements = {
+            {"3", "3x3"},
+        },
+    };
+    c[launcher::Options::RBTouchPollRate] = {
+        .title = "RB Touch Emulation Poll Hz",
+        .name = "rbtouchhz",
+        .desc = "By default, the game polls for touch at ~125Hz. "
+            "This option overrides that rate; enter a number between 1 and 1000.\n\n"
+            "Higher rates reduce input latency (the game sees a fresher touch position) "
+            "but do NOT improve spatial accuracy, and very high rates just waste CPU.",
+        .type = OptionType::Integer,
+        .setting_name = "250",
+        .game_name = "Reflec Beat",
+        .category = "Game Options",
+    };
+    c[launcher::Options::spice2x_AsioForceUnload] = {
+        .title = "ASIO Force Unload On Stop",
+        .name = "sp2x-asioforceunload",
+        .display_name = "asioforceunload",
+        .aliases= "asioforceunload",
+        .desc = "For certain buggy ASIO drivers, force unload of ASIO driver when audio stream stops. "
+            "Used for working around ASIO drivers that lock up after force quitting games.",
+        .type = OptionType::Bool,
+        .category = "Audio Hacks",
+    };
+    c[launcher::Options::spice2x_IIDXNoESpec] = {
+        .title = "IIDX Disable E-spec I/O",
+        .name = "sp2x-iidxnoespec",
+        .display_name = "iidxnoespec",
+        .aliases= "iidxnoespec",
+        .desc = "Disable I/O emulation for E-spec I/O upgrade (GELDJ-JX kit).",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_IIDXWindowedTDJ] = {
+        .title = "IIDX TDJ Windowed Mode (DEPRECATED - just use -iidxtdj and -w together)",
+        .name = "sp2x-iidxtdjw",
+        .display_name = "iidxtdjw",
+        .aliases= "iidxtdjw",
+        .desc = "Enable TDJ, optimized for windowed mode. "
+            "Press Toggle Subscreen button and use your mouse on the main window.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Options",
+    };
+    c[launcher::Options::spice2x_DRSDisableTouch] = {
+        .title = "DRS Disable Touch Input",
+        .name = "sp2x-drsdisabletouch",
+        .display_name = "drsdisabletouch",
+        .aliases= "drsdisabletouch",
+        .desc = "Disables multitouch input.",
+        .type = OptionType::Bool,
+        .game_name = "DANCERUSH",
+        .category = "Game Options",
+    };
+    c[launcher::Options::spice2x_DRSTransposeTouch] = {
+        .title = "DRS Transpose Touch Input",
+        .name = "sp2x-drstransposetouch",
+        .display_name = "drstransposetouch",
+        .aliases= "drstransposetouch",
+        .desc = "Swap x and y values of touch input.",
+        .type = OptionType::Bool,
+        .game_name = "DANCERUSH",
+        .category = "Game Options",
+    };
+    c[launcher::Options::DRSRGBCameraHook] = {
+        .title = "DRS RGB Camera Hook",
+        .name = "drsrgbcamhook",
+        .desc = "Hook into the RGB camera detection and attempt to use your own non-official webcam. "
+            "Not every webcam will be compatible with this; YMMV.\n\n"
+            "Note: this is NOT for the motion camera - you still need a real RealSense camera for that!",
+        .type = OptionType::Bool,
+        .game_name = "DANCERUSH",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::spice2x_IIDXNativeTouch] = {
+        .title = "IIDX Native Touch (DEPRECATED - no longer needed)",
+        .name = "sp2x-iidxnativetouch",
+        .display_name = "iidxnativetouch",
+        .aliases= "iidxnativetouch",
+        .desc = "This option does nothing.\n\n"
+            "Native touch handling is now enabled by default and this option is no longer needed.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_IIDXNoSub] = {
+        .title = "IIDX TDJ Subscreen Disable",
+        .name = "sp2x-iidxnosub",
+        .display_name = "iidxnosub",
+        .aliases= "iidxnosub",
+        .desc = "Prevents TDJ subscreen from launching a separate window.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::IIDXSubMonitorOverride] = {
+        .title = "IIDX TDJ Subscreen Monitor Override",
+        .name = "iidxsubmonitor",
+        .desc = "If you have three or more monitors, this option can be set to tell the game which monitor is the subscreen.",
+        .type = OptionType::Text,
+        .setting_name = "\\\\.\\DISPLAY3",
+        .game_name = "Beatmania IIDX",
+        .category = "Full Screen Settings",
+        .picker = OptionPickerType::Monitor,
+    };
+    c[launcher::Options::spice2x_IIDXEmulateSubscreenKeypadTouch] = {
+        .title = "IIDX TDJ Subscreen Keypad Touch Emulation",
+        .name = "sp2x-iidxsubpoke",
+        .display_name = "iidxsubpoke",
+        .aliases = "iidxsubpoke",
+        .desc = "Emulates touches on TDJ subscreen when keypad input is received. "
+            "Should be used along with 'Unscramble Touch Screen Keypad in TDJ' patch. "
+            "00 is mapped to erase button, and Decimal shows/hides the keypad.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::spice2x_AutoCard] = {
+        .title = "Auto Card Insert",
+        .name = "sp2x-autocard",
+        .display_name = "autocard",
+        .aliases= "autocard",
+        .desc =
+            "Periodically present virtual card(s) to the reader, removing the need to press Insert Card button. "
+            "Only applies to local virtual cards (-card0, -card1, or card0/1.txt), "
+            "do not use with physical card reader or API.",
+        .type = OptionType::Enum,
+        .category = "Network",
+        .elements = {
+            {"off", ""},
+            {"p1", ""},
+            {"p2", ""},
+            {"both", ""},
+        },
+        .quick_setting_category = "Network",
+    };
+    c[launcher::Options::spice2x_TapeLedAlgorithm] = {
+        .title = "Tape LED Avg Algorithm",
+        .name = "sp2x-tapeledalgo",
+        .display_name = "tapeledalgo",
+        .aliases= "tapeledalgo",
+        .desc = "For games with light arrays, determine the algorithm that is used to translate them into a single light binding in Lights tab. "
+            "Default: mid.",
+        .type = OptionType::Enum,
+        .category = "I/O Options",
+        .elements = {
+            {"off", "Off"},
+            {"first", "First LED"},
+            {"mid", "Middle LED"},
+            {"last", "Last LED"},
+            {"avg", "Average color"},
+        },
+    };
+    c[launcher::Options::spice2x_NoNVAPI] = {
+        .title = "NVAPI Block",
+        .name = "sp2x-nonvapi",
+        .display_name = "nonvapi",
+        .aliases= "nonvapi",
+        .desc = "Completely block the game from accessing NVAPI. Can be used if NVAPI is returning undesirable "
+            "results to the game (e.g., wrong values from NvDisplayConfig for SDVX). You may need to apply additional "
+            "hex edits to boot the game correctly.",
+        .type = OptionType::Bool,
+        .category = "Graphics",
+    };
+    c[launcher::Options::spice2x_NoD3D9DeviceHook] = {
+        .title = "Disable D3D9 Device Hook (DEPRECATED - no longer needed for TDJ recording)",
+        .name = "sp2x-nod3d9devhook",
+        .display_name = "nod3d9devhook",
+        .aliases= "nod3d9devhook",
+        .desc = "This was previously required for TDJ play recording, but as of 2024-08-04, it is no longer needed. "
+            "Completely disable all DXD9 device hook, preventing features like Spice overlay, subscreen window, "
+            "screenshots, screen resize, touch emulation, streaming to Companion, etc.",
+        .type = OptionType::Bool,
+        .hidden = true,
+        .category = "Graphics",
+    };
+    c[launcher::Options::spice2x_SDVXNoSub] = {
+        .title = "SDVX Subscreen Disable",
+        .name = "sp2x-sdvxnosub",
+        .display_name = "sdvxnosub",
+        .aliases= "sdvxnosub",
+        .desc = "Prevents VM subscreen from launching a separate window.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::SDVXFullscreenLandscape] = {
+        .title = "SDVX Full Screen Landscape Mode (SDVX5+, EXPERIMENTAL)",
+        .name = "sdvxlandscape",
+        .desc =
+            "Allows you to play in landscape by transposing resolution and applying image scaling.\n\n"
+            "Corrects the in-game perspective camera for the transposed display aspect ratio.\n\n"
+            "Works only for SDVX5 and above.\n\n"
+            "Will launch at 1080p by default; strongly consider combining this with -forceres option to render at monitor native resolution.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::spice2x_EnableSMXStage] = {
+        .title = "StepManiaX Stage Lighting Support",
+        .name = "sp2x-smx-stage",
+        .display_name = "smxstage",
+        .aliases= "smxstage",
+        .desc = "StepmaniaX stage will show up as a device that can receive lighting output. "
+            "For configurator, restart spicecfg.exe after enabling this to have the device show up for binding.",
+        .type = OptionType::Bool,
+        .category = "I/O Options",
+    };
+    c[launcher::Options::spice2x_EnableSMXDedicab] = {
+        .title = "StepManiaX Dedicated Cabinet Lighting Support",
+        .name = "sp2x-smx-dedicab",
+        .display_name = "smxdedicab",
+        .aliases = "smxdedicab",
+        .desc = "StepManiaX Dedicated Cabinet will show up as a device that can receive lighting output. "
+            "For configurator, restart spicecfg.exe after enabling this to have the device show up for binding.",
+        .type = OptionType::Bool,
+        .category = "I/O Options"
+    };
+    c[launcher::Options::IIDXRecQuality] = {
+        .title = "IIDX Recording Quality",
+        .name = "iidxreccqp",
+        .desc = "WARNING: double check if your network allows this & your hardware supports it.\n\n"
+            "For TDJ Play Record feature, specify ConstQP quality settings for NVENC. Lower is higher quality but bigger file.\n\n"
+            "Two options: specify a single number (20) to set CQ Level, or specify comma-separated numbers (23,25,20) to set P, B, I levels.",
+        .type = OptionType::Text,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::IIDXRecDisable] = {
+        .title = "IIDX Recording Force Disable",
+        .name = "iidxnorec",
+        .desc = "When enabled, this prevents the play record feature from being used.",
+        .type = OptionType::Bool,
+        .game_name = "Beatmania IIDX",
+        .category = "Advanced Game Options",
+    };
+    c[launcher::Options::MidiAlgoVer] = {
+        .title = "MIDI Note Input Algorithm",
+        .name = "midialgo",
+        .desc =
+            "Remember to restart after changing this value.\n\n"
+            "Switch algorithm used for MIDI note handling.\n\n"
+            "auto (default): use v2 for most games, v2_drum for DrumMania and FutureTomTom\n\n"
+            "v2: new delta-time logic in spice2x, timestamp every on/off events and apply min. sustain period to rapid on/off triggers, supports velocity threshold\n\n"
+            "v2_drum: same as v2, but disable holds; better for some drum kits\n\n"
+            "legacy: legacy poll-based spicetools logic, may behave incorrectly when the same input is mapped to multiple buttons, no support for velocity threshold.",
+        .type = OptionType::Enum,
+        .category = "I/O Options",
+        .elements = {
+            {"auto", ""},
+            {"v2", ""},
+            {"v2_drum", ""},
+            {"legacy", ""},
+        },
+    };
+    c[launcher::Options::MidiNoteSustain] = {
+        .title = "MIDI Note Min. Sustain",
+        .name = "midisustain",
+        .desc =
+            "Remember to restart after changing this value. Only affects v2 MIDI algorithm. Does not affect spicecfg.\n\n"
+            "Set the minimum duration (in milliseconds) each note is sustained, so that the game's I/O can pick up the input when polled.\n\n"
+            "If this is too short, when game polls for input, it may fail to observe quick input (such as drums). "
+            "If this is too long, rapid hits may be dropped due to coalescing.\n\n"
+            "Recommended to keep at default of 20ms unless you have issues.",
+        .type = OptionType::Integer,
+        .setting_name = "20",
+        .category = "I/O Options",
+    };
+    c[launcher::Options::DDRP4IOBufferMode] = {
+        .title = "DDR P4IO Buffer Algorithm",
+        .name = "ddrp4iobuffer",
+        .desc =
+            "Remember to restart after changing this value.\n\n"
+            "Sets the algorithm used to populate entries to the buffer of controller polls read by the game.\n\n"
+            "auto (default): thread mode if <120Hz, backfill if >=120Hz\n\n"
+            "thread: starts a thread to periodically insert polls into the buffer\n\n"
+            "backfill: fills the buffer on each frame with last known state info at short regular intervals up to the current time, then writes the current state.\n\n"
+            "Only has an effect when emulating P4IO (arkmdxp4.dll).",
+        .type = OptionType::Enum,
+        .game_name = "Dance Dance Revolution",
+        .category = "Advanced Game Options",
+        .elements = {
+            {"auto", ""},
+            {"thread", ""},
+            {"backfill", ""},
+        },
+    };
+    c[launcher::Options::InputRequiresFocus] = {
+        .title = "Input Requires Focus",
+        .name = "inputfocus",
+        .desc =
+            "Determine input behavior when game window is not in focus.\n\n"
+            "never: allow input regardless of focus\n"
+            "naive (default): only naive bindings check for window focus, rawinput binds are always allowed\n"
+            "always: only process input when window is in focus.",
+        .type = OptionType::Enum,
+        .category = "I/O Options",
+        .elements = {
+            {"never", ""},
+            {"naive", ""},
+            {"always", ""},
+        },
+    };
+    c[launcher::Options::NostalgiaPoke] = {
+        .title = "Nost Screen Poke",
+        .name = "nostpoke",
+        .desc =
+            "Enables emulation of touch gestures to make it easier to navigate the game without a touchscreen.\n\n"
+            "This enables two things:\n"
+            "  1. Swipe/Touch bindings in Buttons tab (Swipe Next Page, etc)\n"
+            "  2. PIN pad bindings (make sure Unscramble Keypad patch is applied).",
+        .type = OptionType::Bool,
+        .game_name = "Nostalgia",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::NostalgiaTouchMode] = {
+        .title = "Nostalgia Touch Piano",
+        .name = "nosttouch",
+        .desc =
+            "Allows you to play the piano by touching the screen instead of a controller. "
+            "Use the mode switch button to toggle between interacting with the menu and playing the piano.\n\n"
+            "Velocity sensitivity is not supported. Touch targets will be pixel-perfect aligned with the "
+            "judgement line, key beams, and notes.",
+        .type = OptionType::Bool,
+        .game_name = "Nostalgia",
+        .category = "Game Options",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::ForceBackBufferCount] = {
+        .title = "V-Sync Buffering",
+        .name = "vsyncbuffer",
+        .desc = "Using triple buffering may improve cases of micro-stuttering but increases input latency.",
+        .type = OptionType::Enum,
+        .category = "Graphics",
+        .elements = {
+            {"2", "double buffer"},
+            {"3", "triple buffer"},
+        },
+    };
+    c[launcher::Options::SDVXWindowedSubscreenSize] = {
+        .title = "SDVX Windowed Subscreen Size",
+        .name = "sdvxwsubsize",
+        .desc = "Size of the subscreen window. Defaults to (1920,1080).",
+        .type = OptionType::Text,
+        .setting_name = "1920,1080",
+        .game_name = "Sound Voltex",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::SDVXWindowedSubscreenPosition] = {
+        .title = "SDVX Windowed Subscreen Position",
+        .name = "sdvxwsubpos",
+        .desc = "Initial position of the subscreen window. Defaults to (0,0).",
+        .type = OptionType::Text,
+        .setting_name = "0,0",
+        .game_name = "Sound Voltex",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::SDVXWindowedSubscreenBorderless] = {
+        .title = "SDVX Windowed Subscreen Borderless",
+        .name = "sdvxwsubborderless",
+        .desc = "Remove window decoration from windowed subscreen.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::SDVXWindowedSubscreenAlwaysOnTop] = {
+        .title = "SDVX Windowed Subscreen Always On Top",
+        .name = "sdvxwsubtop",
+        .desc = "Keep windowed subscreen on top.",
+        .type = OptionType::Bool,
+        .game_name = "Sound Voltex",
+        .category = "Game Windowed Settings",
+    };
+    c[launcher::Options::LovePlusCamEnable] = {
+        .title = "LovePlus Camera Enable",
+        .name = "lovepluscam",
+        .desc = "Allow game to access camera; camera must be compatible with game.",
+        .type = OptionType::Bool,
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::LovePlusPrinterOutputPath] = {
+        .title = "LovePlus Printer Output Path",
+        .name = "lpprinterpath",
+        .desc = "Path to folder where images will be stored.",
+        .type = OptionType::Text,
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+        .picker = OptionPickerType::DirectoryPath,
+    };
+    c[launcher::Options::LovePlusPrinterOutputClear] = {
+        .title = "LovePlus Printer Output Clear",
+        .name = "lpprinterclear",
+        .desc = "Clean up saved images in the output directory on startup.",
+        .type = OptionType::Bool,
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::LovePlusPrinterOutputOverwrite] = {
+        .title = "LovePlus Printer Output Overwrite",
+        .name = "lpprinteroverwrite",
+        .desc = "Always overwrite the same file in output directory.",
+        .type = OptionType::Bool,
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::LovePlusPrinterOutputFormat] = {
+        .title = "LovePlus Printer Output Format",
+        .name = "lpprinterformat",
+        .desc = "File format for printer output.",
+        .type = OptionType::Text,
+        .setting_name = "(png/bmp/tga/jpg)",
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::LovePlusPrinterJPGQuality] = {
+        .title = "LovePlus Printer JPG Quality",
+        .name = "lpprinterjpgquality",
+        .desc = "Quality setting in percent if JPG format is used.",
+        .type = OptionType::Integer,
+        .setting_name = "(0-100)",
+        .game_name = "LovePlus",
+        .category = "Cab Peripherals",
+    };
+    c[launcher::Options::OptionConflictResolution] = {
+        .title = "Command Line Args Override",
+        .name = "cmdoverride",
+        .desc = "By default, option values in spicecfg take precedence over command-line args, for legacy compat.\n"
+            "When this is specified in command line, command-line args take precedence instead.",
+        .type = OptionType::Bool,
+        .category = "Development",
+        .disabled = true,
+    };
+    c[launcher::Options::OtocaCamHook] = {
+        .title = "Otoca Camera Check Bypass",
+        .name = "otocacamhook",
+        .desc =
+            "This game REQUIRES a (compatible) webcam to save progress. If you don't have any, check this "
+            "option to bypass camera error during boot, allowing you to try out the game.",
+        .type = OptionType::Bool,
+        .game_name = "Otoca D'or",
+        .category = "Cab Peripherals",
+        .quick_setting_category = "Game",
+    };
+    c[launcher::Options::DisableHighResTimer] = {
+        .title = "Use Legacy Timers",
+        .name = "notimerhacks",
+        .desc = "Disables high resolution timers, reverting to legacy behavior. "
+            "Recommended that you leave this OFF for optimal input latency, "
+            "unless you're on a resource-constrained system (e.g., old cabinet PC)",
+        .type = OptionType::Bool,
+        .category = "Performance"
+    };
+    c[launcher::Options::EnableICMPHook] = {
+        .title = "Enable ICMP Emulation",
+        .name = "icmphook",
+        .desc = "Emulate keepalive ping replies in user mode, so the game does not need to "
+            "open privileged raw ICMP sockets.",
+        .type = OptionType::Bool,
+        .category = "Network Dev",
+    };
+    c[launcher::Options::EnableNICSpoof] = {
+        .title = "NIC Spoof",
+        .name = "nicspoof",
+        .desc =
+            "Use with -icmphook.\n\n"
+            "offline: report a fake Ethernet IPv4 adapter and map DNS names to "
+            "that address so the game can boot when no real NIC is present. "
+            "Does not create a real adapter.\n\n"
+            "tunnelhost: same fake NIC, plus listen for a matching tunnel "
+            "from a peer.\n\n"
+            "tunnelclient: same fake NIC, plus connect to a tunnel host. "
+            "Set -nicspoofhostrealip.",
+        .type = OptionType::Enum,
+        .category = "Network Dev",
+        .elements = {
+            {"offline", ""},
+            {"tunnelhost", ""},
+            {"tunnelclient", ""},
+        },
+    };
+    c[launcher::Options::NICSpoofIP] = {
+        .title = "NIC Spoof IP",
+        .name = "nicspoofip",
+        .desc =
+            "Overlay IPv4 for the fake adapter. Used when NIC Spoof is not Default. "
+            "If unset, 10.100.100.10 is used.\n\n"
+            "Must be on the same subnet as gateway 10.100.100.1 with mask "
+            "255.0.0.0 (10.0.0.0/8). Examples: 10.100.100.10, 10.0.0.10. "
+            "Do not use 10.0.0.0, 10.255.255.255, the gateway 10.100.100.1, "
+            "or DNS 10.2.1.10 / 10.2.1.30. Host and client must use different IPs.",
+        .type = OptionType::Text,
+        .setting_name = "10.100.100.10",
+        .category = "Network Dev",
+    };
+    c[launcher::Options::NICSpoofHostRealIP] = {
+        .title = "NIC Spoof Tunnel Host",
+        .name = "nicspoofhostrealip",
+        .desc =
+            "Real IP address or hostname of the tunnel host. Required for "
+            "tunnel client mode. Not used for offline or tunnel host.",
+        .type = OptionType::Text,
+        .setting_name = "192.168.1.10",
+        .category = "Network Dev",
+    };
+    c[launcher::Options::NICSpoofPort] = {
+        .title = "NIC Spoof Tunnel Port",
+        .name = "nicspoofport",
+        .desc =
+            "UDP port for the matching tunnel. Host listens on this port; "
+            "client connects to it. If unset, 51820 is used.",
+        .type = OptionType::Integer,
+        .setting_name = "51820",
+        .category = "Network Dev",
+    };
+    c[launcher::Options::AutoElevate] = {
+        .title = "Run as",
+        .name = "runas",
+        .desc = "Controls whether spice will automatically re-launch with administrator privileges at startup.\n\n"
+            "admin (default): automatically re-launch with administrator privileges, "
+            "needed for most games to function properly\n\n"
+            "user: skip elevation, run with current user privileges; game may fail to launch, "
+            "crash, or critical features may silently fail; use at your own risk.",
+        .type = OptionType::Enum,
+        .category = "Development",
+        .elements = {
+            {"admin", ""},
+            {"user", ""},
+        },
+    };
+    c[launcher::Options::CfgForceSoftwareRender] = {
+        .title = "Configurator Force Software Rendering",
+        .name = "forcesoftware",
+        .desc = "Forces the use of software rendering instead of hardware acceleration for "
+            "the configurator.",
+        .type = OptionType::Bool,
+        .category = "Development",
+    };
+    c[launcher::Options::OBSWebSocketEnabled] = {
+        .title = "OBS WebSocket Enable",
+        .name = "obsenable",
+        .desc = "Enables the in-game OBS Control overlay and its connection to the OBS Studio "
+            "obs-websocket (v5) server.",
+        .type = OptionType::Bool,
+        .category = "OBS Control",
+    };
+    c[launcher::Options::OBSWebSocketHost] = {
+        .title = "OBS WebSocket Host",
+        .name = "obshost",
+        .desc = "Host name or IP address of the OBS Studio obs-websocket (v5) server used by "
+            "the in-game OBS Control overlay. Defaults to 127.0.0.1 when left empty.",
+        .type = OptionType::Text,
+        .category = "OBS Control",
+    };
+    c[launcher::Options::OBSWebSocketPort] = {
+        .title = "OBS WebSocket Port",
+        .name = "obsport",
+        .desc = "Port of the OBS Studio obs-websocket (v5) server. Defaults to 4455 when left empty.",
+        .type = OptionType::Integer,
+        .category = "OBS Control",
+    };
+    c[launcher::Options::OBSWebSocketPassword] = {
+        .title = "OBS WebSocket Password",
+        .name = "obspass",
+        .desc = "Password for the OBS Studio obs-websocket (v5) server. Leave empty if "
+            "authentication is disabled in OBS.",
+        .type = OptionType::Text,
+        .category = "OBS Control",
+        .sensitive = true,
+    };
+    c[launcher::Options::OBSWebSocketDebug] = {
+        .title = "OBS WebSocket Debug",
+        .name = "obsdebug",
+        .desc = "Writes the OBS WebSocket client's internal connection diagnostics to the log. "
+            "Only enable this when troubleshooting connection problems.",
+        .type = OptionType::Bool,
+        .category = "OBS Control",
+    };
+    c[launcher::Options::ScreenshotIncludeOverlay] = {
+        .title = "Include Overlay in Screenshots",
+        .name = "screenshotoverlay",
+        .desc = "Includes Spice overlay in screenshots.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+    c[launcher::Options::ScreenshotSubscreens] = {
+        .title = "Include Subscreens in Screenshots",
+        .name = "screenshotsub",
+        .desc = "Saves each subscreen as a separate PNG alongside the primary screenshot.",
+        .type = OptionType::Bool,
+        .category = "General Overlay",
+    };
+
+    return c;
+});
+
+const std::vector<std::string> &launcher::get_categories(Options::OptionsCategory category) {
+    switch (category) {
+        case Options::OptionsCategory::API:
+            return CATEGORY_ORDER_API;
+        case Options::OptionsCategory::GameOptions:
+            return CATEGORY_ORDER_GAME_OPTIONS;
+        case Options::OptionsCategory::Display:
+            return CATEGORY_ORDER_DISPLAY;
+        case Options::OptionsCategory::Audio:
+            return CATEGORY_ORDER_AUDIO;
+        case Options::OptionsCategory::Network:
+            return CATEGORY_ORDER_NETWORK;
+        case Options::OptionsCategory::Overlay:
+            return CATEGORY_ORDER_OVERLAY;
+        case Options::OptionsCategory::Advanced:
+            return CATEGORY_ORDER_ADVANCED;
+        case Options::OptionsCategory::Dev:
+            return CATEGORY_ORDER_DEV;
+        case Options::OptionsCategory::Everything:
+        default:
+            return CATEGORY_ORDER_NONE;
+    }
+}
+
+const std::vector<std::string> &launcher::get_quick_setting_categories() {
+    return CATEGORY_ORDER_QUICK;
+}
+
+const std::vector<OptionDefinition> &launcher::get_option_definitions() {
+    return OPTION_DEFINITIONS;
+}
+
+void launcher::validate_option_categories() {
+    // every category the grouped Options nav can display, gathered straight from
+    // get_categories() so this stays in sync with the actual nav. the Everything
+    // group maps to CATEGORY_ORDER_NONE ("") and is intentionally excluded.
+    static const Options::OptionsCategory groups[] = {
+        Options::OptionsCategory::GameOptions,
+        Options::OptionsCategory::Display,
+        Options::OptionsCategory::Audio,
+        Options::OptionsCategory::Network,
+        Options::OptionsCategory::Overlay,
+        Options::OptionsCategory::Advanced,
+        Options::OptionsCategory::Dev,
+        Options::OptionsCategory::API,
+    };
+    std::set<std::string> valid;
+    for (auto group : groups) {
+        for (const auto &category : get_categories(group)) {
+            if (!category.empty()) {
+                valid.insert(category);
+            }
+        }
+    }
+
+    // any definition whose category is not in a group list is orphaned: it only
+    // shows up under Search, never in the grouped Options nav/content. treat this
+    // as fatal so it is caught immediately during development.
+    for (const auto &definition : get_option_definitions()) {
+        if (!valid.contains(definition.category)) {
+            log_fatal("options", "option -{} has orphaned category \"{}\"",
+                definition.name, definition.category);
+        }
+    }
+}
+
+std::unique_ptr<std::vector<Option>> launcher::parse_options(int argc, char *argv[]) {
+
+    // one-time sanity check that every option lands in a known nav category
+    static std::once_flag validate_once;
+    std::call_once(validate_once, validate_option_categories);
+
+    // generate options
+    auto &definitions = get_option_definitions();
+    auto options = std::make_unique<std::vector<Option>>();
+
+    options->reserve(definitions.size());
+
+    for (auto &definition : definitions) {
+
+        // create aliases
+        std::vector<std::string> aliases;
+        aliases.push_back(definition.name);
+        if (!definition.aliases.empty()) {
+            strsplit(definition.aliases, aliases, '/');
+        }
+
+        // create option
+        auto &option = options->emplace_back(definition, "");
+
+        // check if enabled
+        for (int i = 1; i < argc; i++) {
+
+            // ignore leading '-' characters
+            auto argument = argv[i];
+            while (argument[0] == '-') {
+                argument++;
+            }
+
+            // check aliases
+            for (const auto &alias : aliases) {
+                if (_stricmp(alias.c_str(), argument) == 0) {
+                    switch (definition.type) {
+                        case OptionType::Bool: {
+                            option.value_add("/ENABLED");
+                            break;
+                        }
+                        case OptionType::Integer: {
+                            if (++i >= argc) {
+                                log_fatal("options", "missing parameter for -{}", alias);
+                            } else {
+                                // validate it is an integer
+                                char *p;
+                                strtol(argv[i], &p, 10);
+                                if (*p) {
+                                    log_fatal("options", "parameter for -{} is not a number: {}", alias, argv[i]);
+                                } else {
+                                    option.value_add(argv[i]);
+                                }
+                            }
+                            break;
+                        }
+                        case OptionType::Hex: {
+                            if (++i >= argc) {
+                                log_fatal("options", "missing parameter for -{}", alias);
+                            } else {
+                                // validate it is an integer
+                                try {
+                                    auto _ = std::stoull(argv[i], nullptr, 16);
+                                } catch (const std::exception &ex) {
+                                    log_fatal("options", "parameter for -{} is not a hex number: {}", alias, argv[i]);
+                                }
+                            }
+                            break;
+                        }
+                        case OptionType::Enum:
+                        case OptionType::Text: {
+                            if (++i >= argc) {
+                                log_fatal("options", "missing parameter for -{}", alias);
+                            } else {
+                                option.value_add(argv[i]);
+                            }
+                            break;
+                        }
+                        default: {
+                            log_warning("options", "unknown option type: {} (-{})", definition.type, alias);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // positional arguments
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; i++) {
+
+        // check if enabled
+        bool found = false;
+        for (auto &definition : definitions) {
+
+            // create aliases
+            std::vector<std::string> aliases;
+            aliases.push_back(definition.name);
+            if (!definition.aliases.empty()) {
+                strsplit(definition.aliases, aliases, '/');
+            }
+
+            // ignore leading '-' characters
+            auto argument = argv[i];
+            while (argument[0] == '-') {
+                argument++;
+            }
+
+            // check aliases
+            for (const auto &alias : aliases) {
+                if (_stricmp(alias.c_str(), argument) == 0) {
+                    found = true;
+                    switch (definition.type) {
+                        case OptionType::Bool:
+                            break;
+                        case OptionType::Integer:
+                        case OptionType::Hex:
+                        case OptionType::Text:
+                        case OptionType::Enum:
+                            i++;
+                            break;
+                    }
+                    break;
+                }
+            }
+
+            // early quit
+            if (found) {
+                break;
+            }
+        }
+
+        // positional argument
+        if (!found && *argv[i] != '-') {
+            positional.emplace_back(argv[i]);
+        }
+    }
+
+    // game executable
+    if (!positional.empty()) {
+        options->at(launcher::Options::GameExecutable).value = positional[0];
+    }
+
+    // return vector
+    return options;
+}
+
+std::vector<Option> launcher::merge_options(
+        const std::vector<Option> &options,
+        const std::vector<Option> &overrides)
+{
+    std::vector<Option> merged;
+
+    for (const auto &option : options) {
+        for (const auto &override : overrides) {
+            if (option.get_definition().name == override.get_definition().name) {
+                if (override.is_active()) {
+                    if (option.is_active()) {
+                        auto &new_option = merged.emplace_back(option.get_definition(), "");
+                        new_option.disabled = true;
+
+                        if (USE_CMD_OVERRIDE) {
+                            // command-line arguments take precedence (opt-in)
+                            for (auto &value : override.values()) {
+                                new_option.value_add(value);
+                            }
+                            for (auto &value : option.values()) {
+                                new_option.value_add(value);
+                            }
+                        } else {
+                            // spicecfg options take precedence (default)
+                            // this sucks, but it's the default for legacy spicetools compat
+                            for (auto &value : option.values()) {
+                                new_option.value_add(value);
+                            }
+                            for (auto &value : override.values()) {
+                                new_option.value_add(value);
+                            }
+                        }
+                        new_option.conflicting = true;
+                    } else {
+                        auto &new_option = merged.emplace_back(override.get_definition(), "");
+                        new_option.disabled = true;
+
+                        for (auto &value : override.values()) {
+                            new_option.value_add(value);
+                        }
+                    }
+                } else {
+                    merged.push_back(option);
+                }
+                break;
+            }
+        }
+    }
+    return merged;
+}
+
+std::string launcher::detect_bootstrap_release_code(const std::string& bootstrap_user) {
+    std::string bootstrap_path;
+
+    if (!bootstrap_user.empty()) {
+        bootstrap_path = bootstrap_user;
+    } else if (fileutils::file_exists("prop/bootstrap.xml")) {
+        bootstrap_path = "prop/bootstrap.xml";
+    }
+
+    if (bootstrap_path.empty()) {
+        log_warning("options", "unable to detect bootstrap.xml file");
+        return "";
+    }
+
+    // load XML
+    tinyxml2::XMLDocument bootstrap;
+    if (bootstrap.LoadFileA(bootstrap_path.c_str()) != tinyxml2::XML_SUCCESS) {
+        log_warning("options", "unable to parse {}", bootstrap_path);
+        return "";
+    }
+
+    // find release_code
+    auto node_root = bootstrap.LastChild();
+    if (node_root) {
+        auto node_release_code = node_root->FirstChildElement("release_code");
+        if (node_release_code) {
+            return node_release_code->GetText() ? node_release_code->GetText() : "";
+        }
+    }
+
+    // failure
+    log_warning("options", "no release_code found in {}", bootstrap_path);
+    return "";
+}
+
+static launcher::GameVersion detect_gameversion_ident(const std::string& bootstrap_user) {
+
+    // detect ea3-ident path
+    std::string ident_path;
+    if (fileutils::file_exists("prop/ea3-ident.xml")) {
+        ident_path = "prop/ea3-ident.xml";
+    }
+    if (ident_path.empty()) {
+        log_warning("options", "unable to detect ea3-ident.xml file");
+        return launcher::GameVersion();
+    }
+
+    // load XML
+    tinyxml2::XMLDocument ea3_ident;
+    if (ea3_ident.LoadFileA(ident_path.c_str()) != tinyxml2::XML_SUCCESS) {
+        log_warning("options", "unable to parse {}", ident_path);
+        return launcher::GameVersion();
+    }
+
+    // find model string
+    auto node_root = ea3_ident.LastChild();
+    if (node_root) {
+        auto node_soft = node_root->FirstChildElement("soft");
+        if (node_soft) {
+            launcher::GameVersion version;
+            bool error = true;
+            auto node_model = node_soft->FirstChildElement("model");
+            if (node_model) {
+                version.model = node_model->GetText();
+                error = false;
+            }
+            auto node_dest = node_soft->FirstChildElement("dest");
+            if (node_dest) {
+                version.dest = node_dest->GetText();
+            }
+            auto node_spec = node_soft->FirstChildElement("spec");
+            if (node_spec) {
+                version.spec = node_spec->GetText();
+            }
+            auto node_rev = node_soft->FirstChildElement("rev");
+            if (node_rev) {
+                version.rev = node_rev->GetText();
+            }
+            auto node_ext = node_soft->FirstChildElement("ext");
+            if (node_ext) {
+                version.ext = node_ext->GetText() ? node_ext->GetText() : "";
+                auto bootstrap_ext = launcher::detect_bootstrap_release_code(bootstrap_user);
+                if (version.ext.size() != 10 && bootstrap_ext.size() == 10) {
+                    version.ext = bootstrap_ext;
+                } else if (bootstrap_ext.size() == 10) {
+                    int ext_cur = 0;
+                    int ext_new = 0;
+                    try {
+                        ext_cur = std::stoi(version.ext);
+                        try {
+                            ext_new = std::stoi(bootstrap_ext);
+                            if (ext_new > ext_cur) {
+                                version.ext = bootstrap_ext;
+                            }
+                        } catch (const std::exception &ex) {
+                            log_warning("options", "unable to parse soft/ext: {}", bootstrap_ext);
+                        }
+                    } catch (const std::exception &ex) {
+                        log_warning("options", "unable to parse soft/ext: {}", version.ext);
+                        version.ext = bootstrap_ext;
+                    }
+                }
+            }
+            if (!error) {
+                log_info("options", "using model {}:{}:{}:{}:{} from {}",
+                         version.model, version.dest, version.spec, version.rev, version.ext,
+                         ident_path);
+                return version;
+            }
+        }
+    }
+
+    // error
+    log_warning("options", "unable to find /ea3_conf/soft/model in {}", ident_path);
+    return launcher::GameVersion();
+}
+
+launcher::GameVersion launcher::detect_gameversion(const std::string &ea3_user, const std::string& bootstrap_user) {
+    // detect ea3-config path
+    std::string ea3_path;
+    if (!ea3_user.empty()) {
+        ea3_path = ea3_user;
+    } else if (fileutils::file_exists("prop/ea3-config.xml")) {
+        ea3_path = "prop/ea3-config.xml";
+    } else if (fileutils::file_exists("prop/ea3-cfg.xml")) {
+        ea3_path = "prop/ea3-cfg.xml";
+    } else if (fileutils::file_exists("prop/eamuse-config.xml")) {
+        ea3_path = "prop/eamuse-config.xml";
+    }
+    if (ea3_path.empty()) {
+        log_warning("options", "unable to detect EA3 configuration file");
+        return detect_gameversion_ident(bootstrap_user);
+    }
+
+    // load XML
+    tinyxml2::XMLDocument ea3_config;
+    if (ea3_config.LoadFileA(ea3_path.c_str()) != tinyxml2::XML_SUCCESS) {
+        log_warning("options", "unable to parse {}", ea3_path);
+        log_warning("options", "trying again with improper XML header removed...");
+
+        // below: dirty hack to deal with bad ea3 xml file with comments in the beginning
+        // https://stackoverflow.com/questions/19100408/tinyxml-any-way-to-skip-problematic-doctype-tag
+
+        // Open the file and read it into a vector
+        std::ifstream ifs(ea3_path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
+        std::ifstream::pos_type fsize = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        std::vector<char> bytes(fsize);
+        ifs.read(&bytes[0], fsize);
+
+        // Create string from vector
+        std::string xml_str(&bytes[0], fsize);
+
+        // Skip unsupported statements
+        size_t pos = 0;
+        while (true) {
+            pos = xml_str.find_first_of("<", pos);
+            if (xml_str[pos + 1] == '?' || // <?xml...
+                xml_str[pos + 1] == '!') { // <!DOCTYPE... or [<!ENTITY...
+                // Skip this line
+                pos = xml_str.find_first_of("\n", pos);
+            } else
+                break;
+        }
+        xml_str = xml_str.substr(pos);
+
+        // replace with fixed one
+        ea3_config.Clear();
+        if (ea3_config.Parse(xml_str.c_str()) != tinyxml2::XML_SUCCESS) {
+            // if we still failed, give up
+            log_warning("options", "unable to parse fixed xml");
+            return detect_gameversion_ident(bootstrap_user);
+        }
+    }
+
+    // find model string
+    auto node_root = ea3_config.LastChild();
+    if (node_root) {
+        auto node_soft = node_root->FirstChildElement("soft");
+        if (node_soft) {
+            GameVersion version;
+            bool error = true;
+            auto node_model = node_soft->FirstChildElement("model");
+            if (node_model) {
+                version.model = node_model->GetText();
+                error = false;
+            }
+            auto node_dest = node_soft->FirstChildElement("dest");
+            if (node_dest) {
+                version.dest = node_dest->GetText();
+            }
+            auto node_spec = node_soft->FirstChildElement("spec");
+            if (node_spec) {
+                version.spec = node_spec->GetText();
+            }
+            auto node_rev = node_soft->FirstChildElement("rev");
+            if (node_rev) {
+                version.rev = node_rev->GetText();
+            }
+            auto node_ext = node_soft->FirstChildElement("ext");
+            if (node_ext) {
+                version.ext = node_ext->GetText() ? node_ext->GetText() : "";
+                auto bootstrap_ext = launcher::detect_bootstrap_release_code(bootstrap_user);
+                if (version.ext.size() != 10 && bootstrap_ext.size() == 10) {
+                    version.ext = bootstrap_ext;
+                } else if (bootstrap_ext.size() == 10) {
+                    int ext_cur = 0;
+                    int ext_new = 0;
+                    try {
+                        ext_cur = std::stoi(version.ext);
+                        try {
+                            ext_new = std::stoi(bootstrap_ext);
+                            if (ext_new > ext_cur) {
+                                version.ext = bootstrap_ext;
+                            }
+                        } catch (const std::exception &ex) {
+                            log_warning("options", "unable to parse soft/ext: {}", bootstrap_ext);
+                        }
+                    } catch (const std::exception &ex) {
+                        log_warning("options", "unable to parse soft/ext: {}", version.ext);
+                        version.ext = bootstrap_ext;
+                    }
+                }
+            }
+            if (!error) {
+                log_info("options", "using model {}:{}:{}:{}:{} from {}",
+                         version.model, version.dest, version.spec, version.rev, version.ext,
+                         ea3_path);
+                return version;
+            }
+        }
+    }
+
+    // error
+    log_warning("options", "unable to find /ea3/soft/model in {}", ea3_path);
+    return detect_gameversion_ident(bootstrap_user);
+}

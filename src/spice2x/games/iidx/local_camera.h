@@ -1,0 +1,244 @@
+#pragma once
+
+#if SPICE64 && !SPICE_XP
+
+#include <atomic>
+#include <d3d9.h>
+#include <dxva2api.h>
+#include <mutex>
+#include <mferror.h>
+#include <string>
+#include <thread>
+#include <strmif.h>
+#include <vector>
+#include "mf_wrappers.h"
+
+#define CAMERA_CONTROL_PROP_SIZE 7
+#define DRAW_MODE_SIZE 5
+
+template <class T> void SafeRelease(T **ppT)
+{
+    if (*ppT)
+    {
+        (*ppT)->Release();
+        *ppT = nullptr;
+    }
+}
+
+typedef void (*IMAGE_TRANSFORM_FN)(
+    BYTE*       pDest,
+    LONG        lDestStride,
+    const BYTE* pSrc,
+    LONG        lSrcStride,
+    DWORD       dwWidthInPixels,
+    DWORD       dwHeightInPixels
+);
+
+struct CameraControlProp {
+    long minValue = 0;
+    long maxValue = 0;
+    long delta = 0;
+    long defaultValue = 0;
+    long defFlags = 0;
+    long value = 0;
+    long valueFlags = 0;
+};
+
+struct MediaTypeInfo {
+    GUID            subtype = GUID_NULL;
+    UINT32          width = 0;
+    UINT32          height = 0;
+    double          frameRate = 0.0;
+    IMFMediaType*   p_mediaType = nullptr;
+    std::string     description = "";
+    LONG            *plStride = nullptr;
+};
+
+typedef enum {
+    DrawModeStretch = 0,
+    DrawModeCrop = 1,
+    DrawModeLetterbox = 2,
+    DrawModeCrop4_3 = 3,
+    DrawModeLetterbox4_3 = 4,
+} LocalCameraDrawMode;
+
+extern std::string CAMERA_CONTROL_LABELS[];
+
+extern std::string DRAW_MODE_LABELS[];
+
+namespace games::iidx {
+    class IIDXCameraSourceReaderCallback;
+
+    namespace Camera {
+        struct AfpTexture {
+            void* vftbl;
+            IDirect3DTexture9* texture;
+            uint32_t handle;
+        };
+
+        struct TextureRegistry {
+            uint32_t handle_base;
+            uint32_t next_slot;
+            IDirect3DTexture9** begin;
+            IDirect3DTexture9** end;
+            IDirect3DTexture9** capacity_end;
+        };
+
+        struct PlayVideoCamera {
+            AfpTexture* afp_texture(const uintptr_t offset) {
+                return *reinterpret_cast<AfpTexture**>(reinterpret_cast<uint8_t*>(this) + offset);
+            }
+        };
+
+        struct CCameraManager2 {
+            void* vftbl;
+            PlayVideoCamera** begin;
+            PlayVideoCamera** end;
+            PlayVideoCamera** capacity_end;
+        };
+    }
+
+    class IIDXLocalCamera {
+    protected:
+        virtual ~IIDXLocalCamera();
+
+        LONG m_nRefCount;
+        CRITICAL_SECTION m_critsec;
+
+        std::string m_name;
+        std::string m_friendly_name;
+        BOOL m_prefer_16_by_9;
+        WCHAR *m_pwszSymbolicLink = nullptr;
+        UINT32 m_cchSymbolicLink = 0;
+
+        // For reading frames from Camera
+        IMFMediaSource *m_pSource = nullptr;
+        IMFSourceReader *m_pSourceReader = nullptr;
+        IMFSourceReaderEx *m_pSourceReaderEx = nullptr;
+        IIDXCameraSourceReaderCallback *m_pSourceReaderCallback = nullptr;
+        std::mutex m_mediaTypeMutex;
+        IMFMediaType *m_pendingMediaType = nullptr;
+        int m_selectedMediaTypeIndex = 0;
+        std::string m_selectedMediaTypeDescription = "";
+
+        // Camera Format information
+        LONG                    m_cameraWidth;
+        LONG                    m_cameraHeight;
+
+        // Draw rectangles
+        RECT                    m_rcSource;
+        RECT                    m_rcDest;
+
+        // Thread to draw texture asynchorously
+        std::thread             *m_drawThread = nullptr;
+
+        // DirectX9 DeviceEx
+        LPDIRECT3DDEVICE9EX m_device;
+
+        // Address to hook camera textures onto the game
+        LPDIRECT3DTEXTURE9 *m_camera_texture_target = nullptr;
+        LPDIRECT3DTEXTURE9 *m_preview_texture_target = nullptr;
+
+        // Target texture (to be shown in the game)
+        LPDIRECT3DTEXTURE9 m_texture = nullptr;
+        IDirect3DSurface9 *m_pDestSurf = nullptr;
+
+        // Texture for color space conversion
+        LPDIRECT3DTEXTURE9 m_conversionTexture = nullptr;
+        IDirect3DSurface9 *m_pConversionSurf = nullptr;
+
+        // upload surface for decoded camera frames returned in system memory
+        IDirect3DSurface9 *m_pDecodedSurf = nullptr;
+        GUID m_decodedSubtype = GUID_NULL;
+        GUID m_outputSubtype = GUID_NULL;
+        bool m_drawErrorLogged = false;
+
+        // Texture for custom transform (e.g. horizontal flip)
+        LPDIRECT3DTEXTURE9 m_transformTexture = nullptr;
+        IDirect3DSurface9 *m_pTransformSurf = nullptr;
+
+        // Texture to store "transformed" camera content
+        LPDIRECT3DTEXTURE9 m_transformResultTexture = nullptr;
+        IDirect3DSurface9 *m_pTransformResultSurf = nullptr;
+
+        // Storing original textures for clean up
+        LPDIRECT3DTEXTURE9 m_camera_texture_original = nullptr;
+        LPDIRECT3DTEXTURE9 m_preview_texture_original = nullptr;
+
+        IAMCameraControl *m_pCameraControl = nullptr;
+
+        // Camera Control
+        std::vector<CameraControlProp> m_controlProps = {};
+
+        BOOL m_controlOptionsInitialized = false;
+
+    public:
+        // True if first part of the setup steps (those in the constructor) succeeded
+        BOOL m_initialized = false;
+
+        // True if all the setup steps succeeded
+        std::atomic_bool m_active = false;
+
+        // Media type select
+        std::vector<MediaTypeInfo> m_mediaTypeInfos = {};
+        bool m_useAutoMediaType = true;
+        IMFMediaType *m_pAutoMediaType = nullptr;
+        bool m_allowManualControl = false;
+
+        std::atomic<LocalCameraDrawMode> m_drawMode = DrawModeCrop4_3;
+
+        // Render processing
+        std::atomic_bool m_flipHorizontal = false;
+        std::atomic_bool m_flipVertical = false;
+
+        IIDXLocalCamera(
+            std::string name,
+            BOOL prefer_16_by_9,
+            IMFActivate *pActivate,
+            IDirect3DDeviceManager9 *pD3DManager,
+            LPDIRECT3DDEVICE9EX device,
+            LPDIRECT3DTEXTURE9 *camera_texture_target,
+            LPDIRECT3DTEXTURE9 *preview_texture_target
+        );
+        LPDIRECT3DTEXTURE9 GetTexture();
+        ULONG Release();
+        IAMCameraControl* GetCameraControl();
+        HRESULT GetCameraControlProp(int index, CameraControlProp *pProp);
+        HRESULT SetCameraControlProp(int index, long value, long flags);
+        HRESULT ResetCameraControlProps();
+        std::string GetName();
+        std::string GetFriendlyName();
+        std::string GetSymLink();
+        int GetSelectedMediaTypeIndex();
+        std::string GetSelectedMediaTypeDescription();
+        void SetSelectedMediaTypeDescription(const std::string &description);
+        HRESULT ChangeMediaType(IMFMediaType *pType);
+        void RequestMediaType(IMFMediaType *pType);
+        HRESULT StartCapture();
+        void UpdateDrawRect();
+
+    private:
+        HRESULT CreateD3DDeviceManager();
+        void CreateThread();
+        MediaTypeInfo GetMediaTypeInfo(IMFMediaType *pType);
+        std::string GetVideoFormatName(GUID subtype);
+        static bool CompareMediaTypes(const MediaTypeInfo &a, const MediaTypeInfo &b);
+        bool MatchesPreferredAspect(const MediaTypeInfo &info) const;
+        static bool IsBetterAutoType(const MediaTypeInfo &candidate, const MediaTypeInfo &current);
+        IMFMediaType *FindBestNativeAutoType(bool requirePreferredAspect) const;
+        IMFMediaType *FindBestAutoType(const GUID &subtype, bool requirePreferredAspect) const;
+        HRESULT ValidateMediaType(IMFMediaType *pType);
+        HRESULT InitTargetTexture();
+        HRESULT EnsureTransformTextures();
+        HRESULT InitCameraControl();
+        void SetSelectedMediaType(int index, const std::string &description);
+        bool HasPendingMediaType();
+        HRESULT ApplyPendingMediaType();
+        HRESULT UploadDecodedSample(IMFMediaBuffer *pSrcBuffer);
+        HRESULT DrawSample(IMFMediaBuffer *pSrcBuffer);
+        HRESULT ReadSample();
+        HRESULT Render();
+    };
+}
+
+#endif

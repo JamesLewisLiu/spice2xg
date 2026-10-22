@@ -1,0 +1,528 @@
+#include "libutils.h"
+
+#include <cstring>
+#include <windows.h>
+#include <psapi.h>
+#include <shlwapi.h>
+
+#include "logging.h"
+#include "utils.h"
+#include "peb.h"
+#include "util/fileutils.h"
+#include "util/dependencies.h"
+#include "util/unique_plain_ptr.h"
+
+#define DEBUG_VERBOSE 0
+
+#if DEBUG_VERBOSE
+#define log_debug(module, format_str, ...) logger::push( \
+    LOG_FORMAT("M", module, format_str, ## __VA_ARGS__), logger::Style::GREY)
+#else
+#define log_debug(module, format_str, ...)
+#endif
+
+std::filesystem::path libutils::module_file_name(HMODULE module) {
+    std::wstring buf;
+    buf.resize(MAX_PATH + 1);
+
+    while (true) {
+        auto size = GetModuleFileNameW(nullptr, buf.data(), buf.capacity());
+
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            buf.resize(size);
+            break;
+        }
+
+        buf.resize(buf.size() * 2);
+    }
+
+    return std::filesystem::path(std::move(buf));
+}
+
+static inline void load_library_fail(const std::filesystem::path &file_name, bool fatal) {
+    std::string info_str { fmt::format(
+        "DLL failed to load - this is a common error. Please carefully read ALL of the following steps for a fix:\n"
+        " 1. Confirm if the file ({}) exists on the disk and check the file permissions.\n"
+        " 2. Follow this link and install DLL prerequisites on this list:\n"
+        "        https://github.com/spice2x/spice2x.github.io/wiki/DLL-Dependencies \n"
+        " 3. Still have problems after installing from above and rebooting PC?\n"
+        "     a. Avoid manually specifying DLL path (-exec) and module directory (-modules); let spice2x auto-detect unless you have a good reason not to\n"
+        "     b. Ensure you do NOT have multiple copies of the game DLLs (e.g., in contents and in contents\\modules)\n"
+        "     c. Certain games require specific NVIDIA DLLs when running with AMD/Intel GPUs (hint: look inside stub directory for DLLs)\n"
+        " 4. (For advanced users) if none of the above helps, find the missing dependency using:\n"
+        "     a. https://github.com/lucasg/Dependencies (recommended for most) \n"
+        "     b. http://www.dependencywalker.com/ (for old OS) \n"
+    , file_name) };
+    if (fatal) {
+        log_warning("libutils", "{}", info_str);
+        log_fatal("libutils", "DLL failed to load: {}, see log.txt for troubleshooting", file_name);
+    } else {
+        log_warning("libutils", "{}", info_str);
+    }
+}
+
+HMODULE libutils::load_library(const char *module_name, bool fatal) {
+    HMODULE module = LoadLibraryA(module_name);
+
+    if (!module) {
+        log_warning("libutils", "'{}' couldn't be loaded: {}", module_name, get_last_error_string());
+        std::string file_name(PathFindFileNameA(module_name));
+        load_library_fail(file_name, fatal);
+    }
+
+    return module;
+}
+
+HMODULE libutils::load_library(const std::filesystem::path &path, bool fatal) {
+    HMODULE module = LoadLibraryW(path.c_str());
+
+    if (!module) {
+        log_warning("libutils", "'{}' couldn't be loaded: {}", path, get_last_error_string());
+        dependencies::walk(path);
+        load_library_fail(path.filename(), fatal);
+    }
+
+    return module;
+}
+
+HMODULE libutils::try_library(const char *module_name) {
+    return LoadLibraryA(module_name);
+}
+
+HMODULE libutils::try_library(const std::filesystem::path &path) {
+    return LoadLibraryW(path.c_str());
+}
+
+HMODULE libutils::get_module(const char *module_name) {
+    HMODULE module = GetModuleHandleA(module_name);
+    if (!module) {
+        log_fatal("libutils", "'{}' could not be loaded: {}", module_name, get_last_error_string());
+    }
+    return module;
+}
+
+HMODULE libutils::try_module(const char *module_name) {
+    return GetModuleHandleA(module_name);
+}
+
+HMODULE libutils::try_module(const std::filesystem::path &module_path) {
+    return GetModuleHandleW(module_path.c_str());
+}
+
+FARPROC libutils::get_proc(const char *proc_name) {
+
+    // iterate loaded modules
+    auto cur_entry = peb::entry_first();
+    while (cur_entry != nullptr) {
+
+        // check if this module contains the function
+        auto proc = try_proc(reinterpret_cast<HMODULE>(cur_entry->DllBase), proc_name);
+        if (proc) {
+            return proc;
+        }
+
+        // next entry
+        cur_entry = peb::entry_next(cur_entry);
+    }
+
+    // function not found
+    log_fatal("libutils", "'{}' not found", proc_name);
+
+    return 0;
+}
+
+FARPROC libutils::get_proc(HMODULE module, LPCSTR proc) {
+    auto value = GetProcAddress(module, proc);
+
+    if (!value) {
+        log_fatal("libutils", "'{}' not found", proc);
+    }
+
+    return value;
+}
+
+FARPROC libutils::get_proc_list(HMODULE module, std::initializer_list<const char *> list) {
+    FARPROC value = nullptr;
+    for (auto proc_name : list) {
+        value = GetProcAddress(module, proc_name);
+        if (value) {
+            return value;
+        }
+    }
+
+    // error out
+    log_fatal("libutils", "{} not found", *list.begin());
+    return nullptr;
+}
+
+FARPROC libutils::try_proc(const char *proc_name) {
+
+    // iterate loaded modules
+    auto cur_entry = peb::entry_first();
+    while (cur_entry != nullptr) {
+
+        // check if this module contains the function
+        auto proc = try_proc(reinterpret_cast<HMODULE>(cur_entry->DllBase), proc_name);
+        if (proc) {
+            return proc;
+        }
+
+        // next entry
+        cur_entry = peb::entry_next(cur_entry);
+    }
+
+    // function not found
+    return 0;
+}
+
+FARPROC libutils::try_proc(HMODULE module, const char *proc_name) {
+    FARPROC value = GetProcAddress(module, proc_name);
+    if (!value) {
+        return 0;
+    }
+    return value;
+}
+
+FARPROC libutils::try_proc_list(HMODULE module, std::initializer_list<const char *> list) {
+    for (auto proc_name : list) {
+        auto value = GetProcAddress(module, proc_name);
+        if (value) {
+            return value;
+        }
+    }
+    return nullptr;
+}
+
+intptr_t libutils::rva2offset(IMAGE_NT_HEADERS *nt_headers, intptr_t rva) {
+
+    // iterate sections
+    const auto section_count = nt_headers->FileHeader.NumberOfSections;
+    const IMAGE_SECTION_HEADER *section_header = IMAGE_FIRST_SECTION(nt_headers);
+    for (size_t i = 0; i < section_count; i++) {
+
+        // check if RVA is within section
+        if (section_header->VirtualAddress <= (DWORD) rva) {
+            if ((section_header->VirtualAddress + section_header->Misc.VirtualSize) > (DWORD) rva) {
+                rva -= section_header->VirtualAddress;
+                rva += section_header->PointerToRawData;
+                return rva;
+            }
+        }
+
+        // next section
+        section_header++;
+    }
+
+    // offset out of bounds
+    return -1;
+}
+
+
+intptr_t libutils::rva2offset(const std::filesystem::path &path, intptr_t rva) {
+
+    // open file
+    HANDLE dll_file = CreateFileW(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0);
+    if (!dll_file) {
+        return ~0;
+    }
+
+    // create file mapping
+    HANDLE dll_mapping = CreateFileMappingW(dll_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!dll_mapping) {
+        CloseHandle(dll_file);
+        log_warning("libutils", "could not create file mapping for {}", path);
+        return -1;
+    }
+
+    // map view of file
+    LPVOID dll_file_base = MapViewOfFile(dll_mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!dll_file_base) {
+        CloseHandle(dll_file);
+        CloseHandle(dll_mapping);
+        log_warning("libutils", "could not map view of file for {}", path);
+        return -1;
+    }
+
+    // get offset
+    intptr_t offset = -1;
+    auto dll_dos = reinterpret_cast<PIMAGE_DOS_HEADER>(dll_file_base);
+    if (dll_dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        auto dll_nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uint8_t *>(dll_dos) + dll_dos->e_lfanew);
+        offset = libutils::rva2offset(dll_nt, rva);
+    }
+
+    // clean up and return
+    UnmapViewOfFile(dll_file_base);
+    CloseHandle(dll_file);
+    CloseHandle(dll_mapping);
+    return offset;
+}
+
+intptr_t libutils::offset2rva(IMAGE_NT_HEADERS *nt_headers, intptr_t offset) {
+
+    // iterate sections
+    auto section_count = nt_headers->FileHeader.NumberOfSections;
+    PIMAGE_SECTION_HEADER section_header = IMAGE_FIRST_SECTION(nt_headers);
+    for (int i = 0; i < section_count; i++) {
+
+        // check if offset is within section
+        if (section_header->PointerToRawData <= static_cast<DWORD>(offset)) {
+            if ((section_header->PointerToRawData + section_header->SizeOfRawData) > static_cast<DWORD>(offset)) {
+                offset -= section_header->PointerToRawData;
+                offset += section_header->VirtualAddress;
+                return offset;
+            }
+        }
+
+        // next section
+        section_header++;
+    }
+
+    // offset out of bounds
+    return -1;
+}
+
+intptr_t libutils::offset2rva(const std::filesystem::path &path, intptr_t offset) {
+
+    // open file
+    HANDLE dll_file = CreateFileW(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0);
+    if (!dll_file) {
+        return -1;
+    }
+
+    // create file mapping
+    HANDLE dll_mapping = CreateFileMappingW(dll_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!dll_mapping) {
+        log_warning("libutils", "could not create file mapping for {}: {}", path, get_last_error_string());
+        CloseHandle(dll_file);
+        return -1;
+    }
+
+    // map view of file
+    LPVOID dll_file_base = MapViewOfFile(dll_mapping, FILE_MAP_READ, 0, 0, 0);
+    if (!dll_file_base) {
+        log_warning("libutils", "could not map view of file for {}: {}", path, get_last_error_string());
+        CloseHandle(dll_file);
+        CloseHandle(dll_mapping);
+        return -1;
+    }
+
+    // get RVA
+    intptr_t rva = -1;
+    auto dll_dos = reinterpret_cast<PIMAGE_DOS_HEADER>(dll_file_base);
+    if (dll_dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        auto dll_nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uint8_t *>(dll_dos) + dll_dos->e_lfanew);
+        rva = libutils::offset2rva(dll_nt, offset);
+    }
+
+    // clean up
+    UnmapViewOfFile(dll_file_base);
+    CloseHandle(dll_file);
+    CloseHandle(dll_mapping);
+
+    return rva;
+}
+
+void libutils::check_duplicate_dlls() {
+    const auto &spice_bin_path = libutils::module_file_name(nullptr).parent_path();
+    if (MODULE_PATH == spice_bin_path) {
+        return;
+    }
+
+    for (const auto &file : std::filesystem::directory_iterator(MODULE_PATH)) {
+        const auto &filename = file.path().filename();
+        const auto extension = filename.extension().wstring();
+
+        if (wcsicmp(extension.c_str(), L".dll") == 0 &&
+            fileutils::file_exists(spice_bin_path / filename)) {
+            log_warning(
+                "libutils",
+                "DLL CONFLICT WARNING\n\n\n"
+                "-------------------------------------------------------------------\n"
+                "WARNING - WARNING - WARNING - WARNING - WARNING - WARNING - WARNING\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "{} exists in BOTH of these directories:\n\n"
+                "    1. {}\n"
+                "    2. {}\n\n"
+                "due to Windows DLL load order rules, #1 will load instead of #2.\n"
+                "this has unintended consequences and may crash your game!\n"
+                "resolve the conflict by deleting the stale copy of the DLL\n"
+                "-------------------------------------------------------------------\n\n\n",
+                filename,
+                (spice_bin_path / filename),
+                (MODULE_PATH / filename));
+        }
+    }
+}
+
+bool libutils::warn_if_dll_exists(const std::string &file_name) {
+    const auto &spice_bin_path = libutils::module_file_name(nullptr).parent_path();
+    bool found = false;
+    if (fileutils::file_exists(spice_bin_path / file_name)) {
+        log_info("libutils", "found user-supplied {} next to spice executable path", file_name);
+        libutils::print_dll_info(spice_bin_path / file_name);
+        found = true;
+    }
+    if (MODULE_PATH != spice_bin_path && fileutils::file_exists(MODULE_PATH / file_name)) {
+        log_info("libutils", "found user-supplied {} in modules directory", file_name);
+        libutils::print_dll_info(MODULE_PATH / file_name);
+        found = true;
+    }
+    return found;
+}
+
+void libutils::print_dll_info(std::filesystem::path filename) {
+    std::string company_name;
+    std::string product_name;
+    std::string version_str;
+    auto print_summary = [&]() {
+        log_info(
+            "libutils",
+            "DLL info for {}: CompanyName = {}, ProductName = {}, Version = {}, Path = {}",
+            filename.filename(),
+            company_name.empty() ? "?" : company_name,
+            product_name.empty() ? "?" : product_name,
+            version_str.empty() ? "?" : version_str,
+            filename);
+    };
+
+    DWORD handle = 0;
+    const auto size = GetFileVersionInfoSizeW(filename.wstring().c_str(), &handle);
+    if (size == 0) {
+        const auto error = GetLastError();
+        log_misc(
+            "libutils",
+            "GetFileVersionInfoSizeW failed for {}: Win32 error {}; "
+            "DLL may have no version resource",
+            filename,
+            error);
+        print_summary();
+        return;
+    }
+
+    auto data = util::make_unique_plain<VOID>(size);
+    if (!GetFileVersionInfoW(filename.wstring().c_str(), handle, size, data.get())) {
+        const auto error = GetLastError();
+        log_misc(
+            "libutils",
+            "GetFileVersionInfoW failed for {}: Win32 error {}",
+            filename,
+            error);
+        print_summary();
+        return;
+    }
+
+    VS_FIXEDFILEINFO *fixed_info = nullptr;
+    UINT fixed_size = 0;
+    if (VerQueryValueW(data.get(), L"\\", (LPVOID*)&fixed_info, &fixed_size) &&
+        fixed_info != nullptr && fixed_size >= sizeof(*fixed_info) &&
+        fixed_info->dwSignature == 0xFEEF04BD) {
+        version_str = fmt::format(
+            "{}.{}.{}.{}",
+            HIWORD(fixed_info->dwFileVersionMS),
+            LOWORD(fixed_info->dwFileVersionMS),
+            HIWORD(fixed_info->dwFileVersionLS),
+            LOWORD(fixed_info->dwFileVersionLS));
+        log_info("libutils", "Fixed file version for {}: {}", filename.filename(), version_str);
+    } else {
+        log_misc("libutils", "Missing or invalid fixed version info for {}", filename);
+    }
+
+    struct LANGANDCODEPAGE {
+        WORD wLanguage;
+        WORD wCodePage;
+    } *lpTranslate = nullptr;
+
+    UINT cbTranslate = 0;
+    if (!VerQueryValueW(
+            data.get(), L"\\VarFileInfo\\Translation", (LPVOID*)&lpTranslate, &cbTranslate)) {
+        log_misc(
+            "libutils",
+            "VerQueryValueW(\\VarFileInfo\\Translation) failed for {}",
+            filename);
+        print_summary();
+        return;
+    }
+    if (cbTranslate < sizeof(*lpTranslate) ||
+        cbTranslate % sizeof(*lpTranslate) != 0 || lpTranslate == nullptr) {
+        log_misc(
+            "libutils",
+            "Invalid version translation table for {} ({} bytes)",
+            filename,
+            cbTranslate);
+        print_summary();
+        return;
+    }
+
+    // pick language - prefer English
+    WORD lang = 0, codepage = 0;
+    for (UINT i = 0; i < cbTranslate / sizeof(*lpTranslate); i++) {
+        if (lpTranslate[i].wLanguage == 0x0409) { // en-us
+            lang = lpTranslate[i].wLanguage;
+            codepage = lpTranslate[i].wCodePage;
+            break;
+        }
+    }
+    if (lang == 0) {
+        lang = lpTranslate[0].wLanguage;
+        codepage = lpTranslate[0].wCodePage;
+    }
+
+    // StringFileInfo helper
+    auto query_string = [&](const char* key, WORD language, WORD page) -> std::string {
+        std::string subBlock = fmt::format(
+            "\\StringFileInfo\\{:04x}{:04x}\\{}",
+            language, page, key
+        );
+
+        wchar_t *value = nullptr;
+        UINT size_out = 0;
+
+        const auto wide_sub_block = s2ws(subBlock);
+        if (VerQueryValueW(data.get(), wide_sub_block.c_str(), (LPVOID*)&value, &size_out) &&
+            value != nullptr && size_out > 0 && value[size_out - 1] == L'\0') {
+            return fmt::detail::to_utf8<wchar_t>(
+                std::wstring_view(value, size_out - 1),
+                fmt::detail::to_utf8_error_policy::replace).str();
+        }
+        log_misc(
+            "libutils",
+            "Missing or invalid version string {} for {}",
+            subBlock,
+            filename);
+        return "";
+    };
+
+    auto query_translations = [&](const char *key) {
+        auto value = query_string(key, lang, codepage);
+        for (UINT i = 0; value.empty() && i < cbTranslate / sizeof(*lpTranslate); i++) {
+            const auto &translation = lpTranslate[i];
+            if (translation.wLanguage != lang || translation.wCodePage != codepage) {
+                value = query_string(key, translation.wLanguage, translation.wCodePage);
+            }
+        }
+        return value;
+    };
+
+    company_name = query_translations("CompanyName");
+    product_name = query_translations("ProductName");
+    const auto string_version = query_translations("FileVersion");
+    if (!string_version.empty()) {
+        version_str = string_version;
+    }
+    print_summary();
+}

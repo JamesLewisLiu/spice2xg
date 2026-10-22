@@ -1,0 +1,102 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+namespace rawinput {
+    class RawInputManager;
+}
+
+class Light {
+private:
+    std::vector<Light> alternatives;
+    std::string lightName;
+    std::string lightCategory;
+    std::string deviceIdentifier = "";
+    unsigned int index = 0;
+    bool is_temporary = false;
+
+public:
+    float last_state = 0.f;
+
+    // overrides
+    bool override_enabled = false;
+    float override_state = 0.f;
+
+    explicit Light(std::string lightName) : lightName(std::move(lightName)) {};
+    explicit Light(std::string lightName, std::string lightCategory) :
+        lightName(std::move(lightName)), lightCategory(std::move(lightCategory)) {};
+
+    std::string getDisplayString(rawinput::RawInputManager* manager);
+
+    inline std::vector<Light> &getAlternatives() {
+        return this->alternatives;
+    }
+
+    inline bool isSet() const {
+        if (this->override_enabled) {
+            return true;
+        }
+        if (!this->deviceIdentifier.empty()) {
+            return true;
+        }
+
+        for (auto &alternative : this->alternatives) {
+            if (!alternative.deviceIdentifier.empty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    inline const std::string &getName() const {
+        return this->lightName;
+    }
+
+    inline const std::string &getCategory() const {
+        return this->lightCategory;
+    }
+
+    inline void setCategory(std::string category) {
+        this->lightCategory = std::move(category);
+    }
+
+    inline const std::string &getDeviceIdentifier() const {
+        return this->deviceIdentifier;
+    }
+
+    inline void setDeviceIdentifier(std::string deviceIdentifier) {
+        this->deviceIdentifier = std::move(deviceIdentifier);
+    }
+
+    inline unsigned int getIndex() const {
+        return this->index;
+    }
+
+    inline void setIndex(unsigned int index) {
+        this->index = index;
+    }
+
+    inline bool isTemporary() const {
+        return this->is_temporary;
+    }
+
+    inline void setTemporary(bool is_temporary) {
+        this->is_temporary = is_temporary;
+    }
+
+    inline bool isValid() {
+        // temporarily created by UI
+        if (isTemporary()) {
+            return true;
+        }
+
+        // nothing is set
+        if (getDeviceIdentifier().empty()) {
+            return false;
+        }
+
+        return true;
+    }
+};

@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+
+# set to EN-US for consistency
+LANG=en_us_8859_1
+
+# exit on error
+set -e
+CMD_CURR="";
+function trap_error_dbg {
+    CMD_LAST=${CMD_CURR}
+    CMD_CURR=$BASH_COMMAND
+}
+function trap_error_exit {
+    if (($? > 0))
+    then
+        echo "\"${CMD_LAST}\" resulted in exit code $?."
+    fi
+}
+trap trap_error_dbg DEBUG
+trap trap_error_exit EXIT
+
+IGNORE_CACHE=0
+
+# Parse options
+while getopts "ih" opt; do
+  case $opt in
+    i) IGNORE_CACHE=1 ;;
+    h)
+      echo "Usage: $0 [-i]"
+      echo "  -i: Ignore build cache"
+      echo "  -h: Show this help"
+      exit 0
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# settings
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2> /dev/null || echo "none")
+GIT_HEAD=$(git rev-parse HEAD || echo "none")
+TOOLCHAIN_32="${TOOLCHAIN_32:-"/usr/share/mingw/toolchain-i686-w64-mingw32.cmake"}"
+TOOLCHAIN_64="${TOOLCHAIN_64:-"/usr/share/mingw/toolchain-x86_64-w64-mingw32.cmake"}"
+TOOLCHAIN_WINXP_32="${TOOLCHAIN_WINXP_32:-"/opt/llvm-mingw-xp/toolchain-files/cmake/i686-mingw32-clang.cmake"}"
+TOOLCHAIN_WINXP_64="${TOOLCHAIN_WINXP_64:-"/opt/llvm-mingw-xp/toolchain-files/cmake/x86_64-mingw32-clang.cmake"}"
+BUILDDIR_32_RELEASE="./cmake-build-release-32"
+BUILDDIR_32_DEBUG="./cmake-build-debug-32"
+BUILDDIR_64_RELEASE="./cmake-build-release-64"
+BUILDDIR_64_DEBUG="./cmake-build-debug-64"
+BUILDDIR_WINXP_32_RELEASE="./cmake-build-release-winxp-32"
+BUILDDIR_WINXP_32_DEBUG="./cmake-build-debug-winxp-32"
+BUILDDIR_WINXP_64_RELEASE="./cmake-build-release-winxp-64"
+BUILDDIR_WINXP_64_DEBUG="./cmake-build-debug-winxp-64"
+DEBUG=0
+OUTDIR="./bin/spice2x"
+OUTDIR_EXTRAS="./bin/spice2x/extras"
+
+# disabled UPX since it tends to falsely trigger malware detection
+UPX_ENABLE=0
+UPX_FLAGS="-q --best --lzma --compress-exports=0"
+
+CLEAN_BUILD=1
+INCLUDE_SRC=1
+DIST_ENABLE=1
+DIST_FOLDER="./dist"
+DIST_NAME="spice2x-$(date +%y)-$(date +%m)-$(date +%d).zip"
+DIST_NAME_EXTRAS="spice2x-$(date +%y)-$(date +%m)-$(date +%d)-full.zip"
+DIST_COMMENT=${DIST_NAME}$'\n'"$GIT_BRANCH - $GIT_HEAD"$'\nThank you for playing.'
+TARGETS_32="spicetools_stubs_kbt spicetools_stubs_kld spicetools_cfg spicetools_cfg_linux spicetools_spice spicetools_spice_laa spicetools_spice_linux spicetools_stubs_cpusbxpkm spicetools_sdk_sample_v0_flat_c_32"
+TARGETS_64="spicetools_stubs_kbt64 spicetools_stubs_kld64 spicetools_stubs_nvEncodeAPI64 spicetools_stubs_nvcuvid spicetools_stubs_nvcuda spicetools_spice64 spicetools_spice64_linux spicetools_sdk_sample_v0_flat_c_64 spicetools_sdk_sample_v0_cpp_64"
+TARGETS_XP32="spicetools_cfg spicetools_spice"
+TARGETS_XP64="spicetools_spice64"
+
+# determine build type
+BUILD_TYPE="Release"
+BUILDDIR_32=${BUILDDIR_32_RELEASE}
+BUILDDIR_64=${BUILDDIR_64_RELEASE}
+BUILDDIR_WINXP_32=${BUILDDIR_WINXP_32_RELEASE}
+BUILDDIR_WINXP_64=${BUILDDIR_WINXP_64_RELEASE}
+if ((DEBUG > 0))
+then
+	BUILD_TYPE="Debug"
+	BUILDDIR_32=${BUILDDIR_32_DEBUG}
+	BUILDDIR_64=${BUILDDIR_64_DEBUG}
+	BUILDDIR_WINXP_32=${BUILDDIR_WINXP_32_DEBUG}
+	BUILDDIR_WINXP_64=${BUILDDIR_WINXP_64_DEBUG}
+	DIST_NAME=$(echo "${DIST_NAME}" | sed 's/\.[^.]*$/-dbg&/')
+fi
+
+# is the XP-compatible toolchain installed?
+XP_MUST_BUILD=0
+# 64-bit WinXP builds are disabled by default; set to 1 to opt in
+BUILD_XP_64_ENABLE=0
+BUILD_XP_32=0
+BUILD_XP_64=0
+if [ -f "$TOOLCHAIN_WINXP_32" ]; then
+	BUILD_XP_32=1;
+elif ((XP_MUST_BUILD > 0))
+then
+	echo "WinXP 32bit toolchain not available, aborting"
+	exit 1
+fi
+if ((BUILD_XP_64_ENABLE > 0)) && [ -f "$TOOLCHAIN_WINXP_64" ]; then
+	BUILD_XP_64=1;
+fi
+
+# determine number of cores
+CORES=$(nproc)
+
+# print information
+echo ""
+echo "SpiceTools Build-Script"
+echo "======================="
+echo "Host: $(uname -sro)"
+echo "Date: $(date)"
+echo "Git Branch: $GIT_BRANCH"
+echo "Git Head: $GIT_HEAD"
+echo "Toolchain for 32bit targets: $TOOLCHAIN_32"
+echo "Toolchain for 64bit targets: $TOOLCHAIN_64"
+if ((BUILD_XP_32 > 0))
+then
+	echo "Toolchain for WinXP 32bit targets: $TOOLCHAIN_WINXP_32"
+else
+	echo "WinXP 32bit toolchain not available, skipping WinXP 32bit builds"
+fi
+if ((BUILD_XP_64 > 0))
+then
+	echo "Toolchain for WinXP 64bit targets: $TOOLCHAIN_WINXP_64"
+else
+	echo "WinXP 64bit builds disabled, skipping WinXP 64bit builds"
+fi
+echo "Distribution Name: $DIST_NAME"
+echo "Build Type: $BUILD_TYPE"
+echo "Cores: $CORES"
+echo ""
+
+if ((IGNORE_CACHE > 0))
+then
+  echo "Ignoring build cache..."
+else
+ export CCACHE_DIR="$(pwd)/.ccache"
+ export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+ export CMAKE_C_COMPILER_LAUNCHER=ccache
+fi
+
+time (
+	# 32 bit
+	echo "Building 32bit targets..."
+	echo "========================="
+	if ((CLEAN_BUILD > 0))
+	then
+		rm -rf ${BUILDDIR_32}
+	fi
+	mkdir -p ${BUILDDIR_32}
+	pushd ${BUILDDIR_32} > /dev/null
+	cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_32} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} "$OLDPWD" && ninja ${TARGETS_32}
+	popd > /dev/null
+
+	# 64 bit
+	echo ""
+	echo "Building 64bit targets..."
+	echo "========================="
+	if ((CLEAN_BUILD > 0))
+	then
+		rm -rf ${BUILDDIR_64}
+	fi
+	mkdir -p ${BUILDDIR_64}
+	pushd ${BUILDDIR_64} > /dev/null
+	cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_64} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} "$OLDPWD" && ninja ${TARGETS_64}
+	popd > /dev/null
+
+	if ((BUILD_XP_32 > 0))
+	then
+		# 32 bit Windows XP
+		echo ""
+		echo "Building 32bit targets (WinXP toolchain)..."
+		echo "========================="
+		if ((CLEAN_BUILD > 0))
+		then
+			rm -rf ${BUILDDIR_WINXP_32}
+		fi
+		mkdir -p ${BUILDDIR_WINXP_32}
+		pushd ${BUILDDIR_WINXP_32} > /dev/null
+		cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_WINXP_32} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DSPICE_XP=ON "$OLDPWD" && ninja ${TARGETS_XP32}
+		popd > /dev/null
+	else
+		echo ""
+		echo "Skipping WinXP 32bit builds, toolchain not specified"
+	fi
+
+	if ((BUILD_XP_64 > 0))
+	then
+		# 64 bit Windows XP
+		echo ""
+		echo "Building 64bit targets (WinXP toolchain)..."
+		echo "========================="
+		if ((CLEAN_BUILD > 0))
+		then
+			rm -rf ${BUILDDIR_WINXP_64}
+		fi
+		mkdir -p ${BUILDDIR_WINXP_64}
+		pushd ${BUILDDIR_WINXP_64} > /dev/null
+		cmake -G "Ninja" -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_WINXP_64} -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DSPICE_XP=ON "$OLDPWD" && ninja ${TARGETS_XP64}
+		popd > /dev/null
+	else
+		echo ""
+		echo "Skipping WinXP 64bit builds"
+	fi
+
+	echo ""
+	echo "Compilation process done :)"
+	echo "==========================="
+)
+
+echo ""
+echo "Checking Win7 compatibility..."
+echo "============================="
+if ! command -v windows_dll_compat_checker &> /dev/null; then
+	echo "WARNING: windows_dll_compat_checker not found, skipping Win7 compatibility check"
+else
+	windows_dll_compat_checker -s PREMADE/konami_win7_museca_x86_64.ini \
+		${BUILDDIR_64}/spicetools/64/spice64.exe
+	windows_dll_compat_checker -s PREMADE/konami_win7_museca_x86_64_32bit_dlls.ini \
+		${BUILDDIR_32}/spicetools/spicecfg.exe \
+		${BUILDDIR_32}/spicetools/32/spice.exe
+fi
+
+if ((BUILD_XP_32 > 0)) || ((BUILD_XP_64 > 0))
+then
+	echo ""
+	echo "Checking XP compatibility..."
+	echo "============================="
+	if ! command -v windows_dll_compat_checker &> /dev/null; then
+		echo "WARNING: windows_dll_compat_checker not found, skipping XP compatibility check"
+	else
+		if ((BUILD_XP_64 > 0))
+		then
+			windows_dll_compat_checker -s PREMADE/winxp_x86_64.ini \
+				${BUILDDIR_WINXP_64}/spicetools/64/spice64.exe
+		fi
+		if ((BUILD_XP_32 > 0))
+		then
+			windows_dll_compat_checker -s PREMADE/konami_winxp_jubeat_i686.ini \
+				${BUILDDIR_WINXP_32}/spicetools/spicecfg.exe \
+				${BUILDDIR_WINXP_32}/spicetools/32/spice.exe
+		fi
+	fi
+fi
+
+# generate PDBs
+if false  # ((DEBUG > 0))
+then
+	echo "Generating PDBs..."
+
+	# start conversions in multiple processes if in target and binary newer than PDB
+	if [[ ${TARGETS_32} == *"spicetools_cfg"* ]] && \
+	        [[ ${BUILDDIR_32}/spicetools/spicecfg.exe -nt ${BUILDDIR_32}/spicetools/spicecfg-pdb.exe ]]; then
+	    rm -f ${BUILDDIR_32}/spicetools/spicecfg-pdb.exe ${BUILDDIR_32}/spicetools/spicecfg-pdb.pdb
+	    (wine external/cv2pdb/cv2pdb.exe \
+	        ${BUILDDIR_32}/spicetools/spicecfg.exe \
+	        ${BUILDDIR_32}/spicetools/spicecfg-pdb.exe \
+	        ${BUILDDIR_32}/spicetools/spicecfg-pdb.pdb \
+	        &> /dev/null && \
+	        touch --reference=${BUILDDIR_32}/spicetools/spicecfg.exe ${BUILDDIR_32}/spicetools/spicecfg-pdb.exe && \
+	        echo "Generation done for spicetools_cfg") &
+	fi
+	if [[ ${TARGETS_32} == *"spicetools_spice"* ]] && \
+	        [[ ${BUILDDIR_32}/spicetools/32/spice.exe -nt ${BUILDDIR_32}/spicetools/32/spice-pdb.exe ]]; then
+	    rm -f ${BUILDDIR_32}/spicetools/32/spice-pdb.exe ${BUILDDIR_32}/spicetools/32/spice-pdb.pdb
+	    (wine external/cv2pdb/cv2pdb.exe \
+	        ${BUILDDIR_32}/spicetools/32/spice.exe \
+	        ${BUILDDIR_32}/spicetools/32/spice-pdb.exe \
+	        ${BUILDDIR_32}/spicetools/32/spice-pdb.pdb \
+	        &> /dev/null && \
+	        touch --reference=${BUILDDIR_32}/spicetools/32/spice.exe ${BUILDDIR_32}/spicetools/32/spice-pdb.exe && \
+	        echo "Generation done for spicetools_spice") &
+	fi
+	if [[ ${TARGETS_64} == *"spicetools_spice64"* ]] && \
+	        [[ ${BUILDDIR_64}/spicetools/64/spice64.exe -nt ${BUILDDIR_64}/spicetools/64/spice64-pdb.exe ]]; then
+	    rm -f ${BUILDDIR_64}/spicetools/64/spice64-pdb.exe ${BUILDDIR_64}/spicetools/64/spice64-pdb.pdb
+	    (wine external/cv2pdb/cv2pdb.exe \
+	        ${BUILDDIR_64}/spicetools/64/spice64.exe \
+	        ${BUILDDIR_64}/spicetools/64/spice64-pdb.exe \
+	        ${BUILDDIR_64}/spicetools/64/spice64-pdb.pdb \
+	        &> /dev/null && \
+	        touch --reference=${BUILDDIR_64}/spicetools/64/spice64.exe ${BUILDDIR_64}/spicetools/64/spice64-pdb.exe && \
+	        echo "Generation done for spicetools_spice64") &
+	fi
+
+	# wait until all processes are complete
+	wait
+fi
+
+# copy to output directory
+echo "Copy files to output directory..."
+
+rm -rf ${OUTDIR}
+mkdir -p ${OUTDIR}
+mkdir -p ${OUTDIR}/stubs/32
+mkdir -p ${OUTDIR}/stubs/64
+
+rm -rf ${OUTDIR_EXTRAS}
+mkdir -p ${OUTDIR_EXTRAS}
+mkdir -p ${OUTDIR_EXTRAS}/largeaddressaware
+mkdir -p ${OUTDIR_EXTRAS}/linux
+mkdir -p ${OUTDIR_EXTRAS}/sdk/samples/32
+mkdir -p ${OUTDIR_EXTRAS}/sdk/samples/64
+mkdir -p ${OUTDIR_EXTRAS}/updater
+if ((BUILD_XP_32 > 0)) || ((BUILD_XP_64 > 0))
+then
+mkdir -p ${OUTDIR_EXTRAS}/winxp
+fi
+
+if false # ((DEBUG > 0))
+then
+    # debug files
+    cp ${BUILDDIR_32}/spicetools/spicecfg-pdb.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/spicecfg-pdb.pdb ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/spice-pdb.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/spice-pdb.pdb ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/spice64-pdb.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/spice64-pdb.pdb ${OUTDIR} 2>/dev/null
+else
+    # release files
+    cp ${BUILDDIR_32}/spicetools/spicecfg.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/spicecfg_linux.exe ${OUTDIR_EXTRAS}/linux/spicecfg.exe 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/spice.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/spice_laa.exe ${OUTDIR_EXTRAS}/largeaddressaware/spice.exe 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/spice_linux.exe ${OUTDIR_EXTRAS}/linux/spice.exe 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/spice64.exe ${OUTDIR} 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/spice64_linux.exe ${OUTDIR_EXTRAS}/linux/spice64.exe 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/nvEncodeAPI64.dll ${OUTDIR}/stubs/64 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/nvcuda.dll ${OUTDIR}/stubs/64 2>/dev/null
+    cp ${BUILDDIR_64}/spicetools/64/nvcuvid.dll ${OUTDIR}/stubs/64 2>/dev/null
+    cp ${BUILDDIR_32}/spicetools/32/cpusbxpkm.dll ${OUTDIR}/stubs/32 2>/dev/null
+	cp ${BUILDDIR_32}/spicetools/32/sdk_sample_v0_flat_c.dll ${OUTDIR_EXTRAS}/sdk/samples/32/v0_flat_c.dll 2>/dev/null
+	cp ${BUILDDIR_64}/spicetools/64/sdk_sample_v0_flat_c.dll ${OUTDIR_EXTRAS}/sdk/samples/64/v0_flat_c.dll 2>/dev/null
+	cp ${BUILDDIR_64}/spicetools/64/sdk_sample_v0_cpp.dll ${OUTDIR_EXTRAS}/sdk/samples/64/v0_cpp.dll 2>/dev/null
+	if ((BUILD_XP_32 > 0))
+	then
+		cp ${BUILDDIR_WINXP_32}/spicetools/spicecfg.exe ${OUTDIR_EXTRAS}/winxp 2>/dev/null
+		cp ${BUILDDIR_WINXP_32}/spicetools/32/spice.exe ${OUTDIR_EXTRAS}/winxp 2>/dev/null
+	fi
+	if ((BUILD_XP_64 > 0))
+	then
+		cp ${BUILDDIR_WINXP_64}/spicetools/64/spice64.exe ${OUTDIR_EXTRAS}/winxp 2>/dev/null
+	fi
+fi
+
+# pack source files to output directory
+rm -rf ${OUTDIR}/src
+mkdir -p ${OUTDIR}/src
+if ((INCLUDE_SRC > 0))
+then
+	echo "Generating source file archive..."
+	git archive --format tar.gz --prefix=spice2x/ HEAD ./ > "${OUTDIR}/src/spice2x-${GIT_BRANCH}.tar.gz" 2>/dev/null || \
+		echo "WARNING: Couldn't get git to create the archive. Is this a git repository?"
+fi
+
+# sdk headers
+cp -r ./sdk/include ${OUTDIR_EXTRAS}/sdk
+
+# copy resources
+rm -rf ${OUTDIR_EXTRAS}/api
+mkdir ${OUTDIR_EXTRAS}/api
+find ./api/resources/python -name "__pycache__" -exec rm -rf {} +
+cp -r ./api/resources/* ${OUTDIR_EXTRAS}/api
+
+# generate the standalone updater scripts from the shared template and drop them
+bash ./build_updaters.sh ${OUTDIR_EXTRAS}/updater
+
+# build distribution archive
+if ((DIST_ENABLE > 0))
+then
+	echo "Building dist..."
+	mkdir -p ${DIST_FOLDER}
+	rm -rf "${DIST_FOLDER}/${DIST_NAME}"
+	pushd ${OUTDIR} > /dev/null
+	zip -qrXT9 "$OLDPWD/${DIST_FOLDER}/${DIST_NAME}" . -x "extras/*" -z <<< "$DIST_COMMENT"
+	echo "Building extras..."
+	zip -qrXT9 "$OLDPWD/${DIST_FOLDER}/${DIST_NAME_EXTRAS}" . -z <<< "$DIST_COMMENT"
+	popd > /dev/null
+fi
+
+# finish
+echo "All done!"
+exit 0

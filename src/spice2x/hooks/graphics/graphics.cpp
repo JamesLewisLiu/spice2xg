@@ -1,0 +1,2087 @@
+// GetDisplayConfigBufferSizes etc is Vista+
+#define _WIN32_WINNT 0x0601
+
+#include <initguid.h>
+
+#include "graphics.h"
+
+#include <chrono>
+#include <set>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
+
+#include "avs/game.h"
+#include "cfg/icon.h"
+#include "cfg/screen_resize.h"
+#include "games/ddr/ddr.h"
+#include "games/gitadora/gitadora.h"
+#include "games/gitadora/legacy.h"
+#include "games/iidx/iidx.h"
+#include "games/io.h"
+#include "games/sdvx/sdvx.h"
+#include "games/popn/popn.h"
+#include "hooks/graphics/jpeg_encoder.h"
+#include "hooks/graphics/backends/d3d9/d3d9_backend.h"
+#include "hooks/graphics/backends/d3d11/d3d11_backend.h"
+#include "launcher/shutdown.h"
+#include "misc/hotkeys.h"
+#include "overlay/overlay.h"
+#include "touch/touch.h"
+#include "touch/touch_gestures.h"
+#include "util/detour.h"
+#include "util/logging.h"
+#include "util/fileutils.h"
+#include "util/utils.h"
+#include "misc/wintouchemu.h"
+#include "touch/native/inject.h"
+#include "touch/native/nativetouchhook.h"
+#include "util/time.h"
+#include "rawinput/rawinput.h"
+
+struct CaptureData {
+    std::shared_ptr<uint8_t[]> data;
+    unsigned short width, height;
+    uint64_t timestamp;
+};
+
+HWND TDJ_SUBSCREEN_WINDOW = nullptr;
+HWND SDVX_SUBSCREEN_WINDOW = nullptr;
+HWND GFDM_SUBSCREEN_WINDOW = nullptr;
+static HWND GFDM_LEFT_WINDOW = nullptr;
+static HWND GFDM_RIGHT_WINDOW = nullptr;
+static HMONITOR GFDM_TWO_HEAD_SMALL_MONITOR = nullptr;
+static HWND GFDM_TWO_HEAD_SMALL_WINDOW = nullptr;
+HWND POPN_SUBSCREEN_WINDOW = nullptr;
+static HWND NDD_SUBSCREEN_WINDOW = nullptr;
+HWND NDD_MAIN_WINDOW = nullptr;
+bool FAKE_SUBSCREEN_ADAPTER = false;
+
+// icon
+static HICON WINDOW_ICON = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(MAINICON));
+
+// state
+static WNDPROC WNDPROC_ORIG = nullptr;
+static WNDPROC WSUB_WNDPROC_ORIG = nullptr;
+static std::vector<WNDPROC> WNDPROC_CUSTOM {};
+static bool GRAPHICS_SCREENSHOT_TRIGGER = false;
+static std::set<int> GRAPHICS_SCREENS { 0 };
+static std::mutex GRAPHICS_SCREENS_M {};
+static std::vector<int> GRAPHICS_CAPTURE_SCREENS;
+static std::mutex GRAPHICS_CAPTURE_SCREENS_M {};
+static CaptureData GRAPHICS_CAPTURE_BUFFER[GRAPHICS_CAPTURE_SCREEN_NO] {};
+static std::mutex GRAPHICS_CAPTURE_BUFFER_M[GRAPHICS_CAPTURE_SCREEN_NO] {};
+static std::condition_variable GRAPHICS_CAPTURE_CV[GRAPHICS_CAPTURE_SCREEN_NO] {};
+static bool GRAPHICS_CAPTURE_SKIP_SIGNAL[GRAPHICS_CAPTURE_SCREEN_NO] {};
+static constexpr std::chrono::milliseconds GRAPHICS_CAPTURE_RECEIVE_TIMEOUT {2000};
+
+static void graphics_capture_cancel_pending(int screen) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_CAPTURE_SCREENS_M);
+
+    for (auto it = GRAPHICS_CAPTURE_SCREENS.rbegin(); it != GRAPHICS_CAPTURE_SCREENS.rend(); ++it) {
+        if (*it == screen) {
+            GRAPHICS_CAPTURE_SCREENS.erase(std::next(it).base());
+            return;
+        }
+    }
+}
+
+static std::optional<graphics_orientation> target_orientation_on_boot;
+static UINT target_refresh_rate_on_boot = 0;
+static std::optional<std::pair<uint32_t, uint32_t>> target_resolution_on_boot;
+static bool monitor_settings_changed = false;
+static bool monitor_layout_needs_reset = false;
+
+// flag settings
+bool GRAPHICS_CAPTURE_CURSOR = false;
+bool GRAPHICS_LOG_HRESULT = false;
+bool GRAPHICS_SDVX_FORCE_720 = false;
+#ifdef SPICE64
+SdvxLive2dMode GRAPHICS_SDVX_LIVE2D_MODE = SdvxLive2dMode::Off;
+std::atomic<bool> GRAPHICS_SDVX_LIVE2D_IN_GAMEPLAY = false;
+#endif // SPICE64
+bool GRAPHICS_SHOW_CURSOR = false;
+bool GRAPHICS_WINDOWED = false;
+std::vector<HWND> GRAPHICS_WINDOWS;
+UINT GRAPHICS_FORCE_REFRESH = 0;
+std::optional<uint32_t> GRAPHICS_FORCE_REFRESH_SUB;
+std::optional<int> GRAPHICS_FORCE_VSYNC_BUFFER;
+bool GRAPHICS_FORCE_SINGLE_ADAPTER = false;
+bool GRAPHICS_PREVENT_SECONDARY_WINDOWS = false;
+bool GRAPHICS_GITADORA_HIDE_SIDE_WINDOWS = false;
+graphics_dx9on12_state GRAPHICS_9_ON_12_STATE = DX9ON12_AUTO;
+bool GRAPHICS_9_ON_12_REQUESTED_BY_GAME = false;
+bool SUBSCREEN_FORCE_REDRAW = false;
+bool D3D9_DEVICE_HOOK_DISABLE = false;
+std::optional<std::pair<uint32_t, uint32_t>> GRAPHICS_FS_CUSTOM_RESOLUTION;
+std::optional<std::pair<uint32_t, uint32_t>> GRAPHICS_FS_CUSTOM_RESOLUTION_SUB;
+bool GRAPHICS_FS_ORIENTATION_SWAP = false;
+uint32_t GRAPHICS_FS_ORIGINAL_WIDTH = 0;
+uint32_t GRAPHICS_FS_ORIGINAL_HEIGHT = 0;
+
+// settings
+std::string GRAPHICS_DEVICEID = "PCI\\VEN_1002&DEV_7146";
+std::string GRAPHICS_SCREENSHOT_DIR = ".\\screenshots";
+bool GRAPHICS_SCREENSHOT_INCLUDE_OVERLAY = false;
+bool GRAPHICS_SCREENSHOT_SUBSCREENS = false;
+
+static decltype(ChangeDisplaySettingsA) *ChangeDisplaySettingsA_orig = nullptr;
+static decltype(ChangeDisplaySettingsExA) *ChangeDisplaySettingsExA_orig = nullptr;
+static decltype(ClipCursor) *ClipCursor_orig = nullptr;
+static decltype(CreateWindowExA) *CreateWindowExA_orig = nullptr;
+static decltype(CreateWindowExW) *CreateWindowExW_orig = nullptr;
+static decltype(EnableWindow) *EnableWindow_orig = nullptr;
+static decltype(EnumDisplayDevicesA) *EnumDisplayDevicesA_orig = nullptr;
+static decltype(MoveWindow) *MoveWindow_orig = nullptr;
+static decltype(PeekMessageA) *PeekMessageA_orig = nullptr;
+static decltype(RegisterClassA) *RegisterClassA_orig = nullptr;
+static decltype(RegisterClassExA) *RegisterClassExA_orig = nullptr;
+static decltype(RegisterClassW) *RegisterClassW_orig = nullptr;
+static decltype(RegisterClassExW) *RegisterClassExW_orig = nullptr;
+static decltype(ShowCursor) *ShowCursor_orig = nullptr;
+static decltype(SetCursor) *SetCursor_orig = nullptr;
+static decltype(SetWindowLongA) *SetWindowLongA_orig = nullptr;
+static decltype(SetWindowLongW) *SetWindowLongW_orig = nullptr;
+static decltype(SetWindowPos) *SetWindowPos_orig = nullptr;
+static decltype(ShowWindow) *ShowWindow_orig = nullptr;
+static decltype(SetDisplayConfig) *SetDisplayConfig_addr = nullptr;
+
+static void reset_window_hook(HWND hWnd) {
+    overlay::destroy(hWnd);
+
+    if (WNDPROC_ORIG) {
+        SetWindowLongPtrA(hWnd, GWLP_WNDPROC, (LONG_PTR) WNDPROC_ORIG);
+        WNDPROC_ORIG = nullptr;
+    }
+}
+
+static std::string gitadora_canonical_window_name(const std::string &window_name) {
+    if (window_name == "GITADORA") {
+        return "GITADORA";
+    }
+    if (window_name.ends_with("LEFT")) {
+        return "LEFT";
+    }
+    if (window_name.ends_with("RIGHT")) {
+        return "RIGHT";
+    }
+    if (window_name.ends_with("SMALL")) {
+        return "SMALL";
+    }
+    return "";
+}
+
+static const char *gitadora_window_name_for_hwnd(HWND hWnd) {
+    if (hWnd == nullptr) {
+        return nullptr;
+    }
+    if (GRAPHICS_HOOKED_WINDOW.has_value() && hWnd == GRAPHICS_HOOKED_WINDOW.value()) {
+        return "GITADORA";
+    }
+    if (hWnd == GFDM_LEFT_WINDOW) {
+        return "LEFT";
+    }
+    if (hWnd == GFDM_RIGHT_WINDOW) {
+        return "RIGHT";
+    }
+    if (hWnd == GFDM_SUBSCREEN_WINDOW) {
+        return "SMALL";
+    }
+    return nullptr;
+}
+
+static bool is_gfdm_known_window(HWND hWnd) {
+    return gitadora_window_name_for_hwnd(hWnd) != nullptr;
+}
+
+static bool is_gfdm_two_head_small_window(HWND hWnd) {
+    return games::gitadora::is_arena_model() &&
+        games::gitadora::ARENA_TWO_HEAD_EXCLUSIVE &&
+        hWnd != nullptr &&
+        hWnd == GFDM_TWO_HEAD_SMALL_WINDOW;
+}
+
+static bool gitadora_should_block_game_window_placement(HWND hWnd) {
+    if (!GRAPHICS_WINDOWED || !games::gitadora::is_arena_model()) {
+        return false;
+    }
+
+    const auto window_name = gitadora_window_name_for_hwnd(hWnd);
+    return window_name != nullptr && graphics_gitadora_has_window_override(window_name);
+}
+
+static void gitadora_remember_window(HWND hWnd, const std::string &window_name) {
+    if (window_name == "GITADORA") {
+        GRAPHICS_HOOKED_WINDOW = hWnd;
+    } else if (window_name == "LEFT") {
+        GFDM_LEFT_WINDOW = hWnd;
+    } else if (window_name == "RIGHT") {
+        GFDM_RIGHT_WINDOW = hWnd;
+    } else if (window_name == "SMALL") {
+        GFDM_SUBSCREEN_WINDOW = hWnd;
+    }
+
+    // touch belongs to the SMALL panel when it exists, otherwise to the main window
+    // that draws the subscreen overlay
+    const bool hosts_touch = window_name == "SMALL" ||
+        (window_name == "GITADORA" && !graphics_gitadora_has_dedicated_subscreen());
+    if (nativetouch::is_hooked() && hWnd != nullptr && hosts_touch) {
+        nativetouch::inject::set_preferred_injection_window(hWnd);
+    }
+}
+
+bool graphics_gitadora_has_dedicated_subscreen() {
+    return GFDM_SUBSCREEN_WINDOW != nullptr;
+}
+
+const char *graphics_gitadora_window_name(HWND hWnd) {
+    return gitadora_window_name_for_hwnd(hWnd);
+}
+
+bool graphics_gitadora_prepare_two_head_device_window(
+        HWND hWnd, HMONITOR target_monitor, UINT desired_width, UINT desired_height) {
+    if (hWnd == nullptr || !IsWindow(hWnd)) {
+        log_warning(
+            "graphics",
+            "two-head exclusive: native secondary device window is invalid: {}",
+            fmt::ptr(hWnd));
+        return false;
+    }
+    if (ShowWindow_orig == nullptr || SetWindowLongA_orig == nullptr ||
+            SetWindowPos_orig == nullptr) {
+        log_warning(
+            "graphics",
+            "two-head exclusive: window hooks are not initialized for {}",
+            fmt::ptr(hWnd));
+        return false;
+    }
+
+    RECT rect_before {};
+    GetWindowRect(hWnd, &rect_before);
+    const DWORD style_before = static_cast<DWORD>(GetWindowLongA(hWnd, GWL_STYLE));
+    const BOOL visible_before = IsWindowVisible(hWnd);
+
+    if (target_monitor != nullptr) {
+        GFDM_TWO_HEAD_SMALL_MONITOR = target_monitor;
+    }
+    const HMONITOR monitor = target_monitor != nullptr
+        ? target_monitor
+        : (GFDM_TWO_HEAD_SMALL_MONITOR != nullptr
+            ? GFDM_TWO_HEAD_SMALL_MONITOR
+            : MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL));
+    MONITORINFO monitor_info {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (monitor == nullptr || !GetMonitorInfoA(monitor, &monitor_info)) {
+        log_warning(
+            "graphics",
+            "two-head exclusive: could not find the SMALL monitor for {}",
+            fmt::ptr(hWnd));
+        return false;
+    }
+
+    // Arena requests D3DCREATE_NOWINDOWCHANGES, so place its SMALL window on
+    // the second head before D3D9 takes ownership of it.
+    const DWORD fullscreen_style = (style_before & ~WS_OVERLAPPEDWINDOW) | WS_POPUP;
+    const bool style_changed = fullscreen_style != style_before;
+    if (style_changed) {
+        SetWindowLongA_orig(hWnd, GWL_STYLE, static_cast<LONG>(fullscreen_style));
+    }
+    const RECT &monitor_rect = monitor_info.rcMonitor;
+    const int host_width = desired_width != 0
+        ? static_cast<int>(desired_width)
+        : monitor_rect.right - monitor_rect.left;
+    const int host_height = desired_height != 0
+        ? static_cast<int>(desired_height)
+        : monitor_rect.bottom - monitor_rect.top;
+    const bool rect_changed = rect_before.left != monitor_rect.left ||
+        rect_before.top != monitor_rect.top ||
+        rect_before.right != monitor_rect.left + host_width ||
+        rect_before.bottom != monitor_rect.top + host_height;
+    if ((style_changed || rect_changed) && !SetWindowPos_orig(
+        hWnd,
+        HWND_TOP,
+        monitor_rect.left,
+        monitor_rect.top,
+        host_width,
+        host_height,
+        SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
+        log_warning(
+            "graphics",
+            "two-head exclusive: failed to place SMALL window, error={}",
+            GetLastError());
+        return false;
+    }
+
+    if (!visible_before) {
+        ShowWindow_orig(hWnd, SW_SHOWNOACTIVATE);
+    }
+    if (MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL) != monitor) {
+        log_warning(
+            "graphics",
+            "two-head exclusive: SMALL window {} is on the wrong monitor",
+            fmt::ptr(hWnd));
+        return false;
+    }
+
+    GFDM_TWO_HEAD_SMALL_WINDOW = hWnd;
+    return true;
+}
+
+static bool gitadora_should_allow_small_resize() {
+    return GRAPHICS_WINDOWED &&
+        games::gitadora::is_arena_model() &&
+        !graphics_gitadora_is_borderless_windowed();
+}
+
+static void gitadora_apply_small_resize_style(DWORD &style) {
+    if (!gitadora_should_allow_small_resize()) {
+        return;
+    }
+
+    style |= WS_SIZEBOX;
+    style |= WS_MAXIMIZEBOX;
+    style |= WS_SYSMENU;
+}
+
+static void gitadora_force_window_style(HWND hWnd) {
+    if (!GRAPHICS_WINDOWED || !games::gitadora::is_arena_model() || hWnd == nullptr) {
+        return;
+    }
+
+    DWORD style = GetWindowLongA(hWnd, GWL_STYLE);
+    DWORD style_ex = GetWindowLongA(hWnd, GWL_EXSTYLE);
+    const DWORD style_orig = style;
+    const DWORD style_ex_orig = style_ex;
+    graphics_gitadora_apply_window_style(style, style_ex);
+    if (hWnd == GFDM_SUBSCREEN_WINDOW) {
+        gitadora_apply_small_resize_style(style);
+    }
+
+    if (style == style_orig && style_ex == style_ex_orig) {
+        return;
+    }
+
+    if (SetWindowLongA_orig != nullptr) {
+        SetWindowLongA_orig(hWnd, GWL_STYLE, static_cast<LONG>(style));
+        SetWindowLongA_orig(hWnd, GWL_EXSTYLE, static_cast<LONG>(style_ex));
+    } else {
+        SetWindowLongA(hWnd, GWL_STYLE, static_cast<LONG>(style));
+        SetWindowLongA(hWnd, GWL_EXSTYLE, static_cast<LONG>(style_ex));
+    }
+
+    const UINT flags =
+        SWP_NOMOVE |
+        SWP_NOSIZE |
+        SWP_NOZORDER |
+        SWP_NOACTIVATE |
+        SWP_FRAMECHANGED;
+    if (SetWindowPos_orig != nullptr) {
+        SetWindowPos_orig(hWnd, nullptr, 0, 0, 0, 0, flags);
+    } else {
+        SetWindowPos(hWnd, nullptr, 0, 0, 0, 0, flags);
+    }
+
+    log_misc(
+        "graphics",
+        "GITADORA window style override: hwnd={}, style 0x{:x}->0x{:x}, ex 0x{:x}->0x{:x}",
+        fmt::ptr(hWnd),
+        style_orig,
+        style,
+        style_ex_orig,
+        style_ex);
+}
+
+// window procedure
+static LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+
+    // terminate
+    if (uMsg == WM_CLOSE) {
+        if (games::gitadora::legacy::enabled()
+            && !games::gitadora::legacy::has_process_lifetime_resources()) {
+            // Before native boot, the host can still release its own renderer
+            // and allow the launcher's normal AVS shutdown. After boot, use the
+            // common Exit Game path without waiting for a native frame to end.
+            games::gitadora::legacy::request_exit(false);
+            return 0;
+        }
+        log_info("graphics", "detected WM_CLOSE, terminating...");
+        static std::once_flag shutdown_requested;
+        std::call_once(shutdown_requested, [] {
+            std::thread([] {
+                launcher::shutdown(0);
+            }).detach();
+        });
+        return false;
+    }
+
+    // overlay specific
+    if (overlay::OVERLAY) {
+        switch (uMsg) {
+            case WM_CHAR: {
+
+                // input characters if overlay is active
+                if (overlay::OVERLAY->has_focus()) {
+                    overlay::OVERLAY->input_char((unsigned int) wParam);
+                    return true;
+                }
+                break;
+            }
+            case WM_DESTROY: {
+                auto wndproc = WNDPROC_ORIG;
+                reset_window_hook(hWnd);
+                return CallWindowProcA(wndproc, hWnd, uMsg, wParam, lParam);
+            }
+            case WM_SETCURSOR: {
+
+                // set cursor back to the overlay one
+                if (LOWORD(lParam) == HTCLIENT && overlay::OVERLAY->update_cursor()) {
+                    return true;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    if (wintouchemu::INJECT_MOUSE_AS_WM_TOUCH) {
+        // drop mouse inputs since only wintouches should be used
+        switch (uMsg) {
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN:
+            case WM_LBUTTONUP:
+            case WM_MBUTTONDOWN:
+            case WM_MBUTTONUP:
+            case WM_RBUTTONDOWN:
+            case WM_RBUTTONUP:
+            case WM_XBUTTONDOWN:
+            case WM_XBUTTONUP:
+                return true;
+        }
+    }
+
+    // window resize
+    graphics_windowed_wndproc(hWnd, uMsg, wParam, lParam);
+
+    // call custom procedures
+    for (WNDPROC wndProc : WNDPROC_CUSTOM) {
+        wndProc(hWnd, uMsg, wParam, lParam);
+    }
+
+    // capture mouse
+    if (GRAPHICS_CAPTURE_CURSOR) {
+        bool free_cursor = false;
+        bool capture_cursor = false;
+        bool early_return = false;
+        switch (uMsg) {
+            case WM_SETFOCUS:
+                capture_cursor = true;
+                early_return = true;
+                break;
+            case WM_KILLFOCUS:
+                free_cursor = true;
+                early_return = true;
+                break;
+            case WM_WINDOWPOSCHANGED:
+                // known issue: dragging with the title bar results in WM_WINDOWPOSCHANGED
+                // getting called, which calls ClipCursor successfully, but doesn't actually
+                // confine the cursor for some reason; seems like odd Windows behavior
+                // (can be fixed if focus is shifted to another window and then back to the game
+                // window)
+                if (hWnd == GetActiveWindow()) {
+                    capture_cursor = true;
+                } else {
+                    free_cursor = true;
+                }
+                // do not return early; may result in WM_SIZE / WM_MOVE no longer being called
+            default:
+                break;
+        }
+
+        if (free_cursor) {
+            ClipCursor(nullptr);
+        } else if (capture_cursor) {
+            RECT WINDOW_RECT;
+            GetWindowRect(hWnd, &WINDOW_RECT);
+            ClipCursor(&WINDOW_RECT);
+        }
+        if (early_return) {
+            return true;
+        }
+    }
+
+    // drop keydown messages
+    switch (uMsg) {
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
+        case WM_KEYDOWN:
+        case WM_KEYUP:
+            return true;
+        default:
+            break;
+    }
+
+    switch (uMsg) {
+        case WM_MOVE:
+        case WM_SIZE:
+            // Update SPICETOUCH space when the main window changes size or moves.
+            // The update happens regardless of whether the "fake" spicetouch window is present or not.
+            // This allows touches received on subscreen window to be translated correctly.
+            update_spicetouch_window_dimensions(hWnd);
+            // log_misc(
+            //     "graphics", "detected window change ({}x{} @ {}, {}), updating touch coord-space to match",
+            //     SPICETOUCH_TOUCH_WIDTH, SPICETOUCH_TOUCH_HEIGHT, SPICETOUCH_TOUCH_X, SPICETOUCH_TOUCH_Y);
+
+            // Update SPICETOUCH window if present
+            if (SPICETOUCH_TOUCH_HWND) {
+                SetWindowPos(
+                    SPICETOUCH_TOUCH_HWND, HWND_TOP,
+                    SPICETOUCH_TOUCH_X, SPICETOUCH_TOUCH_Y,
+                    SPICETOUCH_TOUCH_WIDTH, SPICETOUCH_TOUCH_HEIGHT,
+                    SWP_NOZORDER | SWP_NOREDRAW | SWP_NOREPOSITION | SWP_NOACTIVATE);
+            }
+            break;
+        case WM_ACTIVATEAPP:
+            if (wParam) {
+                // regained focus
+                // this *can* get called twice in a row when restoring, but update_monitor_at_runtime
+                // is idempotent (checks current display settings to see if changes are needed),
+                // so it shouldn't cause any issues
+                update_monitor_at_runtime();
+            }
+            break;
+        default:
+            break;
+    }
+
+    // call default
+    return CallWindowProcA(WNDPROC_ORIG, hWnd, uMsg, wParam, lParam);
+}
+
+// window procedure for subscreen
+// this might be replaced by spicetouch hook later
+static LRESULT CALLBACK WsubWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_CLOSE) {
+        log_misc("graphics", "ignore WM_CLOSE for subscreen window");
+        return false;
+    }
+
+    if (hWnd == GFDM_SUBSCREEN_WINDOW && (uMsg == WM_MOVE || uMsg == WM_SIZE)) {
+        update_spicetouch_window_dimensions(hWnd);
+        if (SPICETOUCH_TOUCH_HWND) {
+            SetWindowPos(
+                SPICETOUCH_TOUCH_HWND, HWND_TOP,
+                SPICETOUCH_TOUCH_X, SPICETOUCH_TOUCH_Y,
+                SPICETOUCH_TOUCH_WIDTH, SPICETOUCH_TOUCH_HEIGHT,
+                SWP_NOZORDER | SWP_NOREDRAW | SWP_NOREPOSITION | SWP_NOACTIVATE);
+        }
+    }
+
+    return CallWindowProcA(WSUB_WNDPROC_ORIG, hWnd, uMsg, wParam, lParam);
+}
+
+static LONG WINAPI ChangeDisplaySettingsA_hook(DEVMODEA *lpDevMode, DWORD dwflags) {
+    log_misc("graphics", "ChangeDisplaySettingsA hook hit");
+
+    // ignore display settings changes when running windowed
+    if (GRAPHICS_WINDOWED) {
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+
+    // call original
+    return ChangeDisplaySettingsA_orig(lpDevMode, dwflags);
+}
+
+static LONG WINAPI ChangeDisplaySettingsExA_hook(LPCSTR lpszDeviceName, DEVMODEA *lpDevMode, HWND hwnd,
+        DWORD dwflags, LPVOID lParam)
+{
+    log_misc("graphics", "ChangeDisplaySettingsExA hook hit");
+
+    // ignore display settings changes when running windowed
+    if (GRAPHICS_WINDOWED) {
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+
+    // call original
+    return ChangeDisplaySettingsExA_orig(lpszDeviceName, lpDevMode, hwnd, dwflags, lParam);
+}
+
+static BOOL WINAPI ClipCursor_hook(const RECT *lpRect) {
+    log_misc("graphics", "ClipCursor hook hit");
+
+    // ignore cursor confine when having no explicit cursor confine
+    if (!GRAPHICS_CAPTURE_CURSOR) {
+        return TRUE;
+    }
+
+    // call original
+    return ClipCursor_orig(lpRect);
+}
+
+static HWND WINAPI CreateWindowExA_hook(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName,
+                                        DWORD dwStyle, int x, int y, int nWidth, int nHeight,
+                                        HWND hWndParent, HMENU hMenu, HINSTANCE hInstance,
+                                        LPVOID lpParam)
+{
+    const std::string window_name(lpWindowName != nullptr ? lpWindowName : "(null)");
+
+    log_misc("graphics", "CreateWindowExA hook hit (0x{:08x}, {}, {}, 0x{:08x}, {}, {}, {}, {}, {}, {}, {}, {})",
+            dwExStyle,
+            fmt::ptr(lpClassName),
+            window_name,
+            dwStyle,
+            x,
+            y,
+            nWidth,
+            nHeight,
+            fmt::ptr(hWndParent),
+            fmt::ptr(hMenu),
+            fmt::ptr(hInstance),
+            fmt::ptr(lpParam));
+
+    // gfdm
+    std::string effective_window_name = window_name;
+    if (avs::game::is_model({"J32", "J33", "K32", "K33", "L32", "L33", "M32"})) {
+        // set window name
+        if (!lpWindowName) {
+            lpWindowName = "GITADORA";
+            effective_window_name = "GITADORA";
+        }
+    }
+
+    const bool is_sdvx = avs::game::is_model("KFC");
+    bool is_tdj_sub_window = avs::game::is_model("LDJ") && window_name.ends_with(" sub");
+    bool is_sdvx_sub_window = is_sdvx && window_name.ends_with(" Sub Screen");
+    bool is_sdvx_main_window = is_sdvx && window_name.ends_with(" Main Screen");
+    bool is_popn_sub_window = avs::game::is_model("M39") && window_name.ends_with("Sub Screen");
+    const bool is_ndd = avs::game::is_model("NDD");
+    bool is_ndd_sub_window = is_ndd && window_name.starts_with("Aska MultiDisplay");
+    bool is_ndd_main_window = is_ndd && window_name == "ASKA";
+    const std::string gfdm_window_name = games::gitadora::is_arena_model()
+        ? gitadora_canonical_window_name(effective_window_name)
+        : "";
+    const bool is_gfdm_window = !gfdm_window_name.empty();
+    const bool is_gfdm_sub_window = gfdm_window_name == "SMALL";
+    const bool allow_gfdm_small_resize =
+        is_gfdm_sub_window && gitadora_should_allow_small_resize();
+
+    // update style / ex-style
+    if (is_tdj_sub_window || is_sdvx_sub_window || is_gfdm_sub_window || is_popn_sub_window) {
+        // hide maximize button (prevent misaligned touches)
+        if (!allow_gfdm_small_resize) {
+            dwStyle &= ~(WS_MAXIMIZEBOX);
+        }
+
+        // mouse clicks become misaligned when resized
+        if (!allow_gfdm_small_resize) {
+            dwStyle &= ~(WS_SIZEBOX);
+        }
+
+        // borderless
+        if (GRAPHICS_WINDOWED && GRAPHICS_WSUB_BORDERLESS) {
+            dwStyle &= ~(WS_OVERLAPPEDWINDOW);
+        }
+
+        // don't show the sub window on task bar / alt-tab targets
+        if (!GRAPHICS_WINDOWED) {
+            dwExStyle &= ~(WS_EX_APPWINDOW);
+            dwExStyle |= WS_EX_TOOLWINDOW;
+        }
+    }
+
+    if (allow_gfdm_small_resize) {
+        gitadora_apply_small_resize_style(dwStyle);
+    }
+    if (is_gfdm_window) {
+        graphics_gitadora_apply_window_style(dwStyle, dwExStyle);
+    }
+
+    if (is_sdvx_sub_window) {
+        graphics_load_windowed_subscreen_parameters();
+        if (GRAPHICS_WSUB_SIZE.has_value()) {
+            nWidth = GRAPHICS_WSUB_WIDTH;
+            nHeight = GRAPHICS_WSUB_HEIGHT;
+        } else {
+            GRAPHICS_WSUB_WIDTH = nWidth;
+            GRAPHICS_WSUB_HEIGHT = nHeight;
+        }
+        if (GRAPHICS_WSUB_POS.has_value()) {
+            x = GRAPHICS_WSUB_X;
+            y = GRAPHICS_WSUB_Y;
+        } else {
+            GRAPHICS_WSUB_X = x;
+            GRAPHICS_WSUB_Y = y;
+        }
+    }
+
+    if (is_gfdm_window) {
+        graphics_gitadora_apply_window_monitor(
+            gfdm_window_name,
+            x,
+            y,
+            nWidth,
+            nHeight,
+            true);
+    }
+
+    if (GRAPHICS_WINDOWED) {
+        graphics_window_check_bounds_before_creation(x, y, nWidth, nHeight);
+    }
+
+    // call original
+    HWND result = CreateWindowExA_orig(dwExStyle, lpClassName, lpWindowName, dwStyle, x, y, nWidth, nHeight,
+            hWndParent, hMenu, hInstance, lpParam);
+    GRAPHICS_WINDOWS.push_back(result);
+
+    // remember these windows now because full capture happens later during D3D
+    // initialization; placement calls before then can undo creation-time overrides
+    if (result != nullptr && is_gfdm_window && !is_gfdm_sub_window) {
+        gitadora_remember_window(result, gfdm_window_name);
+    }
+
+    // theme the native title bar (dark/light)
+    set_window_dark_titlebar(result);
+
+    if (is_tdj_sub_window) {
+        // TDJ windowed mode: remember the subscreen window handle for later
+        TDJ_SUBSCREEN_WINDOW = result;
+
+        // hook for preventing the closing of subscreen window
+        if (GRAPHICS_IIDX_WSUB) {
+            graphics_hook_subscreen_window(TDJ_SUBSCREEN_WINDOW);
+        }
+    }
+
+    // hook for preventing the closing of subscreen window
+    if (is_sdvx_sub_window) {
+        SDVX_SUBSCREEN_WINDOW = result;
+        graphics_hook_subscreen_window(SDVX_SUBSCREEN_WINDOW);
+    }
+
+    // SDVX registers touch on both windows, so name the one synthetic touches must land on
+    // instead of letting window creation order decide: the sub screen window when windowed,
+    // the main window in fullscreen since the game reads it in primary-display coordinates
+    if (nativetouch::is_hooked() &&
+        result != nullptr &&
+        (GRAPHICS_WINDOWED ? is_sdvx_sub_window : is_sdvx_main_window)) {
+        log_misc(
+            "graphics",
+            "SDVX touch surface is {}, {}",
+            fmt::ptr(result),
+            window_name);
+        nativetouch::inject::set_preferred_injection_window(result);
+    }
+
+    // only hook touch window if multiple windows are allowed
+    if (gfdm_window_name == "LEFT" || gfdm_window_name == "RIGHT") {
+        gitadora_remember_window(result, gfdm_window_name);
+    }
+    if (is_gfdm_sub_window &&
+            ((GRAPHICS_WINDOWED && !GRAPHICS_PREVENT_SECONDARY_WINDOWS) ||
+             games::gitadora::ARENA_TWO_HEAD_EXCLUSIVE)) {
+        gitadora_remember_window(result, gfdm_window_name);
+        if (GRAPHICS_WINDOWED && !GRAPHICS_PREVENT_SECONDARY_WINDOWS) {
+            graphics_hook_subscreen_window(GFDM_SUBSCREEN_WINDOW);
+        }
+
+        // the dedicated SMALL window is the touch panel; mouse and API touch target it
+        if (nativetouch::is_hooked() && result != nullptr) {
+            nativetouch::inject::register_and_attach_window(result);
+        }
+    }
+    if (is_gfdm_window && GRAPHICS_WINDOWED && !GRAPHICS_PREVENT_SECONDARY_WINDOWS) {
+        gitadora_force_window_style(result);
+    }
+
+    if (is_popn_sub_window) {
+        POPN_SUBSCREEN_WINDOW = result;
+        if (!GRAPHICS_PREVENT_SECONDARY_WINDOWS) {
+            graphics_hook_subscreen_window(POPN_SUBSCREEN_WINDOW);
+        }
+    }
+
+    if (is_ndd_sub_window) {
+        NDD_SUBSCREEN_WINDOW = result;
+    }
+
+    if (is_ndd_main_window) {
+        NDD_MAIN_WINDOW = result;
+    }
+
+    disable_touch_gestures(result);
+    log_misc(
+        "graphics",
+        "CreateWindowExA returned {}, {}",
+        fmt::ptr(result),
+        lpWindowName ? lpWindowName : "(null)");
+
+    return result;
+}
+
+static HWND WINAPI CreateWindowExW_hook(DWORD dwExStyle, LPCWSTR lpClassName, LPCWSTR lpWindowName,
+                                        DWORD dwStyle, int x, int y, int nWidth, int nHeight,
+                                        HWND hWndParent, HMENU hMenu, HINSTANCE hInstance,
+                                        LPVOID lpParam)
+{
+    log_misc("graphics", "CreateWindowExW hook hit ({:x}, {}, {}, {:x}, {}, {}, {}, {}, {}, {}, {}, {})",
+            dwExStyle,
+            fmt::ptr(lpClassName),
+            lpWindowName != nullptr ? ws2s(lpWindowName) : "(null)",
+            dwStyle,
+            x,
+            y,
+            nWidth,
+            nHeight,
+            fmt::ptr(hWndParent),
+            fmt::ptr(hMenu),
+            fmt::ptr(hInstance),
+            fmt::ptr(lpParam));
+
+    // DDR specific stuff
+    if (avs::game::is_model("MDX")) {
+
+        // set window name
+        if (!lpWindowName) {
+            lpWindowName = L"Dance Dance Revolution";
+        }
+
+        // windowed mode adjustments
+        // check the width to filter out invisible system-created windows
+        if (GRAPHICS_WINDOWED && nWidth > 0) {
+
+            // change window style
+            dwExStyle = 0;
+            dwStyle |= WS_OVERLAPPEDWINDOW;
+
+            // adjust window size to include window decoration
+            RECT rect {};
+            if (games::ddr::SDMODE) {
+                SetRect(&rect, 0, 0, 800, 600);
+            } else {
+                SetRect(&rect, 0, 0, 1280, 720);
+            }
+            AdjustWindowRect(&rect, dwStyle, (hMenu != nullptr));
+
+            nWidth = rect.right - rect.left;
+            nHeight = rect.bottom - rect.top;
+        }
+    }
+
+    // DanEvo specific stuff
+    if (avs::game::is_model("KDM")) {
+
+        // set window name
+        if (!lpWindowName) {
+            lpWindowName = L"Dance Evolution";
+        }
+    }
+
+    // FTT
+    if (avs::game::is_model("MMD")) {
+        // set window name
+        if (!lpWindowName) {
+            lpWindowName = L"Future TomTom";
+        }
+    }
+
+    if (GRAPHICS_WINDOWED) {
+        graphics_window_check_bounds_before_creation(x, y, nWidth, nHeight);
+    }
+
+    // call original
+    HWND result = CreateWindowExW_orig(
+            dwExStyle, lpClassName, lpWindowName, dwStyle, x, y, nWidth, nHeight,
+            hWndParent, hMenu, hInstance, lpParam);
+    GRAPHICS_WINDOWS.push_back(result);
+
+    // theme the native title bar (dark/light)
+    set_window_dark_titlebar(result);
+
+    log_misc(
+        "graphics",
+        "CreateWindowExW returned {}, {}",
+        fmt::ptr(result),
+        lpWindowName ? ws2s(lpWindowName) : "(null)");
+
+    disable_touch_gestures(result);
+    return result;
+}
+
+static BOOL WINAPI EnableWindow_hook(HWND hWnd, BOOL bEnable) {
+    return TRUE;
+}
+
+static BOOL WINAPI EnumDisplayDevicesA_hook(LPCTSTR lpDevice, DWORD iDevNum,
+        PDISPLAY_DEVICE lpDisplayDevice, DWORD dwFlags) {
+
+    // call original
+    BOOL value = EnumDisplayDevicesA_orig(lpDevice, iDevNum, lpDisplayDevice, dwFlags);
+
+#ifndef SPICE64
+    // older IIDX games check for hardcoded PCI vendor/device ID pair of GPU
+    if ((avs::game::is_model("JDZ") || avs::game::is_model("KDZ")) && value) {
+        log_info(
+            "graphics",
+            "EnumDisplayDevicesA_hook: swap DeviceID {} with {} (for IIDX 18/19)",
+            lpDisplayDevice->DeviceID,
+            GRAPHICS_DEVICEID.c_str());
+        memcpy(&lpDisplayDevice->DeviceID, GRAPHICS_DEVICEID.c_str(), GRAPHICS_DEVICEID.size() + 1);
+    }
+#endif
+
+    // return original result
+    return value;
+}
+
+// the sub screen renders into a fixed 800x480 buffer, but the game's saved layout asks for rects
+// that do not match it, and dxgi stretches the buffer to fill whatever the client area ends up as
+static void ndd_subscreen_size(HWND hWnd, int &width, int &height) {
+    RECT rect {};
+    SetRect(&rect, 0, 0, 800, 480);
+    AdjustWindowRect(&rect, GetWindowLongA(hWnd, GWL_STYLE), 0);
+
+    width = rect.right - rect.left;
+    height = rect.bottom - rect.top;
+}
+
+// the saved layout drops the sub window wherever it sat on the machine that wrote the file
+static void ndd_subscreen_position(int &x, int &y) {
+    RECT main {};
+    if (NDD_MAIN_WINDOW != nullptr && GetWindowRect(NDD_MAIN_WINDOW, &main)) {
+        x = main.right;
+        y = main.top;
+    }
+}
+
+static BOOL WINAPI MoveWindow_hook(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint) {
+    log_misc("graphics", "MoveWindow hook hit ({}, {}, {}, {}, {}, {})",
+        fmt::ptr(hWnd),
+        X,
+        Y,
+        nWidth,
+        nHeight,
+        bRepaint);
+
+    if (is_gfdm_two_head_small_window(hWnd)) {
+        return TRUE;
+    }
+
+    // sound voltex windowed mode adjustments
+    if (GRAPHICS_WINDOWED && GRAPHICS_SDVX_FORCE_720 && avs::game::is_model("KFC")) {
+        RECT rect {};
+        DWORD dwStyle;
+
+        dwStyle = GetWindowLongA(hWnd, GWL_STYLE);
+
+        // luckily, SDVX does not draw a menu. So we can leave the last
+        // argument to `AdjustWindowRect` as `0`.
+        SetRect(&rect, 0, 0, 720, 1280);
+        AdjustWindowRect(&rect, dwStyle, 0);
+
+        nWidth = rect.right - rect.left;
+        nHeight = rect.bottom - rect.top;
+    }
+
+    if (GRAPHICS_WINDOWED && NDD_SUBSCREEN_WINDOW && hWnd == NDD_SUBSCREEN_WINDOW) {
+        ndd_subscreen_size(hWnd, nWidth, nHeight);
+        ndd_subscreen_position(X, Y);
+    }
+
+    // iidx windowed TDJ mode
+    if (GRAPHICS_WINDOWED && TDJ_SUBSCREEN_WINDOW && hWnd == TDJ_SUBSCREEN_WINDOW) {
+       if (GRAPHICS_IIDX_WSUB) {
+           // (Experimental) Show subscreen in windowed mode
+            graphics_load_windowed_subscreen_parameters();
+
+            RECT rect {};
+            DWORD dwStyle;
+
+            dwStyle = GetWindowLongA(hWnd, GWL_STYLE);
+
+            SetRect(&rect, 0, 0, GRAPHICS_WSUB_WIDTH, GRAPHICS_WSUB_HEIGHT);
+            AdjustWindowRect(&rect, dwStyle, 0);
+
+            X = GRAPHICS_WSUB_X;
+            Y = GRAPHICS_WSUB_Y;
+
+            nWidth = rect.right - rect.left;
+            nHeight = rect.bottom - rect.top;
+
+            if (games::iidx::NATIVE_TOUCH) {
+                nativetouch::inject::register_and_attach_window(TDJ_SUBSCREEN_WINDOW);
+            } else {
+                touch_attach_wnd(TDJ_SUBSCREEN_WINDOW);
+            }
+        } else {
+            // Existing behaviour: suppress subscreen window and prompt user to use overlay instead
+             log_info(
+                "graphics",
+                "MoveWindow hook - hiding TDJ subscreen window {}; please use subscreen overlay instead (-iidxtdjw)",
+                fmt::ptr(hWnd));
+            SendMessage(hWnd, WM_CLOSE, 0, 0);
+            TDJ_SUBSCREEN_WINDOW = nullptr;
+            return TRUE;
+        }
+    }
+
+    // Monitor overrides are applied at creation time. Suppress later game
+    // placement calls instead of resizing again during scene transitions.
+    if (gitadora_should_block_game_window_placement(hWnd)) {
+        return TRUE;
+    }
+
+    // call original
+    return MoveWindow_orig(hWnd, X, Y, nWidth, nHeight, bRepaint);
+}
+
+static BOOL WINAPI PeekMessageA_hook(
+        LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+
+    // SDVX polls for messages too slowly
+    if (avs::game::is_model("KFC")) {
+
+        // process remaining messages
+        BOOL ret;
+        while ((ret = PeekMessageA_orig(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, PM_REMOVE)) != 0) {
+            if (ret == -1) {
+                return ret;
+            } else {
+                TranslateMessage(lpMsg);
+                DispatchMessageA(lpMsg);
+            }
+        }
+
+        // return no message
+        return FALSE;
+    }
+
+    return PeekMessageA_orig(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+}
+
+static int WINAPI ShowCursor_hook(BOOL bShow) {
+
+    // prevent game from hiding cursor when option is enabled
+    if (GRAPHICS_SHOW_CURSOR && !bShow) {
+        return 1;
+    }
+
+    // call original
+    return ShowCursor_orig(bShow);
+}
+
+static HCURSOR WINAPI SetCursor_hook(HCURSOR hCursor) {
+    if (GRAPHICS_SHOW_CURSOR && hCursor == NULL) {
+        return GetCursor();
+    }
+    return SetCursor_orig(hCursor);
+}
+
+static LONG WINAPI SetWindowLongA_hook(HWND hWnd, int nIndex, LONG dwNewLong) {
+
+    if (is_gfdm_two_head_small_window(hWnd) &&
+            (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE)) {
+        return GetWindowLongA(hWnd, nIndex);
+    }
+
+    // DDR window style fix
+    if (nIndex == GWL_STYLE && avs::game::is_model("MDX")) {
+        dwNewLong |= WS_OVERLAPPEDWINDOW;
+    }
+
+    const bool force_gfdm_style =
+        GRAPHICS_WINDOWED &&
+        games::gitadora::is_arena_model() &&
+        is_gfdm_known_window(hWnd) &&
+        (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE);
+
+    const auto result = SetWindowLongA_orig(hWnd, nIndex, dwNewLong);
+    if (force_gfdm_style) {
+        gitadora_force_window_style(hWnd);
+    }
+    return result;
+}
+
+static LONG WINAPI SetWindowLongW_hook(HWND hWnd, int nIndex, LONG dwNewLong) {
+
+    if (is_gfdm_two_head_small_window(hWnd) &&
+            (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE)) {
+        return GetWindowLongW(hWnd, nIndex);
+    }
+
+    // DDR overlapped window fix
+    if (nIndex == GWL_STYLE && avs::game::is_model("MDX")) {
+        dwNewLong |= WS_OVERLAPPEDWINDOW;
+    }
+
+    const bool force_gfdm_style =
+        GRAPHICS_WINDOWED &&
+        games::gitadora::is_arena_model() &&
+        is_gfdm_known_window(hWnd) &&
+        (nIndex == GWL_STYLE || nIndex == GWL_EXSTYLE);
+
+    const auto result = SetWindowLongW_orig(hWnd, nIndex, dwNewLong);
+    if (force_gfdm_style) {
+        gitadora_force_window_style(hWnd);
+    }
+    return result;
+}
+
+static BOOL WINAPI SetWindowPos_hook(HWND hWnd, HWND hWndInsertAfter,
+        int X, int Y, int cx, int cy, UINT uFlags) {
+
+    if (GRAPHICS_WINDOWED && NDD_SUBSCREEN_WINDOW && hWnd == NDD_SUBSCREEN_WINDOW) {
+        if (!(uFlags & SWP_NOSIZE)) {
+            ndd_subscreen_size(hWnd, cx, cy);
+        }
+        if (!(uFlags & SWP_NOMOVE)) {
+            ndd_subscreen_position(X, Y);
+        }
+    }
+
+    if (is_gfdm_two_head_small_window(hWnd) &&
+            ((uFlags & SWP_HIDEWINDOW) ||
+             (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE))) {
+        return TRUE;
+    }
+
+    // windowed mode adjustments
+    if (GRAPHICS_WINDOWED && (avs::game::is_model("LMA") || avs::game::is_model("MDX"))) {
+        return TRUE;
+    }
+
+    // Monitor overrides are applied at creation time. Suppress later game
+    // placement calls instead of resizing again during scene transitions.
+    if (gitadora_should_block_game_window_placement(hWnd) &&
+        (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE)) {
+        return TRUE;
+    }
+
+    // prevent gitadora arena model from shifting windows around if the user has preferences
+    if (GRAPHICS_WINDOWED && games::gitadora::is_arena_model() &&
+        GRAPHICS_HOOKED_WINDOW.has_value() && hWnd == GRAPHICS_HOOKED_WINDOW.value() &&
+        cfg::SCREENRESIZE->enable_window_resize) {
+        return TRUE;
+    }
+
+    // call original
+    return SetWindowPos_orig(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+}
+
+static BOOL WINAPI ShowWindow_hook(HWND hWnd, int nCmdShow) {
+    if (is_gfdm_two_head_small_window(hWnd) &&
+            (nCmdShow == SW_HIDE || nCmdShow == SW_MINIMIZE ||
+             nCmdShow == SW_SHOWMINIMIZED || nCmdShow == SW_SHOWMINNOACTIVE ||
+             nCmdShow == SW_FORCEMINIMIZE)) {
+        return TRUE;
+    }
+
+    if (games::gitadora::is_arena_model() &&
+        GRAPHICS_PREVENT_SECONDARY_WINDOWS &&
+        hWnd != GRAPHICS_HOOKED_WINDOW) {
+        log_info("graphics", "ShowWindow_hook - hiding sub window {}", fmt::ptr(hWnd));
+        return true;
+    }
+
+    if (games::gitadora::is_arena_model() &&
+        GRAPHICS_GITADORA_HIDE_SIDE_WINDOWS &&
+        (hWnd == GFDM_LEFT_WINDOW || hWnd == GFDM_RIGHT_WINDOW)) {
+        log_info("graphics", "ShowWindow_hook - hiding GITADORA side window {}", fmt::ptr(hWnd));
+        return true;
+    }
+
+    if (games::popn::is_pikapika_model() &&
+        GRAPHICS_PREVENT_SECONDARY_WINDOWS &&
+        hWnd == POPN_SUBSCREEN_WINDOW) {
+        log_info("graphics", "ShowWindow_hook - hiding sub window {}", fmt::ptr(hWnd));
+        return true;
+    }
+
+    if (games::iidx::TDJ_MODE &&
+        GRAPHICS_PREVENT_SECONDARY_WINDOWS &&
+        hWnd == TDJ_SUBSCREEN_WINDOW) {
+        log_info("graphics", "ShowWindow_hook - hiding sub window {}", fmt::ptr(hWnd));
+        return true;
+    }
+
+    // fullscreen SDVX keeps two adapters so the subscreen overlay can draw, so the game still
+    // creates the sub window even when the user asked for it to be gone
+    if (avs::game::is_model("KFC") &&
+        GRAPHICS_PREVENT_SECONDARY_WINDOWS &&
+        hWnd == SDVX_SUBSCREEN_WINDOW) {
+        log_info("graphics", "ShowWindow_hook - hiding sub window {}", fmt::ptr(hWnd));
+        return true;
+    }
+
+    // call original
+    return ShowWindow_orig(hWnd, nCmdShow);
+}
+
+static ATOM WINAPI RegisterClassA_hook(const WNDCLASSA *lpWndClass) {
+
+    // check for null
+    if (!lpWndClass) {
+        return RegisterClassA_orig(lpWndClass);
+    }
+
+    // copy struct and use own icon
+    WNDCLASSA wnd = *lpWndClass;
+    wnd.hIcon = WINDOW_ICON;
+
+    // call original
+    return RegisterClassA_orig(&wnd);
+}
+
+static ATOM WINAPI RegisterClassExA_hook(const WNDCLASSEXA *Arg1) {
+
+    // check for null
+    if (!Arg1) {
+        return RegisterClassExA_orig(Arg1);
+    }
+
+    // copy struct and use own icon
+    WNDCLASSEXA wnd = *Arg1;
+    wnd.hIcon = WINDOW_ICON;
+    wnd.hIconSm = WINDOW_ICON;
+
+    // call original
+    return RegisterClassExA_orig(&wnd);
+}
+
+static ATOM WINAPI RegisterClassW_hook(const WNDCLASSW *lpWndClass) {
+
+    // check for null
+    if (!lpWndClass) {
+        return RegisterClassW_orig(lpWndClass);
+    }
+
+    // copy struct and use own icon
+    WNDCLASSW wnd = *lpWndClass;
+    wnd.hIcon = WINDOW_ICON;
+
+    // call original
+    return RegisterClassW_orig(&wnd);
+}
+
+static ATOM WINAPI RegisterClassExW_hook(const WNDCLASSEXW *Arg1) {
+
+    // check for null
+    if (!Arg1) {
+        return RegisterClassExW_orig(Arg1);
+    }
+
+    // copy struct and use own icon
+    WNDCLASSEXW wnd = *Arg1;
+    wnd.hIcon = WINDOW_ICON;
+    wnd.hIconSm = WINDOW_ICON;
+
+    // call original
+    return RegisterClassExW_orig(&wnd);
+}
+
+static HHOOK WINAPI SetWindowsHookExA_hook(int, HOOKPROC, HINSTANCE, DWORD) {
+    log_misc("graphics", "SetWindowsHookExA hook hit");
+
+    // we don't do hooks
+    return nullptr;
+}
+
+static BOOL WINAPI SetCursorPos_hook(int, int) {
+
+    // prevent games from messing with the cursor position themselves
+    return TRUE;
+}
+
+static int WINAPI MessageBoxA_hook(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType) {
+
+    auto text = lpText != nullptr ? lpText : "(null)";
+    auto title = lpCaption != nullptr ? lpCaption : "(null)";
+
+    log_info("graphics", "MessageBoxA: {} - {}", title, text);
+    return IDOK;
+}
+
+static int WINAPI MessageBoxExA_hook(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType, WORD wLanguageId) {
+
+    auto text = lpText != nullptr ? lpText : "(null)";
+    auto title = lpCaption != nullptr ? lpCaption : "(null)";
+
+    log_info("graphics", "MessageBoxExA: {} - {}", title, text);
+    return IDOK;
+}
+
+static int WINAPI MessageBoxW_hook(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType) {
+
+    auto text = lpText != nullptr ? lpText : L"(null)";
+    auto title = lpCaption != nullptr ? lpCaption : L"(null)";
+
+    log_info("graphics", "MessageBoxW: {} - {}", ws2s(title), ws2s(text));
+    return IDOK;
+}
+
+static int WINAPI MessageBoxExW_hook(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType, WORD wLanguageId) {
+
+    auto text = lpText != nullptr ? lpText : L"(null)";
+    auto title = lpCaption != nullptr ? lpCaption : L"(null)";
+
+    log_info("graphics", "MessageBoxExW: {} - {}", ws2s(title), ws2s(text));
+    return IDOK;
+}
+
+void graphics_init() {
+    log_info("graphics", "initializing");
+
+    // init screen resize
+    log_info("ScreenResize", "initializing");
+    if(cfg::SCREENRESIZE == nullptr){
+        cfg::SCREENRESIZE = std::make_unique<cfg::ScreenResize>();
+    }
+
+    // init backends
+    graphics_d3d9_init();
+    graphics_d3d11_init();
+
+    // general hooks
+    ChangeDisplaySettingsA_orig = detour::iat_try("ChangeDisplaySettingsA", ChangeDisplaySettingsA_hook);
+    ChangeDisplaySettingsExA_orig = detour::iat_try("ChangeDisplaySettingsExA", ChangeDisplaySettingsExA_hook);
+    ClipCursor_orig = detour::iat_try("ClipCursor", ClipCursor_hook);
+    CreateWindowExA_orig = detour::iat_try("CreateWindowExA", CreateWindowExA_hook);
+    CreateWindowExW_orig = detour::iat_try("CreateWindowExW", CreateWindowExW_hook);
+    EnableWindow_orig = detour::iat_try("EnableWindow", EnableWindow_hook);
+    EnumDisplayDevicesA_orig = detour::iat_try("EnumDisplayDevicesA", EnumDisplayDevicesA_hook);
+    MoveWindow_orig = detour::iat_try("MoveWindow", MoveWindow_hook);
+    PeekMessageA_orig = detour::iat_try("PeekMessageA", PeekMessageA_hook);
+    RegisterClassA_orig = detour::iat_try("RegisterClassA", RegisterClassA_hook);
+    RegisterClassExA_orig = detour::iat_try("RegisterClassExA", RegisterClassExA_hook);
+    RegisterClassW_orig = detour::iat_try("RegisterClassW", RegisterClassW_hook);
+    RegisterClassExW_orig = detour::iat_try("RegisterClassExW", RegisterClassExW_hook);
+    ShowCursor_orig = detour::iat_try("ShowCursor", ShowCursor_hook);
+    SetCursor_orig = detour::iat_try("SetCursor", SetCursor_hook);
+    SetWindowLongA_orig = detour::iat_try("SetWindowLongA", SetWindowLongA_hook);
+    SetWindowLongW_orig = detour::iat_try("SetWindowLongW", SetWindowLongW_hook);
+    SetWindowPos_orig = detour::iat_try("SetWindowPos", SetWindowPos_hook);
+    ShowWindow_orig = detour::iat_try("ShowWindow", ShowWindow_hook);
+
+    detour::iat_try("MessageBoxA", MessageBoxA_hook);
+    detour::iat_try("MessageBoxExA", MessageBoxExA_hook);
+    detour::iat_try("MessageBoxW", MessageBoxW_hook);
+    detour::iat_try("MessageBoxExW", MessageBoxExW_hook);
+
+    detour::iat_try("SetWindowsHookExA", SetWindowsHookExA_hook);
+    detour::iat_try("SetCursorPos", SetCursorPos_hook);
+}
+
+void graphics_hook_window(HWND hWnd, D3DPRESENT_PARAMETERS *pPresentationParameters) {
+
+    // update window size for a few games
+    // TODO: make this work on everything
+    if (pPresentationParameters != nullptr && GRAPHICS_WINDOWED
+    && (avs::game::is_model({ "K39", "L39", "M39", "JMP", "LDJ" }))) {
+
+        // check dimensions
+        auto new_width = pPresentationParameters->BackBufferWidth;
+        auto new_height = pPresentationParameters->BackBufferHeight;
+        if (new_width != 0 && new_height != 0) {
+            RECT rect {};
+            GetWindowRect(hWnd, &rect);
+
+            auto width = rect.right - rect.left;
+            auto height = rect.bottom - rect.top;
+
+            log_info("graphics", "resized window: {}x{} -> {}x{}", width, height, new_width, new_height);
+
+            DWORD dwStyle = GetWindowLongA(hWnd, GWL_STYLE);
+            DWORD dwExStyle = GetWindowLongA(hWnd, GWL_EXSTYLE);
+            HMENU menu = GetMenu(hWnd);
+            SetRect(&rect, 0, 0, new_width, new_height);
+            AdjustWindowRectEx(&rect, dwStyle, (menu != nullptr), dwExStyle);
+
+            // make sure the window does not go off the screen
+            if (rect.top < 0) {
+                rect.bottom += -rect.top;
+                rect.top = 0;
+            }
+
+            width = rect.right - rect.left;
+            height = rect.bottom - rect.top;
+
+            SetWindowPos(hWnd, HWND_TOP, rect.left, rect.top, width, height, 0);
+        }
+    }
+
+    // show cursor
+    if (GRAPHICS_SHOW_CURSOR) {
+        ShowCursor(TRUE);
+    }
+
+    // capture mouse
+    if (GRAPHICS_CAPTURE_CURSOR) {
+        RECT rect {};
+        GetWindowRect(hWnd, &rect);
+        ClipCursor(&rect);
+    }
+
+    // hook window procedure
+    if (WNDPROC_ORIG == nullptr) {
+        WNDPROC_ORIG = reinterpret_cast<WNDPROC>(GetWindowLongPtrA(hWnd, GWLP_WNDPROC));
+        SetWindowLongPtrA(hWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WindowProc));
+
+        const bool native_touch_overlay =
+            (games::iidx::NATIVE_TOUCH && games::iidx::TDJ_MODE && !GRAPHICS_IIDX_WSUB) ||
+            (games::popn::NATIVE_TOUCH &&
+             games::popn::is_pikapika_model() && GRAPHICS_PREVENT_SECONDARY_WINDOWS) ||
+            (games::gitadora::NATIVE_TOUCH &&
+             games::gitadora::is_arena_model() && GRAPHICS_PREVENT_SECONDARY_WINDOWS);
+        if (native_touch_overlay) {
+            nativetouch::inject::register_and_attach_window(hWnd);
+        }
+
+        // NOLEGACY causes WM_CHAR to be not received
+        // reflec beat game engine does not pass WM_CHAR through for some reason (unrelated to SpiceTouch)
+        if (!rawinput::NOLEGACY && !(avs::game::is_model({"KBR", "LBR", "MBR"}))) {
+            overlay::USE_WM_CHAR_FOR_IMGUI_CHAR_INPUT = true;
+        }
+        graphics_capture_initial_window(hWnd);
+    }
+}
+
+void graphics_add_wnd_proc(WNDPROC wnd_proc) {
+    WNDPROC_CUSTOM.push_back(wnd_proc);
+}
+
+void graphics_remove_wnd_proc(WNDPROC wndProc) {
+    for (size_t x = 0; x < WNDPROC_CUSTOM.size(); x++) {
+        if (WNDPROC_CUSTOM[x] == wndProc) {
+            WNDPROC_CUSTOM.erase(WNDPROC_CUSTOM.begin() + x);
+        }
+    }
+}
+
+void graphics_hook_subscreen_window(HWND hWnd) {
+    // hook window procedure
+    if (WSUB_WNDPROC_ORIG == nullptr) {
+        WSUB_WNDPROC_ORIG = reinterpret_cast<WNDPROC>(GetWindowLongPtrA(hWnd, GWLP_WNDPROC));
+        SetWindowLongPtrA(hWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(WsubWindowProc));
+    }
+    if (GRAPHICS_WSUB_ALWAYS_ON_TOP) {
+        graphics_update_z_order(hWnd, true);
+    }
+    if (GRAPHICS_WINDOW_DISABLE_ROUNDED_CORNERS) {
+        graphics_set_corner_preference(hWnd, true);
+    }
+}
+
+void graphics_screens_register(int screen) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_SCREENS_M);
+
+    GRAPHICS_SCREENS.insert(screen);
+}
+
+void graphics_screens_unregister(int screen) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_SCREENS_M);
+
+    GRAPHICS_SCREENS.erase(screen);
+}
+
+void graphics_screens_get(std::vector<int> &screens) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_SCREENS_M);
+
+    screens.insert(screens.end(), GRAPHICS_SCREENS.begin(), GRAPHICS_SCREENS.end());
+}
+
+void graphics_poll_screenshot_hotkey() {
+    if (hotkeys::consume_screenshot()) {
+        graphics_screenshot_trigger();
+    }
+}
+
+void graphics_screenshot_trigger() {
+    GRAPHICS_SCREENSHOT_TRIGGER = true;
+}
+
+bool graphics_screenshot_consume() {
+    auto flag = GRAPHICS_SCREENSHOT_TRIGGER;
+    GRAPHICS_SCREENSHOT_TRIGGER = false;
+    return flag;
+}
+
+void graphics_capture_trigger(int screen) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_CAPTURE_SCREENS_M);
+
+    GRAPHICS_CAPTURE_SCREENS.push_back(screen);
+}
+
+bool graphics_capture_consume(int *screen) {
+    std::lock_guard<std::mutex> lock(GRAPHICS_CAPTURE_SCREENS_M);
+
+    if (GRAPHICS_CAPTURE_SCREENS.empty()) {
+        return false;
+    }
+
+    *screen = GRAPHICS_CAPTURE_SCREENS.back();
+    GRAPHICS_CAPTURE_SCREENS.pop_back();
+    return true;
+}
+
+void graphics_capture_enqueue(int screen, uint8_t *data, size_t width, size_t height) {
+    GRAPHICS_CAPTURE_BUFFER_M[screen].lock();
+    GRAPHICS_CAPTURE_SKIP_SIGNAL[screen] = false;
+    auto &capture = GRAPHICS_CAPTURE_BUFFER[screen];
+    capture.data.reset(data);
+    capture.width = width;
+    capture.height = height;
+    capture.timestamp = get_performance_milliseconds();
+    GRAPHICS_CAPTURE_BUFFER_M[screen].unlock();
+    GRAPHICS_CAPTURE_CV[screen].notify_one();
+}
+
+void graphics_capture_skip(int screen) {
+    if (screen < 0 || screen >= static_cast<int>(GRAPHICS_CAPTURE_SCREEN_NO)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(GRAPHICS_CAPTURE_BUFFER_M[screen]);
+        GRAPHICS_CAPTURE_SKIP_SIGNAL[screen] = true;
+    }
+    GRAPHICS_CAPTURE_CV[screen].notify_one();
+}
+
+bool graphics_capture_last_size(int screen, int *width, int *height) {
+    if (screen < 0 || screen >= static_cast<int>(GRAPHICS_CAPTURE_SCREEN_NO)) {
+        return false;
+    }
+
+    // consuming a frame clears the pixels but leaves the size, so this survives the read
+    std::lock_guard<std::mutex> lock(GRAPHICS_CAPTURE_BUFFER_M[screen]);
+    const auto &capture = GRAPHICS_CAPTURE_BUFFER[screen];
+    if (!capture.width || !capture.height) {
+        return false;
+    }
+
+    if (width != nullptr) {
+        *width = capture.width;
+    }
+    if (height != nullptr) {
+        *height = capture.height;
+    }
+    return true;
+}
+
+bool graphics_capture_receive_raw(int screen, std::shared_ptr<uint8_t[]> &out,
+        int divide, uint64_t *timestamp,
+        int *width, int *height) {
+
+    out = nullptr;
+
+    if (screen < 0 || screen >= static_cast<int>(GRAPHICS_CAPTURE_SCREEN_NO)) {
+        return false;
+    }
+
+    // wait for capture event (with timeout)
+    std::unique_lock<std::mutex> lock(GRAPHICS_CAPTURE_BUFFER_M[screen]);
+    const bool ready = GRAPHICS_CAPTURE_CV[screen].wait_for(
+            lock,
+            GRAPHICS_CAPTURE_RECEIVE_TIMEOUT,
+            [screen] {
+                return GRAPHICS_CAPTURE_BUFFER[screen].data != nullptr
+                    || GRAPHICS_CAPTURE_SKIP_SIGNAL[screen];
+            });
+
+    if (!ready) {
+        lock.unlock();
+        graphics_capture_cancel_pending(screen);
+        return false;
+    }
+
+    if (GRAPHICS_CAPTURE_SKIP_SIGNAL[screen]) {
+        GRAPHICS_CAPTURE_SKIP_SIGNAL[screen] = false;
+        lock.unlock();
+        return false;
+    }
+
+    auto &capture = GRAPHICS_CAPTURE_BUFFER[screen];
+    auto capture_data = capture.data;
+    auto capture_width = capture.width;
+    auto capture_height = capture.height;
+    auto capture_timestamp = capture.timestamp;
+    capture.data = nullptr;
+    lock.unlock();
+
+    // validate data
+    if (!capture_data || !capture_width || !capture_height) {
+        return false;
+    }
+
+    // divide image size
+    if (divide > 1) {
+
+        // get new resolution (round up)
+        int width_new = (capture_width + divide - 1) / divide;
+        int height_new = (capture_height + divide - 1) / divide;
+
+        // allocate new data
+        auto data_old = capture_data.get();
+        auto data_new = new uint8_t[width_new * height_new * 3];
+
+        // copy pixel data
+        int data_y = 0;
+        for (int y = 0; y < capture_height; y += divide) {
+            int data_y_offset_old = y * capture_width;
+            int data_y_offset = data_y * width_new;
+            int data_x = 0;
+            for (int x = 0; x < capture_width; x += divide) {
+                auto pixel_new = &data_new[(data_x + data_y_offset) * 3];
+                auto pixel_old = &data_old[(data_y_offset_old + x) * 3];
+                memcpy(pixel_new, pixel_old, 3);
+                data_x++;
+            }
+            data_y++;
+        }
+
+        // update capture data
+        capture_data.reset(data_new);
+        capture_width = width_new;
+        capture_height = height_new;
+    }
+
+    out = std::move(capture_data);
+
+    // status
+    if (timestamp) {
+        *timestamp = capture_timestamp;
+    }
+    if (width) {
+        *width = capture_width;
+    }
+    if (height) {
+        *height = capture_height;
+    }
+
+    return true;
+}
+
+bool graphics_capture_receive_jpeg(int screen, std::vector<uint8_t> &out,
+        int quality, int divide, uint64_t *timestamp,
+        int *width, int *height) {
+
+    out.clear();
+
+    std::shared_ptr<uint8_t[]> pixels;
+    int capture_width = 0;
+    int capture_height = 0;
+    if (!graphics_capture_receive_raw(
+            screen, pixels, divide, timestamp, &capture_width, &capture_height)) {
+        return false;
+    }
+
+    // compress
+    const bool success = jpeg_encoder::encode(
+            out, pixels.get(),
+            capture_width, capture_height, quality);
+
+    if (!success) {
+        out.clear();
+    }
+
+    // status
+    if (width) {
+        *width = capture_width;
+    }
+    if (height) {
+        *height = capture_height;
+    }
+
+    // clean up
+    return success;
+}
+
+std::string graphics_screenshot_genpath(const std::vector<int> &screens) {
+
+    // verify dir path
+    if (GRAPHICS_SCREENSHOT_DIR.empty()) {
+        return "";
+    } else {
+        auto last_char = GRAPHICS_SCREENSHOT_DIR.back();
+        if (last_char == '\\' || last_char == '/') {
+            GRAPHICS_SCREENSHOT_DIR.pop_back();
+        }
+    }
+
+    // ensure the output directory exists
+    if (!fileutils::dir_exists(GRAPHICS_SCREENSHOT_DIR)) {
+        if (!fileutils::dir_create_recursive(GRAPHICS_SCREENSHOT_DIR)) {
+            log_warning("graphics", "could not create screenshot dir: {}", GRAPHICS_SCREENSHOT_DIR);
+            return "";
+        }
+    }
+
+    // generate date prefix
+    auto t_now = std::time(nullptr);
+    auto tm_now = *std::gmtime(&t_now);
+    auto prefix = to_string(std::put_time(&tm_now, "%Y%m%d"));
+
+    // find next filename; the whole set has to be free so one shot stays numbered together
+    size_t id = 0;
+    while (true) {
+        auto filepath = fmt::format("{}\\{}_{}.png", GRAPHICS_SCREENSHOT_DIR, prefix, id);
+        bool available = !fileutils::file_exists(filepath);
+        for (const auto screen : screens) {
+            if (!available) {
+                break;
+            }
+            if (screen != 0) {
+                available = !fileutils::file_exists(fmt::format(
+                        "{}\\{}_{}_{}.png", GRAPHICS_SCREENSHOT_DIR, prefix, id, screen));
+            }
+        }
+        if (available) {
+            return filepath;
+        }
+
+        id++;
+    }
+}
+
+static std::string get_dmdo_string(DWORD dmdo) {
+    switch (dmdo) {
+        case DMDO_DEFAULT:
+            return "DMDO_DEFAULT";
+        case DMDO_90:
+            return "DMDO_90";
+        case DMDO_180:
+            return "DMDO_180";
+        case DMDO_270:
+            return "DMDO_270";
+        default:
+            return fmt::format("Unknown ({})", dmdo);
+    }
+}
+
+void change_primary_monitor(const std::string &monitor_name) {
+    log_misc("graphics", "try changing primary monitor to {}...", monitor_name);
+
+    // for WinXP, since these are Vista+ or 7+ APIs
+    const auto user32 = LoadLibraryA("user32.dll");
+    if (!user32) {
+        log_warning("graphics", "can't find user32.dll???");
+        return;
+    }
+    const auto GetDisplayConfigBufferSizes_addr =
+        reinterpret_cast<decltype(GetDisplayConfigBufferSizes) *>(
+            GetProcAddress(user32, "GetDisplayConfigBufferSizes"));
+    const auto QueryDisplayConfig_addr =
+        reinterpret_cast<decltype(QueryDisplayConfig) *>(
+            GetProcAddress(user32, "QueryDisplayConfig"));
+    const auto DisplayConfigGetDeviceInfo_addr =
+        reinterpret_cast<decltype(DisplayConfigGetDeviceInfo) *>(
+            GetProcAddress(user32, "DisplayConfigGetDeviceInfo"));
+    SetDisplayConfig_addr =
+        reinterpret_cast<decltype(SetDisplayConfig) *>(
+            GetProcAddress(user32, "SetDisplayConfig"));
+    if (GetDisplayConfigBufferSizes_addr == nullptr || QueryDisplayConfig_addr == nullptr ||
+        DisplayConfigGetDeviceInfo_addr == nullptr || SetDisplayConfig_addr == nullptr) {
+        log_warning("graphics", "cannot change primary monitor, OS does not support required APIs)");
+        return;
+    }
+
+    UINT32 path_count = 0;
+    UINT32 mode_count = 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    bool succeeded = false;
+
+    // in a retry loop, try to query for display config
+    // retry loop is needed because it can fail with ERROR_INSUFFICIENT_BUFFER
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        auto status = GetDisplayConfigBufferSizes_addr(QDC_DATABASE_CURRENT, &path_count, &mode_count);
+        if (status != ERROR_SUCCESS) {
+            log_warning("graphics", "GetDisplayConfigBufferSizes failed: {}", status);
+            return;
+        }
+
+        paths.resize(path_count);
+        modes.resize(mode_count);
+        DISPLAYCONFIG_TOPOLOGY_ID topology_id = DISPLAYCONFIG_TOPOLOGY_INTERNAL;
+        status = QueryDisplayConfig_addr(
+            QDC_DATABASE_CURRENT,
+            &path_count,
+            paths.data(),
+            &mode_count,
+            modes.data(),
+            &topology_id);
+
+        if (status == ERROR_SUCCESS) {
+            // Shrink to actual returned counts
+            paths.resize(path_count);
+            modes.resize(mode_count);
+            succeeded = true;
+            break;
+        }
+
+        if (status != ERROR_INSUFFICIENT_BUFFER) {
+            log_warning("graphics", "QueryDisplayConfig failed: {}", status);
+            return;
+        }
+
+        Sleep(500);
+    }
+    if (!succeeded) {
+        log_warning("graphics", "QueryDisplayConfig failed after reaching max retries");
+        return;
+    }
+
+    LONG x = 0;
+    LONG y = 0;
+    bool found = false;
+
+    // find the new main monitor
+    for (auto& mode : modes) {
+        if (mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            continue;
+        }
+
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME name = {};
+        name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        name.header.size = sizeof(name);
+        name.header.adapterId = mode.adapterId;
+        name.header.id = mode.id;
+        if (DisplayConfigGetDeviceInfo_addr(&name.header) != ERROR_SUCCESS) {
+            continue;
+        }
+
+        const auto device_name = std::string(ws2s(name.viewGdiDeviceName));
+        if (monitor_name == device_name) {
+            x = mode.sourceMode.position.x;
+            y = mode.sourceMode.position.y;
+            found = true;
+            log_info(
+                "graphics",
+                "new main monitor target found: {}, old position: ({}, {})",
+                monitor_name,
+                x, y);
+            break;
+        }
+    }
+    if (!found) {
+        log_fatal(
+            "graphics",
+            "new main monitor target not found, check -mainmonitor option: {}",
+            monitor_name);
+        return;
+    }
+
+    // update monitor positions so that the new monitor is at (0, 0)
+    for (auto& mode : modes) {
+        if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+            mode.sourceMode.position.x -= x;
+            mode.sourceMode.position.y -= y;
+        }
+    }
+
+    // finally, commit the new display config
+    const auto status = SetDisplayConfig_addr(
+        path_count,
+        paths.data(),
+        mode_count,
+        modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG);
+
+    if (status != ERROR_SUCCESS) {
+        log_fatal("graphics", "SetDisplayConfig failed, check -mainmonitor option: {}", status);
+    }
+
+    monitor_layout_needs_reset = true;
+
+    // a little extra time for windows to settle and redraw things
+    Sleep(2000);
+}
+
+void update_monitor(
+    bool is_boot,
+    std::optional<graphics_orientation> target_orientation,
+    UINT target_refresh_rate,
+    std::optional<std::pair<uint32_t, uint32_t>> target_resolution) {
+
+    // note: all of this is only being done for the primary monitor
+
+    // get current settings
+    DEVMODEA dm = {};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsExA(NULL, ENUM_CURRENT_SETTINGS, &dm, 0)) {
+        log_warning("graphics", "EnumDisplaySettingsExa failed {}", get_last_error_string());
+        return;
+    }
+
+    bool needs_update = false;
+
+    if (target_orientation.has_value()) {
+        // convert orientation values, and figure out if resolution needs to be swapped
+        bool rotate_resolution = false;
+        DWORD orientation = DMDO_DEFAULT;
+        switch (target_orientation.value()) {
+            case ORIENTATION_CW:
+                orientation = DMDO_90;
+                if (dm.dmDisplayOrientation == DMDO_DEFAULT || dm.dmDisplayOrientation == DMDO_180) {
+                    rotate_resolution = true;
+                }
+                break;
+            case ORIENTATION_CCW:
+                orientation = DMDO_270;
+                if (dm.dmDisplayOrientation == DMDO_DEFAULT || dm.dmDisplayOrientation == DMDO_180) {
+                    rotate_resolution = true;
+                }
+                break;
+            case ORIENTATION_FLIPPED:
+                orientation = DMDO_180;
+                if (dm.dmDisplayOrientation == DMDO_90 || dm.dmDisplayOrientation == DMDO_270) {
+                    rotate_resolution = true;
+                }
+                break;
+            default:
+                orientation = DMDO_DEFAULT;
+                if (dm.dmDisplayOrientation == DMDO_90 || dm.dmDisplayOrientation == DMDO_270) {
+                    rotate_resolution = true;
+                }
+                break;
+        }
+
+        // update orientation (and resolution if it must be swapped)
+        if (dm.dmDisplayOrientation != orientation) {
+            log_misc("graphics",
+                "current orientation {} => desired orientation {}",
+                get_dmdo_string(dm.dmDisplayOrientation), get_dmdo_string(orientation));
+
+            const DWORD originalWidth = dm.dmPelsWidth;
+            const DWORD originalHeight = dm.dmPelsHeight;
+
+            // change orientation
+            dm.dmDisplayOrientation = orientation;
+            dm.dmFields |= DM_DISPLAYORIENTATION;
+
+            // rotate resolution
+            if (rotate_resolution) {
+                dm.dmPelsWidth  = originalHeight;
+                dm.dmPelsHeight = originalWidth;
+                dm.dmFields |= DM_PELSHEIGHT | DM_PELSWIDTH;
+            }
+
+            needs_update = true;
+        }
+    }
+
+    // update refresh rate
+    if (target_refresh_rate > 0 && target_refresh_rate != dm.dmDisplayFrequency) {
+        log_misc("graphics",
+            "current refresh rate {} => desired refresh rate {}",
+            dm.dmDisplayFrequency, target_refresh_rate);
+
+        dm.dmDisplayFrequency = target_refresh_rate;
+        dm.dmFields |= DM_DISPLAYFREQUENCY;
+        needs_update = true;
+    }
+
+    if (target_resolution.has_value()) {
+        if (dm.dmPelsWidth != target_resolution.value().first ||
+            dm.dmPelsHeight != target_resolution.value().second) {
+
+            log_misc(
+                "graphics",
+                "current resolution {}, {} => desired resolution {}, {}",
+                dm.dmPelsWidth, dm.dmPelsHeight,
+                target_resolution.value().first, target_resolution.value().second);
+
+            dm.dmPelsWidth = target_resolution.value().first;
+            dm.dmPelsHeight = target_resolution.value().second;
+            needs_update = true;
+        }
+    }
+
+    if (!needs_update) {
+        // nothing to do
+        log_misc("graphics", "display settings are already up to date, no changes needed");
+        return;
+    }
+
+    const auto result = ChangeDisplaySettings(&dm, CDS_FULLSCREEN);
+    if (result != DISP_CHANGE_SUCCESSFUL) {
+        if (is_boot) {
+            log_fatal(
+                "graphics",
+                "failed to update display settings ({}px x {}px @ {}Hz): error {}, double check options",
+                dm.dmPelsWidth,
+                dm.dmPelsHeight,
+                dm.dmDisplayFrequency,
+                result);
+        } else {
+            log_warning(
+                "graphics",
+                "failed to update display settings ({}px x {}px @ {}Hz): error {}, double check options",
+                dm.dmPelsWidth,
+                dm.dmPelsHeight,
+                dm.dmDisplayFrequency,
+                result);
+        }
+    } else {
+        monitor_settings_changed = true;
+        // sleep for a little bit after changing monitor settings to delay game launch/resume
+        Sleep(1000);
+        log_info("graphics", "display settings updated successfully ({}px x {}px @ {}Hz)",
+            dm.dmPelsWidth,
+            dm.dmPelsHeight,
+            dm.dmDisplayFrequency);
+    }
+}
+
+void update_monitor_on_boot(
+    std::optional<graphics_orientation> target_orientation,
+    UINT target_refresh_rate,
+    std::optional<std::pair<uint32_t, uint32_t>> target_resolution) {
+
+    target_orientation_on_boot = target_orientation;
+    target_refresh_rate_on_boot = target_refresh_rate;
+    target_resolution_on_boot = target_resolution;
+    log_misc("graphics", "applying monitor updates at boot...");
+    update_monitor(
+        true,
+        target_orientation,
+        target_refresh_rate,
+        target_resolution);
+}
+
+void update_monitor_at_runtime() {
+    if (!GRAPHICS_WINDOWED && monitor_settings_changed) {
+        log_misc("graphics", "applying monitor updates at runtime as window regained focus...");
+        update_monitor(
+            false,
+            target_orientation_on_boot,
+            target_refresh_rate_on_boot,
+            target_resolution_on_boot);
+    }
+}
+
+void reset_monitor_on_exit() {
+
+    // while CDS_FULLSCREEN is *supposed* to be temporary & the OS attempts to
+    // restore the original settings on exit, it can sometimes fail to do that;
+    // therefore, we try our best to clean things up on the way out
+    if (monitor_settings_changed) {
+        monitor_settings_changed = false;
+        log_misc("graphics", "resetting monitor settings on exit...");
+        ChangeDisplaySettingsW(nullptr, 0);
+    }
+
+    // same for this one.
+    if (monitor_layout_needs_reset) {
+        monitor_layout_needs_reset = false;
+        log_misc("graphics", "restoring primary monitor on exit...");
+        if (SetDisplayConfig_addr != nullptr) {
+            SetDisplayConfig_addr(
+                0,
+                nullptr,
+                0,
+                nullptr,
+                SDC_APPLY | SDC_USE_DATABASE_CURRENT);
+        }
+    }
+}

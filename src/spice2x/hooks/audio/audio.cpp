@@ -1,0 +1,188 @@
+#include "audio.h"
+
+#include <vector>
+
+#include <windows.h>
+#include <initguid.h>
+#include <audioclient.h>
+#include <mmdeviceapi.h>
+
+#include "avs/game.h"
+#include "hooks/audio/backends/mmdevice/device_enumerator.h"
+#include "util/detour.h"
+#include "util/logging.h"
+#include "util/memutils.h"
+
+#include "audio_private.h"
+#include "acm.h"
+#include "asio_proxy.h"
+#include "xact.h"
+
+#ifdef _MSC_VER
+DEFINE_GUID(CLSID_MMDeviceEnumerator,
+    0xBCDE0395, 0xE52F, 0x467C,
+    0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E);
+#endif
+
+// {ef985e71-d5c7-42d4-ba4d-2d073e2e96f4}
+DEFINE_GUID(CLSID_DirectSoundI3DL2ReverbDMO,
+    0xef985e71, 0xd5c7, 0x42d4,
+    0xba, 0x4d, 0x2d, 0x07, 0x3e, 0x2e, 0x96, 0xf4);
+
+// {87fc0268-9a55-4360-95aa-004a1d9de26c}
+DEFINE_GUID(CLSID_DirectSoundWavesReverbDMO,
+    0x87fc0268, 0x9a55, 0x4360,
+    0x95, 0xaa, 0x00, 0x4a, 0x1d, 0x9d, 0xe2, 0x6c);
+
+// function pointers
+static decltype(CoCreateInstance) *CoCreateInstance_orig = nullptr;
+
+namespace hooks::audio {
+
+    // public globals
+    bool ENABLED = true;
+    bool VOLUME_HOOK_ENABLED = true;
+    std::optional<DownmixAlgorithm> DOWNMIX_ALGORITHM = std::nullopt;
+    float VOLUME_BOOST = 1.0f;
+    std::optional<uint32_t> RESAMPLE_RATE = std::nullopt;
+    std::optional<uint32_t> EXCLUSIVE_BUFFER_MS = std::nullopt;
+    bool WASAPI_COMPATIBILITY_MODE = false;
+    bool USE_DUMMY = false;
+    WAVEFORMATEXTENSIBLE FORMAT {};
+    std::optional<Backend> BACKEND = std::nullopt;
+    bool INJECT_FAKE_REALTEK_AUDIO = false;
+    std::optional<size_t> ASIO_DRIVER_ID = std::nullopt;
+    std::string ASIO_DRIVER_NAME = "";
+    bool ASIO_FORCE_UNLOAD_ON_STOP = false;
+
+    std::mutex INITIALIZE_LOCK; // for asio
+
+    IAudioClient *CLIENT = nullptr;
+    static std::mutex CLIENT_LOCK;
+    static bool CLIENT_STOPPING = false;
+
+    void set_active_client(IAudioClient *client, const char *source) {
+        IAudioClient *previous_client = nullptr;
+        {
+            std::lock_guard lock(CLIENT_LOCK);
+
+            if (CLIENT_STOPPING || CLIENT == client) {
+                return;
+            }
+            if (client) {
+                client->AddRef();
+            }
+
+            previous_client = CLIENT;
+            CLIENT = client;
+        }
+
+        if (previous_client) {
+            previous_client->Release();
+        }
+
+        if (client) {
+            log_info(
+                "audio",
+                "active client selected by {} after successful initialization",
+                source);
+        }
+    }
+}
+
+static HRESULT STDAPICALLTYPE CoCreateInstance_hook(
+    REFCLSID rclsid,
+    LPUNKNOWN pUnkOuter,
+    DWORD dwClsContext,
+    REFIID riid,
+    LPVOID *ppv)
+{
+
+    HRESULT ret;
+
+    // ASIO: if we already hold a cached instance for this CLSID, hand back a fresh
+    // wrapper over it instead of re-creating the real driver (see asio_proxy.cpp)
+    if (ppv != nullptr && hooks::audio::asio::is_asio_creation(rclsid, riid)) {
+        if (IUnknown *reused = hooks::audio::asio::wrap_existing(rclsid)) {
+            *ppv = reused;
+            return S_OK;
+        }
+    }
+
+    // call original
+    ret = CoCreateInstance_orig(rclsid, pUnkOuter, dwClsContext, riid, ppv);
+    if (FAILED(ret)) {
+        if (IsEqualCLSID(rclsid, CLSID_MMDeviceEnumerator)) {
+            log_warning("audio", "CoCreateInstance failed for CLSID_MMDeviceEnumerator, hr={}", FMT_HRESULT(ret));
+        } else if (IsEqualCLSID(rclsid, CLSID_DirectSoundI3DL2ReverbDMO)) {
+            // deal with reverb DMO missing from dsdmo.dll
+            // it usually fails with 0x80040154 (REGDB_E_CLASSNOTREG), but we have also seen 0x8007007e (ERROR_MOD_NOT_FOUND) 
+            static std::once_flag printed;
+            std::call_once(printed, [ret]() {
+                log_warning(
+                    "audio",
+                    "CoCreateInstance for CLSID_DirectSoundI3DL2ReverbDMO failed with {}, swap with CLSID_DirectSoundWavesReverbDMO...",
+                    FMT_HRESULT(ret));
+            });
+            ret = CoCreateInstance_orig(CLSID_DirectSoundWavesReverbDMO, pUnkOuter, dwClsContext, riid, ppv);
+            if (FAILED(ret)) {
+                log_warning("audio", "CoCreateInstance(CLSID_DirectSoundWavesReverbDMO...) failed, hr={}", FMT_HRESULT(ret));
+            }
+        }
+
+        return ret;
+    }
+
+    // check if this is the audio device enumerator
+    if (IsEqualCLSID(rclsid, CLSID_MMDeviceEnumerator)) {
+
+        // wrap object
+        auto mmde = reinterpret_cast<IMMDeviceEnumerator **>(ppv);
+        *mmde = new WrappedIMMDeviceEnumerator(*mmde);
+    } else if (ppv != nullptr && *ppv != nullptr && hooks::audio::asio::is_asio_creation(rclsid, riid)) {
+
+        // wrap every ASIO driver so calls pass through to the real driver
+        *ppv = hooks::audio::asio::wrap(rclsid, *ppv);
+    }
+
+    // return original result
+    return ret;
+}
+
+namespace hooks::audio {
+    void init() {
+        if (!ENABLED) {
+            return;
+        }
+
+        log_info("audio", "initializing");
+        init_low_latency();
+        hooks::audio::acm::init();
+
+        // general hooks
+        CoCreateInstance_orig = detour::iat_try("CoCreateInstance", CoCreateInstance_hook);
+        if (avs::game::is_model("PAN")) {
+            hooks::audio::xact::init();
+        }
+    }
+
+    void stop() {
+        log_info("audio", "stopping");
+        IAudioClient *client = nullptr;
+        {
+            std::lock_guard lock(CLIENT_LOCK);
+            CLIENT_STOPPING = true;
+            client = CLIENT;
+            CLIENT = nullptr;
+        }
+        if (client) {
+            client->Stop();
+            client->Release();
+        }
+        stop_low_latency();
+
+        // release the ASIO drivers we kept pinned for the process lifetime now that we are
+        // at a controlled shutdown point (see asio_proxy.cpp)
+        hooks::audio::asio::release_all_wrappers();
+    }
+}

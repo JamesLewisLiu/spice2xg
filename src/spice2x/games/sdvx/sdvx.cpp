@@ -1,0 +1,631 @@
+#include "sdvx.h"
+
+#include <external/robin_hood.h>
+
+#include "games/shared/lcdhandle.h"
+#include "games/io.h"
+#include "hooks/audio/audio.h"
+#include "hooks/graphics/graphics.h"
+#include "hooks/devicehook.h"
+#include "hooks/libraryhook.h"
+#ifdef SPICE64
+#include "hooks/graphics/nvapi_impl.h"
+#endif
+#include "hooks/graphics/nvapi_hook.h"
+#include "hooks/powrprof.h"
+#include "hooks/sleephook.h"
+#include "hooks/winuser.h"
+#include "launcher/options.h"
+#include "touch/touch.h"
+#include "util/deferlog.h"
+#include "util/detour.h"
+#include "util/logging.h"
+#include "util/sigscan.h"
+#include "util/socd_cleaner.h"
+#include "util/time.h"
+#include "util/libutils.h"
+#include "util/sysutils.h"
+#include "misc/eamuse.h"
+#include "misc/wintouchemu.h"
+#include "touch/native/nativetouchhook.h"
+#include "bi2x_hook.h"
+#include "camera.h"
+#include "io.h"
+#include "acioemu/handle.h"
+#include "cfg/configurator.h"
+#include "launcher/signal.h"
+
+static decltype(RegCloseKey) *RegCloseKey_orig = nullptr;
+static decltype(RegEnumKeyA) *RegEnumKeyA_orig = nullptr;
+static decltype(RegOpenKeyA) *RegOpenKeyA_orig = nullptr;
+static decltype(RegOpenKeyExA) *RegOpenKeyExA_orig = nullptr;
+static decltype(RegQueryValueExA) *RegQueryValueExA_orig = nullptr;
+
+namespace games::sdvx {
+
+    // constants
+    const HKEY PARENT_ASIO_REG_HANDLE = reinterpret_cast<HKEY>(0x3001);
+    const HKEY DEVICE_ASIO_REG_HANDLE = reinterpret_cast<HKEY>(0x3002);
+    const char *ORIGINAL_ASIO_DEVICE_NAME = "XONAR SOUND CARD(64)";
+
+    // settings
+    uint8_t DIGITAL_KNOB_SENS = 16;
+    SdvxOverlayPosition OVERLAY_POS = SDVX_OVERLAY_BOTTOM;
+    bool ENABLE_COM_PORT_SCAN_HOOK = false;
+
+    bool USE_ASIO = false;
+    std::optional<std::string> ASIO_DRIVER = std::nullopt;
+
+    // states
+    bool SHOW_VM_MONITOR_WARNING = false;
+    static HKEY real_asio_reg_handle = nullptr;
+    static HKEY real_asio_device_reg_handle = nullptr;
+
+    tapeledutils::tape_led TAPELED_MAPPING[SDVX_TAPELED_TOTAL] = {
+        { 74, Lights::TITLE_AVG_R, Lights::TITLE_AVG_G, Lights::TITLE_AVG_B, "Title" },
+        { 12, Lights::UPPER_LEFT_SPEAKER_AVG_R, Lights::UPPER_LEFT_SPEAKER_AVG_G, Lights::UPPER_LEFT_SPEAKER_AVG_B, "Upper Left Speaker" },
+        { 12, Lights::UPPER_RIGHT_SPEAKER_AVG_R, Lights::UPPER_RIGHT_SPEAKER_AVG_G, Lights::UPPER_RIGHT_SPEAKER_AVG_B, "Upper Right Speaker" },
+        { 56, Lights::LEFT_WING_AVG_R, Lights::LEFT_WING_AVG_G, Lights::LEFT_WING_AVG_B, "Left Wing" },
+        { 56, Lights::RIGHT_WING_AVG_R, Lights::RIGHT_WING_AVG_G, Lights::RIGHT_WING_AVG_B, "Right Wing" },
+        { 94, Lights::CONTROL_PANEL_AVG_R, Lights::CONTROL_PANEL_AVG_G, Lights::CONTROL_PANEL_AVG_B, "Control Panel" },
+        { 12, Lights::LOWER_LEFT_SPEAKER_AVG_R, Lights::LOWER_LEFT_SPEAKER_AVG_G, Lights::LOWER_LEFT_SPEAKER_AVG_B, "Lower Left Speaker" },
+        { 12, Lights::LOWER_RIGHT_SPEAKER_AVG_R, Lights::LOWER_RIGHT_SPEAKER_AVG_G, Lights::LOWER_RIGHT_SPEAKER_AVG_B, "Lower Right Speaker" },
+        { 14, Lights::WOOFER_AVG_R, Lights::WOOFER_AVG_G, Lights::WOOFER_AVG_B, "Woofer" },
+        { 86, Lights::V_UNIT_AVG_R, Lights::V_UNIT_AVG_G, Lights::V_UNIT_AVG_B, "V Unit" },
+    };
+
+    static LONG WINAPI RegOpenKeyA_hook(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult) {
+        if (lpSubKey != nullptr &&
+            phkResult != nullptr &&
+            hKey == HKEY_LOCAL_MACHINE &&
+            _stricmp(lpSubKey, "software\\asio") == 0) {
+
+            // prevent the game from randomly picking an ASIO device
+            if (!USE_ASIO) {
+                return ERROR_FILE_NOT_FOUND;
+            }
+            // convince the game to use our hook (so we can swap in the preferred device)
+            if (ASIO_DRIVER.has_value()) {
+                *phkResult = PARENT_ASIO_REG_HANDLE;
+                return RegOpenKeyA_orig(hKey, lpSubKey, &real_asio_reg_handle);
+            }
+        }
+
+        return RegOpenKeyA_orig(hKey, lpSubKey, phkResult);
+    }
+
+    static LONG WINAPI RegOpenKeyExA_hook(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired,
+            PHKEY phkResult)
+    {
+        // ASIO hook
+        if (lpSubKey != nullptr && phkResult != nullptr) {
+            if (hKey == PARENT_ASIO_REG_HANDLE &&
+                    ASIO_DRIVER.has_value() &&
+                    _stricmp(lpSubKey, ORIGINAL_ASIO_DEVICE_NAME) == 0)
+            {
+                *phkResult = DEVICE_ASIO_REG_HANDLE;
+
+                log_info("sdvx::asio", "replacing '{}' with '{}'", lpSubKey, ASIO_DRIVER.value());
+                const auto result = RegOpenKeyExA_orig(
+                        real_asio_reg_handle,
+                        ASIO_DRIVER.value().c_str(),
+                        ulOptions,
+                        samDesired,
+                        &real_asio_device_reg_handle);
+
+                if (result != ERROR_SUCCESS) {
+                    log_warning(
+                        "sdvx::asio",
+                        "failed to open registry subkey '{}', error=0x{:x}",
+                        ASIO_DRIVER.value().c_str(), result);
+                    log_warning(
+                        "sdvx::asio",
+                        "due to improper ASIO setting, game will likely fall back to WASAPI; double check -sdvxasio and the registry",
+                        ASIO_DRIVER.value().c_str(), result);
+                }
+
+                return result;
+            }
+        }
+
+        // COM hook
+        if (ENABLE_COM_PORT_SCAN_HOOK &&
+            lpSubKey != nullptr && phkResult != nullptr &&
+	        _stricmp(lpSubKey, "HARDWARE\\DEVICEMAP\\SERIALCOMM") == 0) {
+            log_info("sdvx::io", "hook access to HKLM\\HARDWARE\\DEVICEMAP\\SERIALCOMM to force COM1 ICCA");
+            return ERROR_FILE_NOT_FOUND;
+        }
+
+        return RegOpenKeyExA_orig(hKey, lpSubKey, ulOptions, samDesired, phkResult);
+    }
+
+    static LONG WINAPI RegEnumKeyA_hook(HKEY hKey, DWORD dwIndex, LPSTR lpName, DWORD cchName) {
+        if (hKey == PARENT_ASIO_REG_HANDLE && ASIO_DRIVER.has_value()) {
+            if (dwIndex == 0) {
+                auto ret = RegEnumKeyA_orig(real_asio_reg_handle, dwIndex, lpName, cchName);
+
+                if (ret == ERROR_SUCCESS && lpName != nullptr) {
+                    log_info("sdvx::asio", "stubbing '{}' with '{}'", lpName, ORIGINAL_ASIO_DEVICE_NAME);
+
+                    strncpy(lpName, ORIGINAL_ASIO_DEVICE_NAME, cchName);
+                }
+
+                return ret;
+            } else {
+                return ERROR_NO_MORE_ITEMS;
+            }
+        }
+
+        return RegEnumKeyA_orig(hKey, dwIndex, lpName, cchName);
+    }
+
+    static LONG WINAPI RegQueryValueExA_hook(HKEY hKey, LPCTSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType,
+            LPBYTE lpData, LPDWORD lpcbData)
+    {
+        if (lpValueName != nullptr && lpData != nullptr && lpcbData != nullptr) {
+            if (hKey == DEVICE_ASIO_REG_HANDLE && ASIO_DRIVER.has_value()) {
+                log_info("sdvx::asio", "RegQueryValueExA({}, \"{}\")", fmt::ptr((void *) hKey), lpValueName);
+
+                if (_stricmp(lpValueName, "Description") == 0) {
+                    // sdvx does a comparison against hardcoded string "XONAR SOUND CARD(64)" (same as iidx31)
+                    // so what's in the registry must be overridden with "XONAR SOUND CARD(64)"
+                    // otherwise you end up with this error: M:BMSoundLib: ASIODriver: No such driver
+                    memcpy(lpData, ORIGINAL_ASIO_DEVICE_NAME, strlen(ORIGINAL_ASIO_DEVICE_NAME) + 1);
+
+                    return ERROR_SUCCESS;
+                } else {
+                    hKey = real_asio_device_reg_handle;
+                }
+            }
+        }
+
+        // fallback
+        return RegQueryValueExA_orig(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
+    }
+
+    static LONG WINAPI RegCloseKey_hook(HKEY hKey) {
+        if (hKey == PARENT_ASIO_REG_HANDLE || hKey == DEVICE_ASIO_REG_HANDLE) {
+            return ERROR_SUCCESS;
+        }
+
+        return RegCloseKey_orig(hKey);
+    }
+
+    SDVXGame::SDVXGame() : Game("Sound Voltex") {
+    }
+
+    static LPWSTR __stdcall GetCommandLineW_hook() {
+        static std::wstring lp_args = L"bootstrap.exe prop\\bootstrap.xml";
+        return lp_args.data();
+    }
+
+#ifdef SPICE64
+    static bool sdvx64_spam_remover(void *user, const std::string &data, logger::Style style, std::string &out) {
+        if (data.empty() || data[0] != '[') {
+            return false;
+        }
+        if (data.find("W:afpu-package: XE592acd000040 texture id invalid") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("W:afpu-package: XE592acd000042 texture id invalid") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("W:CTexture: no such texture: id 0") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("M:autoDj: DEF phrase ") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("W:afp-access: afp_mc_deep_goto_play frame no error") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("W:afputils: CDirectX::SetRenderState") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("W:CameraTexture: Camera error was detected. (err,detail) = (0,0)") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        // M:AppConfig: [env/APPDATA]=C:\Users\username\AppData\Roaming
+        if (data.find("M:AppConfig: [env/") != std::string::npos) {
+            out = "";
+            return true;
+        }
+        if (data.find("SuperstepSound: Audio device is not available") != std::string::npos) {
+            deferredlogs::defer_error_messages(deferredlogs::SUPERSTEP_SOUND_ERROR_MESSAGE);
+            return false;
+        }
+        if (data.find("W:ea3-pos: ea3_report_posev: no such node:") != std::string::npos) {
+            deferredlogs::defer_error_messages({
+                "bad prop\\ea3-config.xml detected by game",
+                std::string("    ") +  data,
+                "    this will most likely cause Server Busy errors in certain conditions",
+                "    follow the FAQ to fix your ea3-config.xml and try again"
+            });
+            return false;
+        }
+
+        static bool logged_missing_layer_error = false;
+        // this is raw SHIFT-JIS text for
+        // W:BM2D: CreateLayer() 指定したレイヤーは存在しません
+        if (!logged_missing_layer_error &&
+            data.find(
+                "\x57\x3A\x42\x4D\x32\x44\x3A\x20\x43\x72\x65\x61\x74\x65\x4C\x61\x79\x65\x72\x28\x29\x20"
+                "\x8E\x77\x92\xE8\x82\xB5\x82\xBD\x83\x8C\x83\x43\x83\x84\x81\x5B\x82\xCD\x91\xB6\x8D\xDD"
+                "\x82\xB5\x82\xDC\x82\xB9\x82\xF1") != std::string::npos) {
+
+            logged_missing_layer_error = true;
+            deferredlogs::defer_error_messages({
+                "sdvx game engine detected missing or corrupt file(s); raw SHIFT-JIS error was:",
+                std::string("    ") +  data,
+                "    this will almost certainly cause your game to crash",
+                "    this is often caused by mismatched game DLLs or missing resources from game updates",
+                "    double check the integrity of your game data and try again"
+            });
+            return false;
+        }
+
+        return false;
+    }
+
+    void SDVXGame::detect_sound_output_device() {
+        USE_ASIO = false;
+        // if the user specified a value for -sdvxasio, use asio
+        if (ASIO_DRIVER.has_value()) {
+            log_misc(
+                "sdvx",
+                "-sdvxasio is set to \"{}\"", ASIO_DRIVER.value());
+            USE_ASIO = true;
+        } else {
+            // see if XONAR AE is present; if so, use that
+            HKEY subkey;
+            LSTATUS result;
+            result = RegOpenKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO\\XONAR SOUND CARD(64)", &subkey);
+            if (result == ERROR_SUCCESS) {
+                RegCloseKey(subkey);
+                USE_ASIO = true;
+                log_misc(
+                    "sdvx",
+                    "found HKLM\\SOFTWARE\\ASIO\\XONAR SOUND CARD(64)");
+            }
+        }
+        if (!USE_ASIO) {
+            log_misc("sdvx", "asio not configured");
+        }
+    }
+
+    typedef void **(__fastcall *volume_set_t)(uint64_t, uint64_t, uint64_t);
+    static volume_set_t volume_set_orig = nullptr;
+    static void **__fastcall volume_set_hook(uint64_t vol_sound, uint64_t vol_woofer, uint64_t vol_headphone) {
+
+        // volume level conversion tables
+        static uint8_t SOUND_VOLUMES[] = {
+                4, 55, 57, 59, 61, 63, 65, 67, 69, 71,
+                73, 75, 77, 78, 79, 80, 81, 82, 83, 84,
+                85, 86, 87, 88, 89, 90, 91, 92, 93, 95, 96,
+        };
+        static uint8_t WOOFER_VOLUMES[] = {
+                4, 70, 72, 73, 74, 75, 76, 77, 79, 80,
+                81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+                91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 100,
+        };
+        static uint8_t HEADPHONE_VOLUMES[] = {
+                4, 60, 62, 64, 66, 68, 70, 72, 76, 78,
+                80, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+                91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 100,
+        };
+
+        // apply volumes
+        auto &format = hooks::audio::FORMAT.Format;
+        auto &lights = games::sdvx::get_lights();
+        if (format.nChannels == 6 || vol_sound != 30) {
+            if (vol_sound < std::size(SOUND_VOLUMES) && vol_sound != 30) {
+                float value = (float) SOUND_VOLUMES[vol_sound] * 0.01f;
+                GameAPI::Lights::writeLight(RI_MGR, lights[Lights::VOLUME_SOUND], value);
+            }
+        }
+        if (vol_woofer < std::size(WOOFER_VOLUMES)) {
+            float value = (float) WOOFER_VOLUMES[vol_woofer] * 0.01f;
+            GameAPI::Lights::writeLight(RI_MGR, lights[Lights::VOLUME_WOOFER], value);
+        }
+        if (vol_headphone < std::size(HEADPHONE_VOLUMES)) {
+            float value = (float) HEADPHONE_VOLUMES[vol_headphone] * 0.01f;
+            GameAPI::Lights::writeLight(RI_MGR, lights[Lights::VOLUME_HEADPHONE], value);
+        }
+
+        // call original function to set volumes for the 6ch mode
+        return volume_set_orig(format.nChannels == 6 ? vol_sound : 30, vol_woofer, vol_headphone);
+    }
+#endif
+
+    void SDVXGame::pre_attach() {
+        // for whatever reason, sdvx latches onto cards for much longer than other games
+        // needed because the game waits forever on the game over screen until a card is not detected
+        AUTO_INSERT_CARD_COOLDOWN = 15.f;
+        // check bad model name
+        if (!cfg::CONFIGURATOR_STANDALONE && avs::game::is_model("UFC")) {
+            log_warning(
+                "sdvx",
+                "BAD MODEL NAME ERROR\n\n\n"
+                "!!! model name set to UFC, this is WRONG and will break your game !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! If you are trying to boot Valkyrie Model,                     !!!\n"
+                "!!! change <spec> from F to G.                                    !!!\n"
+                "!!!                                                               !!!\n"
+                "!!! model name set to UFC, this is WRONG and will break your game !!!\n\n\n"
+                );
+            log_fatal(
+                "sdvx",
+                "BAD MODEL NAME ERROR - model name set to UFC, must be KFC instead");
+        }
+
+#ifdef SPICE64 // SDVX5+ specific code
+        // check -dxmainadapter + UFC mode
+        if (!GRAPHICS_WINDOWED && D3D9_ADAPTER.has_value() && is_valkyrie_model()) {
+            SHOW_VM_MONITOR_WARNING = true;
+            log_warning(
+                "sdvx",
+                "\n\n"
+                "!!! using -dxmainadapter option with Valkyrie mode is NOT          !!!\n"
+                "!!! recommended due to known compatibility issues with the game     !!!\n"
+                "!!!                                                                 !!!\n"
+                "!!!   * game may launch in wrong resolution or refresh rate         !!!\n"
+                "!!!   * touch / mouse input may stop working in subscreen / overlay !!!\n"
+                "!!!                                                                 !!!\n"
+                "!!! recommendation is to use the Change Main Monitor (-mainmonitor) !!!\n"
+                "!!! option instead of -dxmainadapter                                !!!\n\n"
+                );
+
+            deferredlogs::defer_error_messages({
+                "-dxmainadapter option is NOT recommended when running with Valkyrie mode",
+                "    due to known compatibility issues with the game:",
+                "      * game may launch in wrong resolution or refresh rate",
+                "      * touch / mouse input may stop working in subscreen / overlay",
+                "    use Change Main Monitor (-mainmonitor) option instead"
+                });
+        }
+#endif
+
+#ifdef SPICE64
+        this->detect_sound_output_device();
+#endif
+
+        // SOCD
+        auto options = games::get_options(eamuse_get_game());
+        socd::ALGORITHM = socd::SocdAlgorithm::PreferRecent;
+        if (options->at(launcher::Options::SDVXDigitalKnobSocd).is_active()) {
+            if (options->at(launcher::Options::SDVXDigitalKnobSocd).value_text() == "neutral") {
+                socd::ALGORITHM = socd::SocdAlgorithm::Neutral;
+            } else if (options->at(launcher::Options::SDVXDigitalKnobSocd).value_text() == "last") {
+                socd::ALGORITHM = socd::SocdAlgorithm::PreferRecent;
+            }
+        }
+    }
+    
+    void SDVXGame::attach() {
+        Game::attach();
+
+#ifdef SPICE64 // SDVX5+ specific code
+
+        // LCD handle
+        if (!is_valkyrie_model()) {
+            devicehook_init();
+            devicehook_add(new games::shared::LCDHandle());
+        }
+#else
+        devicehook_init();
+        devicehook_add(new games::shared::LCDHandle());
+#endif
+        hooks::sleep::init(1000, 1);
+
+        // hooks for chinese SDVX
+        if (libutils::try_module("unisintr.dll")) {
+            detour::iat_try("GetCommandLineW", GetCommandLineW_hook);
+
+            // skip 30 second timeout after NETWORK DEVICE check
+            replace_pattern(
+                    avs::game::DLL_INSTANCE,
+                    "89F528003D????0000",
+                    "89F528003D01000000",
+                    0, 0);
+        }
+
+#ifdef SPICE64 // SDVX5+ specific code
+
+        // check for new I/O DLL
+        auto aio = libutils::try_library("libaio.dll");
+        if (aio != nullptr) {
+
+            // enable 9on12 for AMD
+            const auto nvapi = libutils::try_library("nvapi64.dll");
+            if (nvapi == nullptr) {
+                log_info(
+                    "sdvx",
+                    "nvapi64.dll not found; for non-NVIDIA GPUs, requesting 9on12 to be enabled");
+                GRAPHICS_9_ON_12_REQUESTED_BY_GAME = true;
+            }
+
+            if (nvapi_hook::BYPASS_NVAPI || nvapi == nullptr) {
+                const uint32_t main_refresh_hz = GRAPHICS_FORCE_REFRESH > 0 ?
+                    GRAPHICS_FORCE_REFRESH : (is_valkyrie_model() ? 120 : 60);
+                const uint32_t sub_refresh_hz = GRAPHICS_FORCE_REFRESH_SUB.value_or(60);
+                if (!nvapi_impl::initialize(
+                        avs::game::DLL_INSTANCE,
+                        main_refresh_hz,
+                        sub_refresh_hz)) {
+                    log_warning("sdvx", "failed to initialize synthetic NVAPI");
+                }
+            } else {
+                // don't let nvapi mess with display settings
+                nvapi_hook::initialize(avs::game::DLL_INSTANCE);
+            }
+
+            if (is_valkyrie_model()) {
+                const auto native_touch_ready = !wintouchemu::FORCE &&
+                    nativetouch::hook(avs::game::DLL_INSTANCE);
+                if (!native_touch_ready) {
+                    wintouchemu::FORCE = true;
+                    if (!GRAPHICS_WINDOWED) {
+                        wintouchemu::INJECT_MOUSE_AS_WM_TOUCH = true;
+                        wintouchemu::hook_title_ends(
+                            "SOUND VOLTEX",
+                            "Main Screen",
+                            avs::game::DLL_INSTANCE);
+                    }
+                }
+
+                // insert BI2X hooks
+                bi2x_hook_init();
+
+                // add card readers
+                devicehook_init(aio);
+                devicehook_add(new acioemu::ACIOHandle(L"COM1"));
+
+                // this is needed because on some newer versions of SDVX6, soundvoltex.dll will open
+                // HKLM\HARDWARE\DEVICEMAP\SERIALCOMM, go through some of the keys, and depending on
+                // what is present, pick a port other than COM1 (seemingly the highest port
+                // available). We want the game to pick COM1 still, so a workaround is needed to
+                // fool the game.
+                ENABLE_COM_PORT_SCAN_HOOK = true;
+            }
+        }
+        
+#endif
+
+        // ASIO device hook
+        RegCloseKey_orig = detour::iat_try(
+                "RegCloseKey", RegCloseKey_hook, avs::game::DLL_INSTANCE);
+        RegEnumKeyA_orig = detour::iat_try(
+                "RegEnumKeyA", RegEnumKeyA_hook, avs::game::DLL_INSTANCE);
+        RegOpenKeyA_orig = detour::iat_try(
+                "RegOpenKeyA", RegOpenKeyA_hook, avs::game::DLL_INSTANCE);
+        RegOpenKeyExA_orig = detour::iat_try(
+                "RegOpenKeyExA", RegOpenKeyExA_hook, avs::game::DLL_INSTANCE);
+        RegQueryValueExA_orig = detour::iat_try(
+                "RegQueryValueExA", RegQueryValueExA_hook, avs::game::DLL_INSTANCE);
+
+#ifdef SPICE64
+        powrprof_hook_init(avs::game::DLL_INSTANCE);
+        winuser_hook_init(avs::game::DLL_INSTANCE);
+
+        // hook camera
+        camera_init();
+
+        // RGB CAMERA error ignore for SDVX5
+        // SDVX5: boot sequence triggers camera error if camera is not detected
+        // SDVX6: boots fine, but game title screen in attract loop will have camera error (cosmetic only)
+        if (replace_pattern(
+                avs::game::DLL_INSTANCE,
+                "418D480484C074218D51FD",
+                "????????????9090??????",
+                0, 0)) {
+            log_info("sdvx", "applied camera error patch (sdvx5)");
+        }
+
+        // remove log spam
+        logger::hook_add(sdvx64_spam_remover, nullptr);
+
+        if (is_valkyrie_model()) {
+            sysutils::hook_EnumDisplayDevicesA();
+        }
+#endif
+    }
+
+    void SDVXGame::post_attach() {
+        Game::post_attach();
+
+#ifdef SPICE64 // SDVX5+ specific code
+
+        /*
+         * Volume Hook
+         *
+         * How to find the correct RVA:
+         *
+         * Method 1 (older versions):
+         * Search for byte sequence 48 8B C4 48 81 EC 88 00 00 00 80 3D
+         *
+         * Method 2 (older versions):
+         * 1. search for ac_io_bi2a_set_amp_volume
+         * 2. move one function up (function where it does some calculations, that's ours)
+         * 3. take the *file offset* of the *first* instruction of this function
+         *
+         * Method 3:
+         * Search for the function with the 3 arguments which is being called from the sound options.
+         * It is pretty obvious which one it is because it checks all 3 args to be <= 30.
+         */
+        static const robin_hood::unordered_map<std::string, intptr_t> VOLUME_HOOKS {
+                { "2019100800", 0x414ED0 },
+                { "2020011500", 0x417090 },
+                { "2020022700", 0x4281A0 },
+                { "2020122200", 0x40C030 },
+                { "2021042800", 0x096EB0 },
+                { "2021051802", 0x097930 },
+                { "2021083100", 0x096E20 },
+                { "2021102000", 0x097230 },
+                { "2021121400", 0x09AD00 },
+        };
+
+        bool volume_hook_found = false;
+        for (auto &[datecode, rva] : VOLUME_HOOKS) {
+            if (avs::game::is_ext(datecode.c_str())) {
+
+                // calculate target RVA
+                auto volume_set_rva = libutils::offset2rva(MODULE_PATH / avs::game::DLL_NAME, rva);
+                if (volume_set_rva == -1) {
+                    log_info("sdvx", "could not apply volume hook patch (convert rva {})", rva);
+                    break;
+                }
+
+                // convert RVA to real target
+                auto *volume_set_ptr = reinterpret_cast<uint16_t *>(
+                        reinterpret_cast<intptr_t>(avs::game::DLL_INSTANCE) + volume_set_rva);
+                if (volume_set_ptr[0] != 0x8B48) {
+                    log_info("sdvx", "could not apply volume hook patch (invalid target)", rva);
+                    break;
+                }
+
+                // insert trampoline
+                if (!detour::trampoline(
+                            reinterpret_cast<volume_set_t>(volume_set_ptr),
+                            volume_set_hook,
+                            &volume_set_orig))
+                {
+                    log_info("sdvx", "could not apply volume hook patch (insert trampoline)", rva);
+                }
+
+                // success
+                volume_hook_found = true;
+                break;
+            }
+        }
+
+        // check if version not found
+        if (!volume_hook_found) {
+            log_info("sdvx", "volume hook unavailable for this game version");
+
+            // set volumes to sdvx 4 defaults
+            auto &lights = games::sdvx::get_lights();
+            GameAPI::Lights::writeLight(RI_MGR, lights[games::sdvx::Lights::VOLUME_SOUND],
+                    (100 - 15) / 100.f);
+            GameAPI::Lights::writeLight(RI_MGR, lights[games::sdvx::Lights::VOLUME_HEADPHONE],
+                    (100 - 9) / 100.f);
+            GameAPI::Lights::writeLight(RI_MGR, lights[games::sdvx::Lights::VOLUME_EXTERNAL],
+                    (100 - 96) / 100.f);
+            GameAPI::Lights::writeLight(RI_MGR, lights[games::sdvx::Lights::VOLUME_WOOFER],
+                    (100 - 9) / 100.f);
+        }
+#endif
+    }
+
+    void SDVXGame::detach() {
+        Game::detach();
+
+        devicehook_dispose();
+    }
+}

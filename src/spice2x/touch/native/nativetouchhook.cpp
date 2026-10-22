@@ -1,0 +1,281 @@
+// enable touch functions - set version to windows 7
+// mingw otherwise doesn't load touch stuff
+#define _WIN32_WINNT 0x0601
+
+#include <atomic>
+
+#include "nativetouchhook.h"
+#include "avs/game.h"
+#include "rawinput/touch.h"
+#include "inject.h"
+#include "inject_internal.h"
+#include "settings.h"
+#include "transform.h"
+
+#include "util/detour.h"
+#include "util/logging.h"
+
+#define TOUCH_SIMULATE_FAT_FINGERS 0
+#define TOUCH_DEBUG_VERBOSE 0
+
+#if TOUCH_DEBUG_VERBOSE
+#define log_debug(module, format_str, ...) logger::push( \
+    LOG_FORMAT("M", module, format_str, ## __VA_ARGS__), logger::Style::GREY)
+#else
+#define log_debug(module, format_str, ...)
+#endif
+
+namespace nativetouch {
+
+    namespace settings {
+        bool EMULATE_DIGITIZER = false;
+        bool REFRESH_CONTACT_LIFETIME_FROM_GAME_LOOP = false;
+        bool SYNTHETIC_TOUCH_USES_CLIENT_COORDINATES = false;
+    }
+
+    static decltype(GetSystemMetrics) *GetSystemMetrics_orig = nullptr;
+    static decltype(GetTouchInputInfo) *GetTouchInputInfo_orig = nullptr;
+    static std::atomic<TouchInputFilter> touch_input_filter { nullptr };
+    static bool native_touch_hooked = false;
+    static bool native_display_initialized = false;
+    static DWORD native_display_orientation = DMDO_DEFAULT;
+    static long native_display_size_x = 1920L;
+    static long native_display_size_y = 1080L;
+
+    static void initialize_game_settings() {
+        const auto is_pan = avs::game::is_model("PAN");
+        settings::EMULATE_DIGITIZER = is_pan;
+
+        // PAN samples and clears touch events in its I/O update loop. Window-timer updates
+        // made stationary holds flicker while movement updates remained stable, so refresh
+        // the native contact from ac_io_update instead of using the generic mouse timer.
+        settings::REFRESH_CONTACT_LIFETIME_FROM_GAME_LOOP = is_pan;
+
+        // translate native touch between desktop and game-window client coordinates
+        settings::SYNTHETIC_TOUCH_USES_CLIENT_COORDINATES = is_pan;
+    }
+
+    static int WINAPI GetSystemMetricsHook(int index) {
+        if (index == SM_DIGITIZER) {
+            return NID_INTEGRATED_TOUCH | NID_EXTERNAL_TOUCH |
+                NID_MULTI_INPUT | NID_READY;
+        }
+
+        return GetSystemMetrics_orig(index);
+    }
+
+    static void update_native_display_mode() {
+        RECT display_rect{};
+        if (GetWindowRect(GetDesktopWindow(), &display_rect)) {
+            native_display_size_x = display_rect.right - display_rect.left;
+            native_display_size_y = display_rect.bottom - display_rect.top;
+        }
+
+        DEVMODE display_mode{};
+        display_mode.dmSize = sizeof(display_mode);
+        if (EnumDisplaySettingsEx(nullptr, ENUM_CURRENT_SETTINGS, &display_mode, EDS_RAWMODE) &&
+            (display_mode.dmFields & DM_DISPLAYORIENTATION)) {
+            native_display_orientation = display_mode.dmDisplayOrientation;
+        } else {
+            log_info("touch::native", "failed to determine monitor orientation");
+        }
+
+        log_info(
+            "touch::native", "primary display mode: {}x{}, orientation {}",
+            native_display_size_x,
+            native_display_size_y,
+            native_display_orientation);
+    }
+
+    static void strip_contact_size(PTOUCHINPUT point) {
+
+#if TOUCH_SIMULATE_FAT_FINGERS
+        point->dwMask |= 0x004;
+        point->cxContact = 80 * 100;
+        point->cyContact = 60 * 100;
+#endif
+
+        // most monitors do not set TOUCHEVENTFMASK_CONTACTAREA, but for
+        // monitors that do set it, IIDX can get very confused (SDVX is not
+        // affected)
+        //
+        // while the test menu and the touch "glow" seem to work properly,
+        // interacting with subscreen menu items or entering PIN becomes
+        // very unpredictable
+        //
+        // to fix this, simply remove the contact area width and height
+        // 
+        // note: test menu > I/O > touch test  gives 5 numbers:
+        //       n: x, y, w, h
+        //       where 
+        //       n is the nth touch input since boot
+        //       x, y are coordinates (center of finger)
+        //       w, h are contact width and height
+        //
+        // when TOUCHEVENTFMASK_CONTACTAREA is not set, w/h will
+        // automatically be seen as 1x1, which works perfectly fine
+
+        log_debug(
+            "touch::native",
+            "[{}, {}] dwMask = 0x{:x}, cxContact = {}, cyContact = {}",
+            point->x / 100,
+            point->y / 100,
+            point->dwMask,
+            point->cxContact,
+            point->cyContact);
+
+        point->dwMask &= ~(0x004ul); // clear TOUCHEVENTFMASK_CONTACTAREA 
+        point->cxContact = 0;
+        point->cyContact = 0;
+    }
+
+    static void flip_touch_points(PTOUCHINPUT point) {
+        point->x = native_display_size_x * 100 - point->x;
+        point->y = native_display_size_y * 100 - point->y;
+    }
+
+    static BOOL WINAPI GetTouchInputInfoHook(
+        HTOUCHINPUT hTouchInput, UINT cInputs, PTOUCHINPUT pInputs, int cbSize) {
+
+        // refresh after exclusive fullscreen establishes the final display mode
+        if (!native_display_initialized) {
+            update_native_display_mode();
+            native_display_initialized = true;
+        }
+
+        // call the original first
+        const auto result = GetTouchInputInfo_orig(hTouchInput, cInputs, pInputs, cbSize);
+        if (result == 0) {
+            return result;
+        }
+
+        bool flip_hardware_touch = false;
+        if (avs::game::is_model("KFC")) {
+            log_debug(
+                "touch::native", "orientation = {}, display size = {}x{}",
+                native_display_orientation,
+                native_display_size_x,
+                native_display_size_y);
+            if (native_display_orientation == DMDO_270) {
+                flip_hardware_touch = true;
+            }
+        }
+
+        for (size_t i = 0; i < cInputs; i++) {
+            PTOUCHINPUT point = &pInputs[i];
+
+            const auto synthetic = inject::transform_touch_input(point);
+
+            if (avs::game::is_model("LDJ")) {
+                strip_contact_size(point);
+            }
+
+            const auto flip_values = !synthetic &&
+                (rawinput::touch::INVERTED ^ flip_hardware_touch);
+            if (flip_values) {
+                flip_touch_points(point);
+            }
+            if (!synthetic) {
+                POINT position { point->x / 100, point->y / 100 };
+                const auto transform_result =
+                    transform::hardware_to_game(&position);
+                if (transform_result == transform::Result::Transformed) {
+                    point->x = position.x * 100;
+                    point->y = position.y * 100;
+                } else if (transform_result == transform::Result::Rejected &&
+                    !(point->dwFlags & TOUCHEVENTF_UP)) {
+                    // suppress rejected contacts, but preserve UP to release an active touch ID
+                    point->dwFlags = 0;
+                }
+            }
+
+            const auto filter = touch_input_filter.load(std::memory_order_acquire);
+            if (point->dwFlags != 0 && filter != nullptr) {
+                const NativeTouchEvent event {
+                    .id = point->dwID,
+                    .x = point->x / 100,
+                    .y = point->y / 100,
+                    .down = (point->dwFlags & TOUCHEVENTF_DOWN) != 0,
+                    .move = (point->dwFlags & TOUCHEVENTF_MOVE) != 0,
+                    .up = (point->dwFlags & TOUCHEVENTF_UP) != 0,
+                    .synthetic = synthetic,
+                };
+                if (filter(event)) {
+                    point->dwFlags = 0;
+                }
+            }
+        }
+        
+        return result;
+    }
+
+    bool is_hooked() {
+        return native_touch_hooked;
+    }
+
+    void set_input_filter(TouchInputFilter filter) {
+        touch_input_filter.store(filter, std::memory_order_release);
+    }
+
+    void refresh_contact_lifetime() {
+        if (settings::REFRESH_CONTACT_LIFETIME_FROM_GAME_LOOP) {
+            inject::refresh_contact_lifetime();
+        }
+    }
+
+    static bool hook_prerequisites_available(HMODULE module) {
+        if (detour::iat_find("GetTouchInputInfo", module) == nullptr) {
+            log_warning("touch::native", "GetTouchInputInfo unavailable");
+            return false;
+        }
+        if (settings::EMULATE_DIGITIZER &&
+            detour::iat_find("GetSystemMetrics", module) == nullptr) {
+            log_warning("touch::native", "GetSystemMetrics unavailable");
+            return false;
+        }
+        return true;
+    }
+
+    bool hook(HMODULE module) {
+        native_touch_hooked = false;
+        initialize_game_settings();
+
+        // check if the OS supports touch API (Win7+) and injection API (requires Win8+)
+        if (!hook_prerequisites_available(module)) {
+            return false;
+        }
+        if (!inject::hook_available(module)) {
+            return false;
+        }
+
+        // try hooking injection API first since they require the highest OS level
+        // (WINE specifically did not implement this in 2026)
+        if (!inject::hook(module)) {
+            return false;
+        }
+
+        // GetSystemMetrics
+        if (settings::EMULATE_DIGITIZER) {
+            GetSystemMetrics_orig = detour::iat_try(
+                "GetSystemMetrics", GetSystemMetricsHook, module);
+            if (GetSystemMetrics_orig == nullptr) {
+                log_warning("touch::native", "failed to hook GetSystemMetrics");
+                return false;
+            }
+            log_misc("touch::native", "GetSystemMetrics hooked");
+        }
+
+        // GetTouchInputInfo
+        GetTouchInputInfo_orig = detour::iat_try("GetTouchInputInfo", GetTouchInputInfoHook, module);
+        if (GetTouchInputInfo_orig == nullptr) {
+            log_warning("touch::native", "failed to hook GetTouchInputInfo");
+            return false;
+        }
+        log_misc("touch::native", "GetTouchInputInfo hooked");
+        
+        native_touch_hooked = true;
+        return true;
+    }
+
+}
+ 

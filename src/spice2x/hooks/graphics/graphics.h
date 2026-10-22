@@ -1,0 +1,200 @@
+#pragma once
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
+#include <optional>
+#include <cstdint>
+
+#include <windows.h>
+#include <d3d9.h>
+#if !SPICE_XP
+#include <dwmapi.h>
+#endif
+
+// order must match spice2x_AutoOrientation UI enum order
+enum graphics_orientation {
+    ORIENTATION_CW = 0,
+    ORIENTATION_CCW = 1,
+    ORIENTATION_NORMAL = 2,
+    ORIENTATION_FLIPPED = 3
+};
+
+enum graphics_dx9on12_state {
+    DX9ON12_AUTO,
+    DX9ON12_FORCE_OFF,
+    DX9ON12_FORCE_ON,
+};
+
+// SDVX Live2D suppression policy. the mode comes from the launcher
+// option; the in-gameplay flag is maintained by the SDVX scene-detection hook in
+// games/sdvx (which does not require the SDVX game module to be enabled). the
+// d3d9 backend reads graphics_sdvx_live2d_should_skip() on every draw.
+// only the Live2D-capable SDVX versions are 64-bit, so the whole feature is
+// compiled out of 32-bit builds.
+#ifdef SPICE64
+enum class SdvxLive2dMode {
+    Off,    // leave Live2D untouched (default)
+    Always, // always skip Live2D draws (also removes the menu navigator)
+    InGame, // skip Live2D draws only during a song
+};
+extern SdvxLive2dMode GRAPHICS_SDVX_LIVE2D_MODE;
+extern std::atomic<bool> GRAPHICS_SDVX_LIVE2D_IN_GAMEPLAY;
+
+inline bool graphics_sdvx_live2d_should_skip() {
+    switch (GRAPHICS_SDVX_LIVE2D_MODE) {
+        case SdvxLive2dMode::Always:
+            return true;
+        case SdvxLive2dMode::InGame:
+            return GRAPHICS_SDVX_LIVE2D_IN_GAMEPLAY.load(std::memory_order_relaxed);
+        default:
+            return false;
+    }
+}
+#endif // SPICE64
+
+// flag settings
+extern bool GRAPHICS_CAPTURE_CURSOR;
+extern bool GRAPHICS_LOG_HRESULT;
+extern bool GRAPHICS_SDVX_FORCE_720;
+extern bool GRAPHICS_SHOW_CURSOR;
+extern bool GRAPHICS_WINDOWED;
+extern std::vector<HWND> GRAPHICS_WINDOWS;
+extern UINT GRAPHICS_FORCE_REFRESH;
+extern std::optional<uint32_t> GRAPHICS_FORCE_REFRESH_SUB;
+extern std::optional<int> GRAPHICS_FORCE_VSYNC_BUFFER;
+extern bool GRAPHICS_FORCE_SINGLE_ADAPTER;
+extern bool GRAPHICS_PREVENT_SECONDARY_WINDOWS;
+extern bool GRAPHICS_GITADORA_HIDE_SIDE_WINDOWS;
+extern std::optional<std::pair<uint32_t, uint32_t>> GRAPHICS_FS_CUSTOM_RESOLUTION;
+extern std::optional<std::pair<uint32_t, uint32_t>> GRAPHICS_FS_CUSTOM_RESOLUTION_SUB;
+extern bool GRAPHICS_FS_ORIENTATION_SWAP;
+extern uint32_t GRAPHICS_FS_ORIGINAL_WIDTH;
+extern uint32_t GRAPHICS_FS_ORIGINAL_HEIGHT;
+
+extern graphics_dx9on12_state GRAPHICS_9_ON_12_STATE;
+extern bool GRAPHICS_9_ON_12_REQUESTED_BY_GAME;
+
+extern std::optional<int> GRAPHICS_WINDOW_STYLE;
+extern std::optional<std::pair<uint32_t, uint32_t>> GRAPHICS_WINDOW_SIZE;
+extern std::optional<std::string> GRAPHICS_WINDOW_POS;
+extern bool GRAPHICS_WINDOW_ALWAYS_ON_TOP;
+extern bool GRAPHICS_WINDOW_BACKBUFFER_SCALE;
+extern bool GRAPHICS_WINDOW_DISABLE_ROUNDED_CORNERS;
+extern std::optional<HWND> GRAPHICS_HOOKED_WINDOW;
+extern std::string GRAPHICS_GITADORA_MAIN_MONITOR;
+extern std::string GRAPHICS_GITADORA_LEFT_MONITOR;
+extern std::string GRAPHICS_GITADORA_RIGHT_MONITOR;
+extern std::string GRAPHICS_GITADORA_SMALL_MONITOR;
+extern std::optional<std::string> GRAPHICS_GITADORA_SMALL_SIZE;
+extern std::optional<std::string> GRAPHICS_GITADORA_SMALL_POS;
+
+extern bool GRAPHICS_IIDX_WSUB;
+extern std::optional<std::string> GRAPHICS_WSUB_SIZE;
+extern std::optional<std::string> GRAPHICS_WSUB_POS;
+extern int GRAPHICS_WSUB_WIDTH;
+extern int GRAPHICS_WSUB_HEIGHT;
+extern int GRAPHICS_WSUB_X;
+extern int GRAPHICS_WSUB_Y;
+extern bool GRAPHICS_WSUB_BORDERLESS;
+extern bool GRAPHICS_WSUB_ALWAYS_ON_TOP;
+extern HWND TDJ_SUBSCREEN_WINDOW;
+extern HWND SDVX_SUBSCREEN_WINDOW;
+extern HWND POPN_SUBSCREEN_WINDOW;
+extern HWND GFDM_SUBSCREEN_WINDOW;
+extern HWND NDD_MAIN_WINDOW;
+
+extern bool SUBSCREEN_FORCE_REDRAW;
+extern bool FAKE_SUBSCREEN_ADAPTER;
+
+// settings
+extern std::string GRAPHICS_DEVICEID;
+extern std::string GRAPHICS_SCREENSHOT_DIR;
+extern bool GRAPHICS_SCREENSHOT_INCLUDE_OVERLAY;
+extern bool GRAPHICS_SCREENSHOT_SUBSCREENS;
+
+// Direct3D 9 settings
+extern std::optional<UINT> D3D9_ADAPTER;
+extern DWORD D3D9_BEHAVIOR_DISABLE;
+extern bool D3D9_DEVICE_HOOK_DISABLE;
+
+void graphics_init();
+void graphics_hook_window(HWND hWnd, D3DPRESENT_PARAMETERS *pPresentationParameters);
+bool graphics_gitadora_has_dedicated_subscreen();
+
+// "GITADORA", "LEFT", "RIGHT", "SMALL", or nullptr for anything else
+const char *graphics_gitadora_window_name(HWND hWnd);
+// The native GITADORA two-head D3D9 group uses the game's named SMALL
+// device window for the native physical SMALL head. The game requests
+// D3DCREATE_NOWINDOWCHANGES, so this host must be made borderless and sized
+// to the requested native SMALL mode before the native fullscreen device is
+// created. During the adapter-group startup warmup, the monitor can briefly
+// report a different mode; preserve its origin but not that temporary size.
+bool graphics_gitadora_prepare_two_head_device_window(
+    HWND hWnd, HMONITOR target_monitor = nullptr, UINT desired_width = 0,
+    UINT desired_height = 0);
+void graphics_add_wnd_proc(WNDPROC wndProc);
+void graphics_remove_wnd_proc(WNDPROC wndProc);
+void graphics_hook_subscreen_window(HWND hWnd);
+void graphics_screens_register(int screen);
+void graphics_screens_unregister(int screen);
+void graphics_screens_get(std::vector<int> &screens);
+void graphics_poll_screenshot_hotkey();
+void graphics_screenshot_trigger();
+bool graphics_screenshot_consume();
+
+inline constexpr size_t GRAPHICS_CAPTURE_SCREEN_NO = 4;
+
+void graphics_capture_trigger(int screen);
+bool graphics_capture_consume(int *screen);
+void graphics_capture_enqueue(int screen, uint8_t *data, size_t width, size_t height);
+void graphics_capture_skip(int screen);
+// size of the last frame captured off this screen, before any caller side downscale; false
+// until one has been captured, so it cannot report a size for a screen the game never drew
+bool graphics_capture_last_size(int screen, int *width, int *height);
+// on success `out` owns packed 24bpp RGB pixels, width * height * 3 bytes
+bool graphics_capture_receive_raw(int screen, std::shared_ptr<uint8_t[]> &out,
+        int divide = 0,
+        uint64_t *timestamp = nullptr,
+        int *width = nullptr, int *height = nullptr);
+// on success `out` holds the encoded JPEG; its storage is reused across calls
+bool graphics_capture_receive_jpeg(int screen, std::vector<uint8_t> &out,
+        int quality = 80, int divide = 0,
+        uint64_t *timestamp = nullptr,
+        int *width = nullptr, int *height = nullptr);
+// the returned path is for screen 0; any extra screens only reserve their suffixed names
+std::string graphics_screenshot_genpath(const std::vector<int> &screens = {});
+
+// graphics_windowed.cpp
+void graphics_windowed_wndproc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+void graphics_capture_initial_window(HWND hWnd);
+void graphics_update_window_style(HWND hWnd, bool force_update=false);
+void graphics_update_z_order(HWND hWnd, bool always_on_top);
+void graphics_set_corner_preference(HWND hWnd, bool disable);
+void graphics_move_resize_window(HWND hWnd);
+bool graphics_window_options_breaks_game();
+bool graphics_window_decoration_change_crashes_game();
+bool graphics_window_resize_breaks_game();
+bool graphics_window_move_and_resize_breaks_game();
+void graphics_load_windowed_subscreen_parameters();
+void graphics_window_check_bounds_before_creation(int &x, int &y, const int width, const int height);
+bool graphics_gitadora_is_borderless_windowed();
+void graphics_gitadora_apply_window_style(DWORD &style, DWORD &style_ex);
+bool graphics_gitadora_apply_window_monitor(
+        const std::string &window_name,
+        int &x,
+        int &y,
+        int &width,
+        int &height,
+        bool log_change);
+bool graphics_gitadora_has_window_override(const std::string &window_name);
+
+void change_primary_monitor(const std::string &monitor_name);
+void update_monitor_on_boot(
+    std::optional<graphics_orientation> target_orientation,
+    UINT target_refresh_rate,
+    std::optional<std::pair<uint32_t, uint32_t>> target_resolution);
+
+void update_monitor_at_runtime();
+void reset_monitor_on_exit();

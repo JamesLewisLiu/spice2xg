@@ -1,0 +1,245 @@
+#pragma once
+
+#include <cstdint>
+#include <array>
+#include <string>
+#include <cmath>
+#include <queue>
+
+#define ANALOG_HISTORY_CNT 10
+#define M_TAU (2 * M_PI)
+#define M_1_TAU (0.5 * M_1_PI)
+
+namespace rawinput {
+    class RawInputManager;
+}
+
+namespace GameAPI::Analogs {
+    enum class AnalogType {
+        // default; values wrap around (below 0 turns into 1, over 1 is 0)
+        // knobs, turntables
+        Circular = 0,
+
+        // typical joystick that rests at the center and caps at [0, 1]
+        LinearCentered = 1,
+
+        // one-directional value (sliders and instruments like piano/drum velocity)
+        // starts at 0 and goes up to 1
+        LinearPositive = 2,
+    };
+}
+
+struct AnalogMovingAverage {
+    double time_in_ms;
+    float sine;
+    float cosine;
+};
+
+struct AnalogDelayEntry {
+    double time_in_ms;
+    float value;
+};
+
+class Analog {
+private:
+    std::string name;
+    std::string device_identifier = "";
+    unsigned short index = USHRT_MAX;
+    float sensitivity = 1.f;
+    float deadzone = 0.f;
+    bool deadzone_mirror = false;
+    bool invert = false;
+    float last_state = 0.5f;
+    bool sensitivity_set = false;
+    bool deadzone_set = false;
+    GameAPI::Analogs::AnalogType type = GameAPI::Analogs::AnalogType::Circular;
+    
+    // smoothing function
+    bool smoothing = false;
+    std::array<AnalogMovingAverage, ANALOG_HISTORY_CNT> vector_history = {};
+    int vector_history_index = 0;
+    float smoothed_last_state = 0.f;
+
+    // angular scaling for sensitivity
+    float previous_raw_rads = 0.f;
+    float adjusted_rads = 0.f;
+
+    // multiplier/divisor
+    int multiplier = 1; 
+    float divisor_previous_value = 0.5f;
+    unsigned short divisor_region = 0;
+
+    // relative input mode
+    float rel_mode_absolute_value = 0.5f;
+    float rel_mode_last_read_time_s = 0.f;
+    bool relative_mode = false;
+
+    // delay
+    uint32_t delay_ms = 0;
+    std::queue<AnalogDelayEntry> delayed_inputs;
+
+    float calculateAngularDifference(float old_rads, float new_rads);
+    float normalizeAngle(float rads);
+    float normalizeAnalogValue(float value);
+
+public:
+
+    // overrides
+    bool override_enabled = false;
+    float override_state = 0.5f;
+
+    explicit Analog(std::string name) : name(std::move(name)) {
+    };
+    explicit Analog(std::string name, GameAPI::Analogs::AnalogType type) : name(std::move(name)), type(type) {
+    };
+
+    std::string getDisplayString(rawinput::RawInputManager* manager);
+    float getSmoothedValue(float raw_rads);
+    float applyAngularSensitivity(float raw_rads);
+    float applyMultiplier(float raw_value);
+    float applyDeadzone(float raw_value);
+    float getRelativeModeValue(float raw_value);
+    float getDelayedValue(float raw_value);
+
+    inline bool isSet() {
+        if (this->override_enabled) {
+            return true;
+        }
+        return this->index != 0xFF;
+    }
+
+    inline void resetValues() {
+        setSensitivity(1.f);
+        setDeadzone(0.f);
+        invert = false;
+        smoothing = false;
+        deadzone_mirror = false;
+        setMultiplier(1);
+        setRelativeMode(false);
+        setLastState(0.5f);
+        setDelayMs(0);
+    }
+
+    inline void clearBindings() {
+        device_identifier = "";
+        index = 0xFF;
+        resetValues();
+    }
+
+    inline const std::string &getName() const {
+        return this->name;
+    }
+
+    inline const std::string &getDeviceIdentifier() const {
+        return this->device_identifier;
+    }
+
+    inline void setDeviceIdentifier(std::string device_identifier) {
+        this->device_identifier = std::move(device_identifier);
+    }
+
+    inline unsigned short getIndex() const {
+        return this->index;
+    }
+
+    inline void setIndex(unsigned short index) {
+        this->index = index;
+    }
+
+    inline float getSensitivity() const {
+        return this->sensitivity;
+    }
+
+    inline float getDeadzone() const {
+        return this->deadzone;
+    }
+
+    inline void setSensitivity(float sensitivity) {
+        this->sensitivity = sensitivity;
+        this->sensitivity_set = (sensitivity < 0.99f || 1.01f < sensitivity);
+    }
+
+    inline void setDeadzone(float deadzone) {
+        this->deadzone = std::max(-1.f, std::min(1.f, deadzone));
+        this->deadzone_set = fabsf(deadzone) > 0.01f;
+    }
+
+    inline bool isSensitivitySet() {
+        return this->sensitivity_set;
+    }
+
+    inline bool isDeadzoneSet() {
+        return this->deadzone_set;
+    }
+
+    inline bool getDeadzoneMirror() const {
+        return this->deadzone_mirror;
+    }
+
+    inline void setDeadzoneMirror(bool deadzone_mirror) {
+        this->deadzone_mirror = deadzone_mirror;
+    }
+
+    inline bool getInvert() const {
+        return this->invert;
+    }
+
+    inline void setInvert(bool invert) {
+        this->invert = invert;
+    }
+
+    inline bool getSmoothing() const {
+        return this->smoothing;
+    }
+
+    inline void setSmoothing(bool smoothing) {
+        this->smoothing = smoothing;
+    }
+
+    inline int getMultiplier() const {
+        return this->multiplier;
+    }
+
+    inline void setMultiplier(int multiplier) {
+        this->multiplier = multiplier;
+        this->divisor_region = 0;
+        this->divisor_previous_value = 0.5f;
+    }
+
+    inline float getLastState() const {
+        return this->last_state;
+    }
+
+    inline void setLastState(float last_state) {
+        this->last_state = last_state;
+    }
+
+    inline bool isRelativeMode() const {
+        return this->relative_mode;
+    }
+
+    inline void setRelativeMode(bool relative_mode) {
+        if (relative_mode) {
+            this->smoothing = false;
+        }
+        this->relative_mode = relative_mode;
+        this->rel_mode_absolute_value = 0.5f;
+        this->rel_mode_last_read_time_s = 0.f;
+    }
+
+    inline GameAPI::Analogs::AnalogType getType() const {
+        return this->type;
+    }
+
+    inline void setType(GameAPI::Analogs::AnalogType type) {
+        this->type = type;
+    }
+
+    inline uint32_t getDelayMs() const {
+        return this->delay_ms;
+    }
+
+    inline void setDelayMs(uint32_t delay_ms) {
+        this->delay_ms = delay_ms;
+    }
+};

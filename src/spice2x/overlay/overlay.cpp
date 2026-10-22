@@ -1,0 +1,1071 @@
+#include "overlay.h"
+
+#include "avs/game.h"
+#include "cfg/configurator.h"
+#include "games/io.h"
+#include "games/gitadora/gitadora.h"
+#include "games/iidx/iidx.h"
+#include "games/nost/nost.h"
+#include "games/popn/popn.h"
+#include "games/rb/touch_debug.h"
+#include "hooks/graphics/graphics.h"
+#include "misc/eamuse.h"
+#include "touch/touch.h"
+#include "util/fileutils.h"
+#include "util/logging.h"
+#include "util/resutils.h"
+#include "build/resource.h"
+
+#include "external/imgui/backends/imgui_impl_dx9.h"
+#ifdef SPICE_D3D11
+#include "external/imgui/backends/imgui_impl_dx11.h"
+#include "hooks/graphics/backends/d3d11/d3d11_backend.h"
+#endif
+#include "overlay/imgui/impl_spice.h"
+#include "overlay/imgui/impl_sw.h"
+#include "overlay/notifications.h"
+
+#ifdef SPICE_D3D11
+#include <d3d11.h>
+#include <dxgi.h>
+#endif
+
+#include "window.h"
+#ifdef SPICE64
+#include "windows/camera_control.h"
+#endif
+#include "windows/card_manager.h"
+#include "windows/screen_resize.h"
+#include "windows/config.h"
+#include "windows/control.h"
+#include "windows/fps.h"
+#include "windows/generic_sub.h"
+#include "windows/iidx_seg.h"
+#include "windows/iidx_sub.h"
+#include "windows/gfdm_sub.h"
+#include "windows/drs_dancefloor.h"
+#include "windows/iopanel.h"
+#include "windows/iopanel_ddr.h"
+#include "windows/iopanel_gfdm.h"
+#include "windows/iopanel_iidx.h"
+#include "windows/popn_sub.h"
+#include "windows/sdvx_sub.h"
+#include "windows/keypad.h"
+#include "windows/log.h"
+#include "windows/nostalgia_touch_piano.h"
+#include "windows/obs.h"
+#include "windows/patch_manager.h"
+#include "windows/exitprompt.cpp"
+
+static inline ImVec4 operator*(const ImVec4& lhs, const ImVec4& rhs) \
+    { return ImVec4(lhs.x * rhs.x, lhs.y * rhs.y, lhs.z * rhs.z, lhs.w * rhs.w); }
+
+namespace overlay {
+
+    // settings
+    bool ENABLED = true;
+    bool AUTO_SHOW_FPS = false;
+    bool AUTO_SHOW_SUBSCREEN = false;
+    bool AUTO_SHOW_IOPANEL = false;
+    bool AUTO_SHOW_KEYPAD_P1 = false;
+    bool AUTO_SHOW_KEYPAD_P2 = false;
+    bool ENABLE_KEYBOARD_NAVIGATION = false;
+    bool USE_WM_CHAR_FOR_IMGUI_CHAR_INPUT = false;
+    FpsLocation FPS_LOCATION = FpsLocation::TopRight;
+    std::optional<uint32_t> UI_SCALE_PERCENT;
+
+    // global
+    std::mutex OVERLAY_MUTEX;
+    std::unique_ptr<overlay::SpiceOverlay> OVERLAY = nullptr;
+    ImFont* DSEG_FONT = nullptr;
+    bool SHOW_DEBUG_LOG_WINDOW = false;
+
+    ImVec2 apply_scaling_to_vector(float x, float y) {
+        if (!UI_SCALE_PERCENT.has_value()) {
+            return ImVec2(x, y);
+        }
+        return ImVec2(apply_scaling(x), apply_scaling(y));
+    }
+
+    ImVec2 apply_scaling_to_vector(const ImVec2& input) {
+        return apply_scaling_to_vector(input.x, input.y);
+    }
+}
+
+static void *ImGui_Alloc(size_t sz, void *user_data) {
+    void *data = malloc(sz);
+    if (!data) {
+        return nullptr;
+    }
+
+    memset(data, 0, sz);
+
+    return data;
+}
+
+static void ImGui_Free(void *data, void *user_data) {
+    free(data);
+}
+
+void overlay::create_d3d9(HWND hWnd, IDirect3D9 *d3d, IDirect3DDevice9 *device) {
+    if (!overlay::ENABLED) {
+        return;
+    }
+
+    const std::lock_guard<std::mutex> lock(OVERLAY_MUTEX);
+
+    if (!overlay::OVERLAY) {
+        overlay::OVERLAY = std::make_unique<overlay::SpiceOverlay>(hWnd, d3d, device);
+    }
+}
+
+#ifdef SPICE_D3D11
+void overlay::create_d3d11(HWND hWnd, ID3D11Device *device, ID3D11DeviceContext *context,
+                           IDXGISwapChain *swapchain) {
+    if (!overlay::ENABLED) {
+        return;
+    }
+
+    const std::lock_guard<std::mutex> lock(OVERLAY_MUTEX);
+
+    if (!overlay::OVERLAY) {
+        overlay::OVERLAY = std::make_unique<overlay::SpiceOverlay>(hWnd, device, context, swapchain);
+    }
+}
+#endif
+
+void overlay::create_software(HWND hWnd) {
+    if (!overlay::ENABLED) {
+        return;
+    }
+
+    const std::lock_guard<std::mutex> lock(OVERLAY_MUTEX);
+
+    if (!overlay::OVERLAY) {
+        overlay::OVERLAY = std::make_unique<overlay::SpiceOverlay>(hWnd);
+    }
+}
+
+void overlay::destroy(HWND hWnd) {
+    if (!overlay::ENABLED) {
+        return;
+    }
+
+    const std::lock_guard<std::mutex> lock(OVERLAY_MUTEX);
+
+    if (overlay::OVERLAY && (hWnd == nullptr || overlay::OVERLAY->uses_window(hWnd))) {
+        overlay::OVERLAY.reset();
+    }
+}
+
+bool overlay::global_hotkeys_triggered() {
+    const std::lock_guard<std::mutex> lock(OVERLAY_MUTEX);
+    return !overlay::OVERLAY || overlay::OVERLAY->hotkeys_triggered();
+}
+
+overlay::SpiceOverlay::SpiceOverlay(HWND hWnd, IDirect3D9 *d3d, IDirect3DDevice9 *device)
+        : renderer(OverlayRenderer::D3D9), hWnd(hWnd), d3d(d3d), device(device) {
+    log_info("overlay", "initializing (D3D9)");
+
+    // increment reference counts
+    this->d3d->AddRef();
+    this->device->AddRef();
+
+    // get creation parameters
+    HRESULT ret;
+    ret = this->device->GetCreationParameters(&this->creation_parameters);
+    if (FAILED(ret)) {
+        log_fatal("overlay", "GetCreationParameters failed, hr={}", FMT_HRESULT(ret));
+    }
+
+    // get adapter identifier
+    ret = this->d3d->GetAdapterIdentifier(
+            creation_parameters.AdapterOrdinal,
+            0,
+            &this->adapter_identifier);
+    if (FAILED(ret)) {
+        log_fatal("overlay", "GetAdapterIdentifier failed, hr={}", FMT_HRESULT(ret));
+    }
+
+    // init
+    this->init();
+}
+
+overlay::SpiceOverlay::SpiceOverlay(HWND hWnd)
+        : renderer(OverlayRenderer::SOFTWARE), hWnd(hWnd) {
+    log_info("overlay", "initializing (SOFTWARE)");
+
+    // init
+    this->init();
+}
+
+#ifdef SPICE_D3D11
+overlay::SpiceOverlay::SpiceOverlay(HWND hWnd, ID3D11Device *d3d11_device,
+                                    ID3D11DeviceContext *d3d11_context,
+                                    IDXGISwapChain *d3d11_swapchain)
+        : renderer(OverlayRenderer::D3D11),
+          hWnd(hWnd),
+          d3d11_device(d3d11_device),
+          d3d11_context(d3d11_context),
+          d3d11_swapchain(d3d11_swapchain) {
+    log_info("overlay", "initializing (D3D11)");
+
+    // increment reference counts
+    this->d3d11_device->AddRef();
+    this->d3d11_context->AddRef();
+    this->d3d11_swapchain->AddRef();
+
+    // init
+    this->init();
+}
+#endif
+
+void overlay::SpiceOverlay::init() {
+
+    // init imgui
+    IMGUI_CHECKVERSION();
+    ImGui::SetAllocatorFunctions(ImGui_Alloc, ImGui_Free, nullptr);
+    ImGui::CreateContext();
+    ImGui::GetIO();
+
+    // set style
+    ImGui::StyleColorsDark();
+    if (this->renderer == OverlayRenderer::SOFTWARE) {
+        imgui_sw::make_style_fast();
+        ImVec4* colors = ImGui::GetStyle().Colors;
+        colors[ImGuiCol_Border].w = 0;
+        colors[ImGuiCol_Separator].w = 0.25f;
+    } else {
+        auto &style = ImGui::GetStyle();
+        style.WindowRounding = 0;
+    }
+
+    if (UI_SCALE_PERCENT.has_value()) {
+        const auto scale = static_cast<float>(UI_SCALE_PERCENT.value()) / 100.f;
+        ImGui::GetStyle().ScaleAllSizes(scale);
+        ImGui::GetStyle().FontScaleMain = scale;
+    }
+
+    // based on CrimsonVesuvius theme from
+    // https://github.com/ocornut/imgui/issues/707#issuecomment-4107169777
+    ImVec4* colors = ImGui::GetStyle().Colors;
+
+    // Text
+    colors[ImGuiCol_Text] = ImVec4(1.00f, 0.90f, 0.90f, 1.00f); // Slight pinkish tint to off-white
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.35f, 0.26f, 0.26f, 1.00f);
+
+    // Backgrounds
+    colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.07f, 0.07f, 1.00f); // Deep charcoal
+    colors[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.09f, 0.09f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.07f, 0.07f, 0.96f);
+
+    // Borders
+    colors[ImGuiCol_Border] = ImVec4(0.25f, 0.15f, 0.15f, 0.80f);
+    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+    // Frames
+    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.10f, 0.10f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.35f, 0.20f, 0.20f, 1.00f);
+
+    // Title Bars
+    colors[ImGuiCol_TitleBg] = ImVec4(0.12f, 0.08f, 0.08f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.25f, 0.10f, 0.10f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.05f, 0.05f, 1.00f);
+
+    // Menus
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.12f, 0.08f, 0.08f, 1.00f);
+
+    // Scrollbars
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.05f, 0.05f, 0.05f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.25f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.35f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.45f, 0.20f, 0.20f, 1.00f);
+
+    // Interactables (The High-Intensity Red)
+    colors[ImGuiCol_CheckMark] = ImVec4(0.85f, 0.15f, 0.15f, 1.00f); // Sharp Red
+    colors[ImGuiCol_CheckboxSelectedBg] = colors[ImGuiCol_FrameBg];
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.60f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.85f, 0.15f, 0.15f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.30f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.50f, 0.18f, 0.18f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.70f, 0.25f, 0.25f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.30f, 0.12f, 0.12f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.50f, 0.18f, 0.18f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.70f, 0.25f, 0.25f, 1.00f);
+
+    // Tabs
+    colors[ImGuiCol_Tab] = ImVec4(0.15f, 0.10f, 0.10f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.50f, 0.18f, 0.18f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.35f, 0.12f, 0.12f, 1.00f);
+
+    // Misc
+    colors[ImGuiCol_PlotLines] = ImVec4(0.85f, 0.20f, 0.20f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.85f, 0.15f, 0.15f, 0.35f);
+    colors[ImGuiCol_NavHighlight] = ImVec4(0.85f, 0.15f, 0.15f, 1.00f);
+
+    // spice custom
+    colors[ImGuiCol_TableRowBgAlt]    = ImVec4(1.00f, 1.00f, 1.00f, 0.025f);
+    colors[ImGuiCol_Separator]        = ImVec4(0.32f, 0.22f, 0.22f, 1.00f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.42f, 0.22f, 0.22f, 1.00f);
+    colors[ImGuiCol_SeparatorActive]  = ImVec4(0.52f, 0.22f, 0.22f, 1.00f);
+    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(1.00f, 1.00f, 1.00f, 0.5f);
+
+#ifdef IMGUI_HAS_DOCK
+    colors[ImGuiCol_DockingPreview] = ImVec4(0.85f, 0.15f, 0.15f, 0.40f);
+    colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.08f, 0.07f, 0.07f, 1.00f);
+#endif
+
+    // configure IO
+    auto &io = ImGui::GetIO();
+    io.UserData = this;
+    io.ConfigFlags = ImGuiConfigFlags_None;
+    if (cfg::CONFIGURATOR_STANDALONE || ENABLE_KEYBOARD_NAVIGATION) {
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    }
+    if (!cfg::CONFIGURATOR_STANDALONE) {
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    }
+
+    // temporarily turn this off as it can cause crashes during font load failures
+    // turns back on in ImGui_ImplSpice_Init
+    io.ConfigErrorRecoveryEnableTooltip = false;
+
+    io.MouseDrawCursor = !GRAPHICS_SHOW_CURSOR;
+
+    // disable config
+    io.IniFilename = nullptr;
+
+    // allow CTRL+WHEEL scaling in the in-game overlay; disable for the standalone
+    // configurator so the mouse wheel always scrolls the configuration window.
+    io.FontAllowUserScaling = !cfg::CONFIGURATOR_STANDALONE;
+
+    // add default font
+    io.Fonts->AddFontDefaultBitmap();
+
+    // add fallback fonts for missing glyph ranges
+    ImFontConfig config {};
+    config.MergeMode = true;
+
+    log_misc("overlay", "loading fonts, failures are not fatal");
+    add_font("simsun.ttc", &config, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    add_font("arial.ttf", &config, io.Fonts->GetGlyphRangesCyrillic());
+    add_font("meiryu.ttc", &config, io.Fonts->GetGlyphRangesJapanese());
+    add_font("meiryo.ttc", &config, io.Fonts->GetGlyphRangesJapanese());
+    add_font("gulim.ttc", &config, io.Fonts->GetGlyphRangesKorean());
+    add_font("cordia.ttf", &config, io.Fonts->GetGlyphRangesThai());
+    add_font("arial.ttf", &config, io.Fonts->GetGlyphRangesVietnamese());
+
+    // add special font
+    if (avs::game::is_model("LDJ")) {
+        DWORD size;
+        ImFontConfig config {};
+        config.FontDataOwnedByAtlas = false;
+        auto buffer = resutil::load_file(IDR_DSEGFONT, &size);
+        DSEG_FONT = io.Fonts->AddFontFromMemoryTTF((void *)buffer, size,
+            overlay::windows::IIDX_SEGMENT_FONT_SIZE);
+    }
+
+    // init implementation
+    ImGui_ImplSpice_Init(this->hWnd);
+    switch (this->renderer) {
+        case OverlayRenderer::D3D9:
+            ImGui_ImplDX9_Init(this->device);
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            ImGui_ImplDX11_Init(this->d3d11_device, this->d3d11_context);
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            imgui_sw::bind_imgui_painting();
+            break;
+    }
+
+    // create empty frame
+    switch (this->renderer) {
+        case OverlayRenderer::D3D9:
+            ImGui_ImplDX9_NewFrame();
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            ImGui_ImplDX11_NewFrame();
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            break;
+    }
+    ImGui_ImplSpice_NewFrame();
+    ImGui::NewFrame();
+    ImGui::EndFrame();
+
+    // fix navigation buttons causing crash on overlay activation
+    ImGui::Begin("Temp");
+    ImGui::End();
+
+    bool set_overlay_active = false;
+
+    // owned separately from `windows` so it never affects overlay activation/input gating
+    window_fps = std::make_unique<overlay::windows::FPS>(this);
+    if (!cfg::CONFIGURATOR_STANDALONE && AUTO_SHOW_FPS) {
+        window_fps->set_active(true);
+    }
+
+    if (!cfg::CONFIGURATOR_STANDALONE &&
+        avs::game::is_model("PAN") && games::nost::ENABLE_TOUCH_MODE) {
+        window_nostalgia_touch_piano =
+            std::make_unique<overlay::windows::NostalgiaTouchPiano>(this);
+    }
+
+    // owned separately from `windows` so it is not part of the overlay window layer
+    window_main_menu = std::make_unique<overlay::windows::ExitPrompt>(this);
+
+    // add default windows
+    this->window_add(window_config = new overlay::windows::Config(this));
+    this->window_add(window_control = new overlay::windows::Control(this));
+    this->window_add(window_log = new overlay::windows::Log(this));
+#if SPICE64 && !SPICE_XP
+    if (avs::game::is_model("LDJ")) {
+        this->window_add(window_camera = new overlay::windows::CameraControl(this));
+    }
+#endif
+    this->window_add(window_cards = new overlay::windows::CardManager(this));
+    if (!cfg::CONFIGURATOR_STANDALONE) {
+        this->window_add(window_resize = new overlay::windows::ScreenResize(this));
+    }
+    this->window_add(new overlay::windows::PatchManager(this));
+
+    // OBS control spawns a background WebSocket worker; skip it in the standalone
+    // configurator, where there is no running game to stream/record
+    if (!cfg::CONFIGURATOR_STANDALONE) {
+        this->window_add(window_obs = new overlay::windows::OBSControl(this));
+    }
+
+    {
+        window_keypad1 = new overlay::windows::Keypad(this, 0);
+        this->window_add(window_keypad1);
+        if (!cfg::CONFIGURATOR_STANDALONE && AUTO_SHOW_KEYPAD_P1) {
+            window_keypad1->set_active(true);
+            set_overlay_active = true;
+        }
+    }
+    if (eamuse_get_game_keypads() > 1) {
+        window_keypad2 = new overlay::windows::Keypad(this, 1);
+        this->window_add(window_keypad2);
+        if (!cfg::CONFIGURATOR_STANDALONE && AUTO_SHOW_KEYPAD_P2) {
+            window_keypad2->set_active(true);
+            set_overlay_active = true;
+        }
+    }
+
+    // IO panel needs to know what game is running
+    if (!cfg::CONFIGURATOR_STANDALONE) {
+        window_iopanel = nullptr;
+        if (avs::game::is_model("LDJ")) {
+            window_iopanel = new overlay::windows::IIDXIOPanel(this);
+        } else if (avs::game::is_model("MDX")) {
+            window_iopanel = new overlay::windows::DDRIOPanel(this);
+        } else if (avs::game::is_model({"J32", "J33", "K32", "K33", "L32", "L33", "M32"}) &&
+            !games::gitadora::is_arena_model()) {
+            window_iopanel = new overlay::windows::GitadoraIOPanel(this);
+        } else {
+            window_iopanel = new overlay::windows::IOPanel(this);
+        }
+        if (window_iopanel) {
+            this->window_add(window_iopanel);
+            if (AUTO_SHOW_IOPANEL) {
+                window_iopanel->set_active(true);
+                set_overlay_active = true;
+            }
+        }
+    }
+
+    // subscreens need DirectX, so don't try to initialize them in standalone
+    if (!cfg::CONFIGURATOR_STANDALONE) {
+        window_sub = nullptr;
+        if (avs::game::is_model("LDJ")) {
+            if (games::iidx::TDJ_MODE) {
+                window_sub = new overlay::windows::IIDXSubScreen(this);
+            } else {
+                window_sub = new overlay::windows::IIDXSegmentDisplay(this);
+            }
+        } else if (avs::game::is_model("REC")) {
+            window_sub = new overlay::windows::DRSDanceFloorDisplay(this);
+        } else if (avs::game::is_model("KFC")) {
+            window_sub = new overlay::windows::SDVXSubScreen(this);
+        } else if (games::gitadora::is_arena_model()) {
+            window_sub = new overlay::windows::GitaDoraSubScreen(this);
+        } else if (games::popn::is_pikapika_model()) {
+            window_sub = new overlay::windows::PopnSubScreen(this);
+        }
+
+        if (window_sub) {
+            this->window_add(window_sub);
+            if (AUTO_SHOW_SUBSCREEN) {
+                window_sub->set_active(true);
+                set_overlay_active = true;
+            }
+        }
+    }
+
+    if (set_overlay_active) {
+        this->set_active(true);
+    }
+}
+
+overlay::SpiceOverlay::~SpiceOverlay() {
+
+    // imgui shutdown
+    ImGui_ImplSpice_Shutdown();
+    switch (this->renderer) {
+        case OverlayRenderer::D3D9:
+            ImGui_ImplDX9_Shutdown();
+
+            // drop references
+            this->device->Release();
+            this->d3d->Release();
+
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            if (this->d3d11_rtv) {
+                this->d3d11_rtv->Release();
+                this->d3d11_rtv = nullptr;
+            }
+            ImGui_ImplDX11_Shutdown();
+
+            // drop references
+            this->d3d11_swapchain->Release();
+            this->d3d11_context->Release();
+            this->d3d11_device->Release();
+
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            imgui_sw::unbind_imgui_painting();
+            break;
+    }
+    ImGui::DestroyContext();
+}
+
+void overlay::SpiceOverlay::window_add(Window *wnd) {
+    this->windows.emplace_back(std::unique_ptr<Window>(wnd));
+}
+
+void overlay::SpiceOverlay::new_frame() {
+
+    // update implementation
+    ImGui_ImplSpice_NewFrame();
+    this->total_elapsed += ImGui::GetIO().DeltaTime;
+
+    // notifications draw on top of the game without flipping `active`, so the input gates
+    // (see touch/touch.cpp WndProc, touch_get_points/events, graphics.cpp WM_CHAR) stay
+    // disabled and input continues to flow to the game.
+    // SOFTWARE renderer (spicecfg / configurator) never gets notifications - no room.
+    const bool draw_notifications = this->renderer != OverlayRenderer::SOFTWARE
+        && overlay::notifications::has_pending();
+
+    // persistent FPS window: drawn whenever active, independent of the overlay
+    const bool draw_fps_persistent = this->renderer != OverlayRenderer::SOFTWARE
+        && this->window_fps->get_active();
+
+    const bool draw_nostalgia_touch_piano = this->renderer != OverlayRenderer::SOFTWARE
+        && this->window_nostalgia_touch_piano
+        && this->window_nostalgia_touch_piano->get_active();
+
+    // draw RB touch diagnostics
+    const bool draw_rb_touch_debug = this->renderer != OverlayRenderer::SOFTWARE
+        && games::rb::touch_debug_overlay_enabled();
+
+    // check if there is nothing to draw
+    this->has_pending_frame = false;
+    if (!this->active && !draw_notifications && !draw_fps_persistent &&
+        !draw_nostalgia_touch_piano && !draw_rb_touch_debug) {
+        return;
+    }
+
+    // init frame
+    switch (this->renderer) {
+        case OverlayRenderer::D3D9:
+            ImGui_ImplDX9_NewFrame();
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            // refresh DisplaySize each frame; the dx11 swapchain hook pushes
+            // the current backbuffer dimensions into impl_spice via the
+            // size override so ImGui's viewport tracks ResizeBuffers calls.
+            ImGui_ImplSpice_UpdateDisplaySize();
+            ImGui_ImplDX11_NewFrame();
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            ImGui_ImplSpice_UpdateDisplaySize();
+            break;
+    }
+    ImGui::NewFrame();
+    this->has_pending_frame = true;
+
+    if (draw_rb_touch_debug) {
+        games::rb::touch_draw_debug_overlay();
+    }
+
+    // build windows only when the overlay itself is active
+    if (this->active) {
+        for (auto &window : this->windows) {
+            window->build();
+        }
+    }
+
+    if (draw_nostalgia_touch_piano) {
+        this->window_nostalgia_touch_piano->build();
+    }
+
+    if (this->active) {
+        // draw the main menu on top of the overlay windows
+        this->window_main_menu->build();
+
+        if (SHOW_DEBUG_LOG_WINDOW) {
+            ImGui::ShowDebugLogWindow(&SHOW_DEBUG_LOG_WINDOW);
+        }
+    }
+
+    if (draw_fps_persistent) {
+        this->window_fps->build();
+    }
+
+    // draw notifications last so they paint on top of any overlay windows
+    if (draw_notifications) {
+        overlay::notifications::draw();
+    }
+
+    // end frame
+    ImGui::EndFrame();
+}
+
+// FNV-1a 64-bit hash helper used by the software renderer to detect idle frames.
+static inline uint64_t overlay_fnv1a64(uint64_t h, const void *data, size_t len) {
+    const auto *p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001B3ULL;
+    }
+    return h;
+}
+
+// Compute a hash over the visual content of ImDrawData. Only the geometry the
+// software rasterizer actually consumes (vertex/index buffers + display size)
+// feeds into the hash, so frames where ImGui produces identical draw data
+// (i.e. nothing animated this tick) can skip the full pixel rasterization.
+static uint64_t overlay_hash_draw_data(const ImDrawData *draw_data) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    if (draw_data == nullptr) {
+        return h;
+    }
+    const float display[4] = {
+        draw_data->DisplayPos.x,
+        draw_data->DisplayPos.y,
+        draw_data->DisplaySize.x,
+        draw_data->DisplaySize.y,
+    };
+    h = overlay_fnv1a64(h, display, sizeof(display));
+
+    const int cmd_lists = draw_data->CmdListsCount;
+    h = overlay_fnv1a64(h, &cmd_lists, sizeof(cmd_lists));
+
+    for (int i = 0; i < draw_data->CmdListsCount; i++) {
+        const ImDrawList *cmd_list = draw_data->CmdLists[i];
+        if (cmd_list == nullptr) {
+            continue;
+        }
+        const int vtx_count = cmd_list->VtxBuffer.Size;
+        const int idx_count = cmd_list->IdxBuffer.Size;
+        h = overlay_fnv1a64(h, &vtx_count, sizeof(vtx_count));
+        h = overlay_fnv1a64(h, &idx_count, sizeof(idx_count));
+        if (vtx_count > 0) {
+            h = overlay_fnv1a64(h, cmd_list->VtxBuffer.Data,
+                static_cast<size_t>(vtx_count) * sizeof(ImDrawVert));
+        }
+        if (idx_count > 0) {
+            h = overlay_fnv1a64(h, cmd_list->IdxBuffer.Data,
+                static_cast<size_t>(idx_count) * sizeof(ImDrawIdx));
+        }
+    }
+    return h;
+}
+
+void overlay::SpiceOverlay::render() {
+
+    // skip if new_frame() didn't begin a frame this tick
+    if (!this->has_pending_frame) {
+        return;
+    }
+
+    // imgui render
+    ImGui::Render();
+
+    // implementation render
+    switch (this->renderer) {
+        case OverlayRenderer::D3D9:
+            if (cfg::CONFIGURATOR_STANDALONE) {
+                const auto *draw_data = ImGui::GetDrawData();
+                const uint64_t draw_hash = overlay_hash_draw_data(draw_data);
+                const auto &io = ImGui::GetIO();
+                const int display_w = static_cast<int>(std::ceil(io.DisplaySize.x));
+                const int display_h = static_cast<int>(std::ceil(io.DisplaySize.y));
+                const bool size_matches = (this->d3d9_last_display_w == display_w
+                    && this->d3d9_last_display_h == display_h);
+                if (this->d3d9_has_last_draw_hash
+                        && draw_hash == this->d3d9_last_draw_hash
+                        && size_matches) {
+                    this->d3d9_frame_dirty = false;
+                    break;
+                }
+                this->d3d9_last_draw_hash = draw_hash;
+                this->d3d9_has_last_draw_hash = true;
+                this->d3d9_last_display_w = display_w;
+                this->d3d9_last_display_h = display_h;
+                this->d3d9_frame_dirty = true;
+            } else {
+                ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+            }
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            overlay::d3d11::render(this->d3d11_device, this->d3d11_context,
+                                   this->d3d11_swapchain, &this->d3d11_rtv);
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE: {
+
+            // get display metrics
+            auto &io = ImGui::GetIO();
+            auto width = static_cast<size_t>(std::ceil(io.DisplaySize.x));
+            auto height = static_cast<size_t>(std::ceil(io.DisplaySize.y));
+            auto pixels = width * height;
+
+            // skip the (expensive) full software rasterization when the draw data
+            // is byte-identical to the previous frame and the existing pixel
+            // buffer still matches the current display size.
+            const auto *draw_data = ImGui::GetDrawData();
+            const uint64_t draw_hash = overlay_hash_draw_data(draw_data);
+            const bool size_matches = (this->pixel_data_width == width
+                && this->pixel_data_height == height
+                && this->pixel_data.size() >= pixels);
+            if (this->sw_has_last_draw_hash
+                    && draw_hash == this->sw_last_draw_hash
+                    && size_matches) {
+                this->sw_pixels_dirty = false;
+                break;
+            }
+            this->sw_last_draw_hash = draw_hash;
+            this->sw_has_last_draw_hash = true;
+
+            // make sure buffer is big enough
+            if (this->pixel_data.size() < pixels) {
+                this->pixel_data.resize(pixels, 0);
+            }
+
+            // reset buffer
+            memset(&this->pixel_data[0], 0, width * height * sizeof(uint32_t));
+
+            // render to pixel data
+            imgui_sw::SwOptions options {
+                .optimize_text = true,
+                .optimize_rectangles = true,
+            };
+            imgui_sw::paint_imgui(&this->pixel_data[0], width, height, options);
+            pixel_data_width = width;
+            pixel_data_height = height;
+            this->sw_pixels_dirty = true;
+
+            break;
+        }
+    }
+
+    for (auto &window : this->windows) {
+        window->after_render();
+    }
+
+    this->has_pending_frame = false;
+}
+
+void overlay::SpiceOverlay::d3d9_render_draw(const bool force_submit) {
+    if (this->renderer != OverlayRenderer::D3D9) {
+        return;
+    }
+    if (!force_submit && !this->d3d9_frame_dirty) {
+        return;
+    }
+    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+}
+
+void overlay::SpiceOverlay::update() {
+
+    // there are three layers -
+    // bottommost layer - FPS, notifications (non-interactable)
+    // overlay layer - most windows
+    // topmost layer - main menu (popup)
+
+    auto overlay_buttons = games::get_buttons_overlay(eamuse_get_game());
+
+    // check overlay toggle
+    const bool toggle_down_new = overlay_buttons
+            && this->hotkeys_triggered()
+            && GameAPI::Buttons::getState(RI_MGR, overlay_buttons->at(games::OverlayButtons::ToggleAllWindows));
+    if (toggle_down_new && !this->toggle_down) {
+        toggle_active();
+    }
+    this->toggle_down = toggle_down_new;
+
+    // check main menu
+    const auto main_menu_down_new = overlay_buttons
+            && this->hotkeys_triggered()
+            && GameAPI::Buttons::getState(RI_MGR, overlay_buttons->at(games::OverlayButtons::ToggleMainMenu));
+    if (main_menu_down_new && !this->main_menu_down) {
+        show_main_menu();
+    }
+    this->main_menu_down = main_menu_down_new;
+
+    // check FPS toggle - controls the persistent FPS window only, never the overlay
+    const auto fps_down_new = overlay_buttons
+            && this->hotkeys_triggered()
+            && GameAPI::Buttons::getState(RI_MGR, overlay_buttons->at(games::OverlayButtons::ToggleFps));
+    if (fps_down_new && !this->fps_down) {
+        this->window_fps->toggle_active();
+    }
+    this->fps_down = fps_down_new;
+
+    // update windows
+    for (auto &window : this->windows) {
+        window->update();
+    }
+
+    // FPS window
+    this->window_fps->update();
+
+    if (this->window_nostalgia_touch_piano) {
+        this->window_nostalgia_touch_piano->update();
+    }
+
+    // main menu (owned separately from the overlay window layer)
+    this->window_main_menu->update();
+
+    // deactivate if nothing is shown - the main menu keeps the overlay active
+    // while open even though it is not part of `windows`
+    bool window_active = this->window_main_menu->get_active();
+    if (!window_active) {
+        for (auto &window : this->windows) {
+            if (window->get_active()) {
+                window_active = true;
+                break;
+            }
+        }
+    }
+    if (!window_active) {
+        this->set_active(false);
+    }
+}
+
+bool overlay::SpiceOverlay::update_cursor() {
+    return ImGui_ImplSpice_UpdateMouseCursor();
+}
+
+void overlay::SpiceOverlay::toggle_active() {
+    // invert active state
+    this->active = !this->active;
+}
+
+void overlay::SpiceOverlay::show_main_menu() {
+    if (!this->window_main_menu) {
+        return;
+    }
+    if (this->window_main_menu->get_active()) {
+        // window already visible - close the window
+        this->window_main_menu->set_active(false);
+        return;
+    }
+
+    // don't open on top of another genuinely-visible popup, but ONLY guard while
+    // the overlay is active
+    if (this->get_active() && ImGui::IsPopupOpen(0, ImGuiPopupFlags_AnyPopup)) {
+        return;
+    }
+
+    if (this->get_active()) {
+        if (!ImGui::IsAnyItemActive() && !ImGui::IsAnyItemFocused()) {
+            this->window_main_menu->set_active(true);
+        }
+    } else  {
+        this->set_active(true);
+        this->window_main_menu->set_active(true);
+    }
+}
+
+void overlay::SpiceOverlay::set_active(bool new_active) {
+
+    // toggle if different
+    if (this->active != new_active) {
+        this->toggle_active();
+    }
+}
+
+bool overlay::SpiceOverlay::get_active() {
+    return this->active;
+}
+
+bool overlay::SpiceOverlay::is_subscreen_overlay_visible() {
+    return this->get_active() &&
+        this->window_sub != nullptr &&
+        this->window_sub->get_active();
+}
+
+bool overlay::SpiceOverlay::accepts_subscreen_mouse_input() {
+    return this->is_subscreen_overlay_visible() &&
+        this->window_sub->is_mouse_hovered();
+}
+
+bool overlay::SpiceOverlay::has_focus() {
+    return this->get_active() && ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow);
+}
+
+bool overlay::SpiceOverlay::hotkeys_triggered() {
+    const std::lock_guard<std::mutex> lock(this->hotkeys_mutex);
+
+    // this query also consumes the shared HotkeyToggle edge; the mutex gives all callers one latch
+    // prevent hotkeys in spicecfg
+    if (cfg::CONFIGURATOR_STANDALONE) {
+        return false;
+    }
+
+    // get buttons
+    auto buttons = games::get_buttons_overlay(eamuse_get_game());
+    if (!buttons) {
+        return false;
+    }
+
+    auto &hotkey1 = buttons->at(games::OverlayButtons::HotkeyEnable1);
+    auto &hotkey2 = buttons->at(games::OverlayButtons::HotkeyEnable2);
+    auto &toggle = buttons->at(games::OverlayButtons::HotkeyToggle);
+
+    // check hotkey toggle
+    auto toggle_state = GameAPI::Buttons::getState(RI_MGR, toggle);
+    if (toggle_state) {
+        if (!this->hotkey_toggle_last) {
+            this->hotkey_toggle_last = true;
+            this->hotkey_toggle = !this->hotkey_toggle;
+        }
+    } else {
+        this->hotkey_toggle_last = false;
+    }
+
+    // hotkey toggle overrides hotkey enable button states
+    if (hotkey_toggle) {
+        return true;
+    }
+
+    // check hotkey enable buttons
+    bool triggered = true;
+    if (hotkey1.isSet() && !GameAPI::Buttons::getState(RI_MGR, hotkey1)) {
+        triggered = false;
+    }
+    if (hotkey2.isSet() && !GameAPI::Buttons::getState(RI_MGR, hotkey2)) {
+        triggered = false;
+    }
+    return triggered;
+}
+
+void overlay::SpiceOverlay::reset_invalidate() {
+    if (!overlay::OVERLAY) {
+        return;
+    }
+    switch (overlay::OVERLAY->renderer) {
+        case OverlayRenderer::D3D9:
+            if (cfg::CONFIGURATOR_STANDALONE) {
+                overlay::OVERLAY->d3d9_has_last_draw_hash = false;
+                overlay::OVERLAY->d3d9_frame_dirty = true;
+            }
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            // for DX11 a ResizeBuffers only invalidates the backbuffer RTV; the imgui
+            // device objects (shaders, buffers, textures) remain valid.
+            if (overlay::OVERLAY->d3d11_rtv) {
+                overlay::OVERLAY->d3d11_rtv->Release();
+                overlay::OVERLAY->d3d11_rtv = nullptr;
+            }
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            break;
+    }
+}
+
+void overlay::SpiceOverlay::reset_recreate() {
+    if (!overlay::OVERLAY) {
+        return;
+    }
+    switch (overlay::OVERLAY->renderer) {
+        case OverlayRenderer::D3D9:
+            ImGui_ImplDX9_CreateDeviceObjects();
+            break;
+#ifdef SPICE_D3D11
+        case OverlayRenderer::D3D11:
+            // RTV is lazily recreated on the next render()
+            break;
+#endif
+        case OverlayRenderer::SOFTWARE:
+            break;
+    }
+}
+
+void overlay::SpiceOverlay::input_char(unsigned int c) {
+    // add character to ImGui
+    ImGui::GetIO().AddInputCharacter(c);
+}
+
+uint32_t *overlay::SpiceOverlay::sw_get_pixel_data(int *width, int *height) {
+
+    // check if active (notifications never draw in software renderer, so no extra gate here)
+    if (!this->active) {
+        *width = 0;
+        *height = 0;
+        return nullptr;
+    }
+
+    // ensure buffer has the right size
+    const size_t total_size = this->pixel_data_width * this->pixel_data_height;
+    if (this->pixel_data.size() < total_size) {
+        this->pixel_data.resize(total_size, 0);
+    }
+
+    // check for empty surface
+    if (this->pixel_data.empty()) {
+        *width = 0;
+        *height = 0;
+        return nullptr;
+    }
+
+    // copy and return pointer to data
+    *width = this->pixel_data_width;
+    *height = this->pixel_data_height;
+    return &this->pixel_data[0];
+}
+
+void overlay::SpiceOverlay::add_font(const char* font, ImFontConfig* config, const ImWchar* glyphs) {
+    CHAR fonts_dir[MAX_PATH];
+    ExpandEnvironmentStringsA(R"(%SYSTEMROOT%\Fonts\)", fonts_dir, MAX_PATH);
+    std::filesystem::path full_path = fonts_dir;
+    full_path += font;
+
+    if (fileutils::file_exists(full_path)) {
+        log_misc("overlay", "loading font: {}", full_path);
+        ImGui::GetIO().Fonts->AddFontFromFileTTF(
+            full_path.string().c_str(),
+            13.0f,
+            config,
+            glyphs);
+    } else {
+        log_misc("overlay", "font not found: {}", full_path);
+    }
+}

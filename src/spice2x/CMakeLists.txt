@@ -1,0 +1,1113 @@
+cmake_minimum_required(VERSION 3.12)
+cmake_policy(SET CMP0069 NEW)
+project(spicetools)
+include(CheckIPOSupported)
+
+# set language level
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
+
+# niceities for vscode
+set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
+
+# for RapidJSON
+add_compile_definitions(RAPIDJSON_HAS_STDSTRING)
+
+if(MSVC)
+    # disable intermediate manifest
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /manifest:no")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /manifest:no")
+
+    # disable warnings about using non _s variants like strncpy
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+
+    # disable warnings about using deprecated winsock2 functions
+    add_compile_definitions(_WINSOCK_DEPRECATED_NO_WARNINGS)
+
+    # RapidJSON does this
+    add_compile_definitions(_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING)
+
+    # define M_PI
+    add_compile_definitions(_USE_MATH_DEFINES)
+
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DYNAMICBASE:NO")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DYNAMICBASE:NO")
+
+    set(USE_STATIC_MSVCRT ON CACHE BOOL "If enabled, will force the use of static crt instead of dynamic")
+
+    if(USE_STATIC_MSVCRT)
+        # use statically linked runtime
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set(CompilerFlags
+                CMAKE_CXX_FLAGS
+                CMAKE_CXX_FLAGS_DEBUG
+                CMAKE_CXX_FLAGS_RELEASE
+                CMAKE_C_FLAGS
+                CMAKE_C_FLAGS_DEBUG
+                CMAKE_C_FLAGS_RELEASE
+        )
+
+        foreach(CompilerFlag ${CompilerFlags})
+            string(REPLACE "/MD" "/MT" ${CompilerFlag} "${${CompilerFlag}}")
+        endforeach()
+    endif()
+
+    # disable C4996 "The POSIX name for this item is deprecated. Instead, use the ISO C and C++ conformant name" warning
+    add_compile_options("/wd4996")
+
+    # cleanup windows.h includes
+    add_compile_options("/DNOMINMAX")
+
+    # cleanup weird types
+    add_compile_options("/DWINBOOL=BOOL")
+
+    # add support for the deprecated std::result_of in c++20
+    add_compile_options("/D_HAS_DEPRECATED_RESULT_OF")
+
+    # enable build paralellization
+    add_compile_options("/MP")
+
+    # enable edit and continue in Debug
+    add_compile_options("$<$<CONFIG:DEBUG>:/ZI>")
+    add_link_options("$<$<CONFIG:DEBUG>:/SAFESEH:NO>")
+
+    # enable fast pdb generation in debug
+    add_link_options("$<$<CONFIG:DEBUG>:/DEBUG:FASTLINK>")
+
+    # enable pdb generation for release builds
+    add_compile_options("$<$<CONFIG:RELEASE,MINSIZEREL>:/Zi>")
+    add_link_options("$<$<CONFIG:RELEASE,MINSIZEREL>:/DEBUG:FULL>")
+
+    # enable COMDAT folding for even smaller release builds
+    add_link_options("$<$<CONFIG:RELEASE,MINSIZEREL>:/OPT:ICF>")
+
+    # always use UTF-8 (fix 4819)
+    add_compile_options("/utf-8")
+
+    # spectre mitigation warning
+    add_compile_options("/wd5045")
+
+    # implicit type convert warnings
+    add_compile_options("/wd4244")
+    add_compile_options("/wd4267")
+    add_compile_options("/wd4305")
+
+    # unreferenced local variable
+    add_compile_options("/wd4101")
+
+    # warning in winbase.h??
+    add_compile_options("/wd5039")
+
+
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # disable warnings about using non _s variants like strncpy
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+
+    # disable warnings about using deprecated winsock2 functions
+    add_compile_definitions(_WINSOCK_DEPRECATED_NO_WARNINGS)
+
+    # RapidJSON does this
+    add_compile_definitions(_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING)
+
+    add_compile_options("-Wno-nontrivial-memcall") # imgui, rapidjson
+    add_compile_options("-Wno-deprecated-builtins") # robin_hood
+    add_compile_options("-Wno-deprecated-declarations") # rapidjson
+    add_compile_options("-Wno-inconsistent-missing-override") # headsocket
+    add_compile_options("-Wno-microsoft-exception-spec") # gcc/clang have different noexcept specifiers on d3d9 COM interfaces
+
+    # warnings
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wunknown-warning-option")
+
+    # static linking
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static")
+else()
+
+    # warnings as errors
+    set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+
+    # warnings
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra") # enable stuff
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pointer-arith") # but we love pointer arithmetic :)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unknown-pragmas") # since CLion does clang pragmas
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-address") # to allow checking function pointers for null
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-cast-function-type") # we actually do this a lot
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-class-memaccess") # RapidJSON does this
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations") # RapidJSON issue
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter") # for all those stubs
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-parameter") # for all those stubs
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-truncation") # since we do that from time to time
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-local-typedefs") # for our logging system
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes") # fmtlib workaround
+
+    # release flags
+    if(CMAKE_BUILD_TYPE MATCHES "Release")
+
+        # hide ident strings
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fno-ident -ffunction-sections -fdata-sections")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fno-ident -ffunction-sections -fdata-sections")
+
+        # a change in the linker caused the executable to be loaded above 4GB base virtual address
+        # https://github.com/msys2/MINGW-packages/pull/6880
+        # some games crash if some DLLS load above 4GB VA, so manually set base address to standard 32-bit VA,
+        # and might as well double make sure ASLR is disabled here
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+
+        # set visibility to hidden
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fvisibility=hidden")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fvisibility=hidden -fvisibility-inlines-hidden")
+
+        # remove symbol table and relocation information
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -s")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -s")
+
+        # performance
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O2 -pipe")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -pipe")
+
+        # ensure frame pointers are enabled
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -fno-omit-frame-pointer")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fno-omit-frame-pointer")
+
+        # no debug
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -DNDEBUG")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG")
+
+        # file prefix map for relative working directory
+        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -ffile-prefix-map=\"${CMAKE_SOURCE_DIR}=.\"")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -ffile-prefix-map=\"${CMAKE_SOURCE_DIR}=.\"")
+    endif()
+
+    # release with debug info flags
+    if(CMAKE_BUILD_TYPE MATCHES "RelWithDebInfo")
+
+        # hide ident strings
+        set(CMAKE_C_FLAGS_RELWITHDEBINFO "-fno-ident -ffunction-sections -fdata-sections")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-fno-ident -ffunction-sections -fdata-sections")
+
+        # linker fix to load below 4GB
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+
+        # set visibility to hidden
+        set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fvisibility=hidden")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fvisibility=hidden -fvisibility-inlines-hidden")
+
+        # generate dwarf
+        set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -gdwarf")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -gdwarf")
+
+        # ensure frame pointers are enabled
+        set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fno-omit-frame-pointer")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fno-omit-frame-pointer")
+    endif()
+
+    # debug flags
+    if(CMAKE_BUILD_TYPE MATCHES "Debug")
+
+        # generate dwarf
+        set(CMAKE_C_FLAGS_DEBUG "-gdwarf")
+        set(CMAKE_CXX_FLAGS_DEBUG "-gdwarf")
+
+        # linker fix to load below 4GB
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--disable-dynamicbase,--image-base=0x400000,--enable-stdcall-fixup")
+
+        # enable debug symbols on level 3 and keep frame pointers
+        set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3 -fno-omit-frame-pointer")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3 -fno-omit-frame-pointer")
+
+        # optimize for debugging
+        set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Og -pipe")
+        set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Og -pipe")
+    endif()
+
+    # static linking
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static -static-libgcc")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static -static-libgcc -static-libstdc++")
+endif()
+
+# default defines
+add_compile_definitions(
+        WIN32_LEAN_AND_MEAN
+        _WIN32_IE=0x0400
+)
+
+# SPICE_XP: set by build_all.sh for the WinXP-compat toolchains. Gates out
+# the DX11 overlay backend
+option(SPICE_XP "Build for the WinXP-compat toolchain" OFF)
+if(SPICE_XP)
+    add_compile_definitions(SPICE_XP=1)
+endif()
+
+# acioemu log
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DACIOEMU_LOG")
+
+# add project directory to include path so we can comfortably import
+include_directories(${spicetools_SOURCE_DIR} ${spicetools_SOURCE_DIR}/external/imgui)
+
+# add external libraries
+add_subdirectory(external/fmt EXCLUDE_FROM_ALL)
+add_subdirectory(external/discord-rpc EXCLUDE_FROM_ALL)
+add_subdirectory(external/hash-library EXCLUDE_FROM_ALL)
+add_subdirectory(external/imgui EXCLUDE_FROM_ALL)
+add_subdirectory(external/minhook EXCLUDE_FROM_ALL)
+add_subdirectory(external/wslay EXCLUDE_FROM_ALL)
+add_subdirectory(external/cpu_features EXCLUDE_FROM_ALL)
+
+# libjpeg-turbo, prebuilt into the deps image. The WinXP toolchains have their own
+# sysroot and cannot see it, so those targets build without JPEG support.
+add_library(spice_jpeg INTERFACE)
+if(NOT SPICE_XP)
+    # search static archives only: the mingw package also ships an import library,
+    # and linking that one would pull in a libjpeg DLL at runtime
+    set(SPICE_JPEG_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_STATIC_LIBRARY_SUFFIX})
+    find_package(JPEG)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${SPICE_JPEG_SUFFIXES})
+
+    if(JPEG_FOUND)
+        target_link_libraries(spice_jpeg INTERFACE JPEG::JPEG)
+        target_compile_definitions(spice_jpeg INTERFACE SPICE_JPEG=1)
+    else()
+        message(WARNING
+                "libjpeg-turbo not found: screen capture over the API is disabled")
+    endif()
+endif()
+
+# x264 for the API H.264 video stream, installed into the mingw sysroots by the
+# deps image. The WinXP toolchains deliberately go without it and serve MJPEG only.
+add_library(spice_x264 INTERFACE)
+if(NOT SPICE_XP)
+    # search static archives only: the mingw package also ships an import library,
+    # and linking that one would pull in a libx264 DLL at runtime
+    set(SPICE_X264_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_STATIC_LIBRARY_SUFFIX})
+    find_library(X264_LIBRARY NAMES x264 libx264)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${SPICE_X264_SUFFIXES})
+
+    find_path(X264_INCLUDE_DIR NAMES x264.h)
+    if(X264_LIBRARY AND X264_INCLUDE_DIR)
+        target_include_directories(spice_x264 INTERFACE "${X264_INCLUDE_DIR}")
+        target_link_libraries(spice_x264 INTERFACE "${X264_LIBRARY}")
+        target_compile_definitions(spice_x264 INTERFACE SPICE_H264=1)
+    else()
+        message(WARNING
+                "x264 not found: the api video stream will only offer MJPEG")
+    endif()
+endif()
+
+# fpng's SIMD needs the whole unit built for SSE4.1, which its runtime CPU check
+# cannot undo, so keep it scalar rather than raising the CPU baseline
+set_source_files_properties(external/fpng/fpng.cpp PROPERTIES
+        COMPILE_DEFINITIONS "FPNG_NO_SSE=1")
+if(NOT MSVC)
+    set_source_files_properties(external/fpng/fpng.cpp PROPERTIES
+            COMPILE_OPTIONS "-fno-strict-aliasing")
+endif()
+
+# set link time optimizations (disabled for Debug builds for speed, disabled
+# for RelWithDebInfo builds due to "lto1: error: two or more sections for"
+# errors)
+check_ipo_supported()
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO OFF)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+
+# resources
+###########
+set_source_files_properties(build/manifest.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(build/icon.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(cfg/manifest.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(cfg/icon.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(cfg/Win32D.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(build/manifest64.rc PROPERTIES LANGUAGE RC)
+set_source_files_properties(stubs/manifest.rc PROPERTIES LANGUAGE RC)
+
+# sources
+#########
+
+set(SOURCE_FILES ${SOURCE_FILES}
+
+        # acio
+        acio/acio.cpp
+        acio/module.cpp
+        acio/pix/pix.cpp
+        acio/core/core.cpp
+        acio/hgth/hgth.cpp
+        acio/bmpu/bmpu.cpp
+        acio/hbhi/hbhi.cpp
+        acio/hdxs/hdxs.cpp
+        acio/kfca/kfca.cpp
+        acio/i36g/i36g.cpp
+        acio/panb/panb.cpp
+        acio/icca/icca.cpp
+        acio/j32d/j32d.cpp
+        acio/bi2a/bi2a.cpp
+        acio/klpa/klpa.cpp
+        acio/mdxf/mdxf.cpp
+        acio/pjei/pjei.cpp
+        acio/pjec/pjec.cpp
+        acio/i36i/i36i.cpp
+        acio/nddb/nddb.cpp
+        acio/la9a/la9a.cpp
+
+        # acioemu
+        acioemu/acioemu.cpp
+        acioemu/device.cpp
+        acioemu/handle.cpp
+        acioemu/icca.cpp
+
+        # acio2emu
+        acio2emu/handle.cpp
+        acio2emu/packet.cpp
+        acio2emu/firmware/bi2x.cpp
+
+        # api
+        api/controller.cpp
+        api/websocket.cpp
+        api/capture_pump.cpp
+        api/h264_stream.cpp
+        api/stream_format.cpp
+        api/stream_server.cpp
+        api/request.cpp
+        api/response.cpp
+        api/module.cpp
+        api/modules/card.cpp
+        api/modules/buttons.cpp
+        api/modules/capture.cpp
+        api/modules/analogs.cpp
+        api/modules/lights.cpp
+        api/modules/memory.cpp
+        api/modules/coin.cpp
+        api/modules/info.cpp
+        api/modules/keypads.cpp
+        api/modules/control.cpp
+        api/modules/touch.cpp
+        api/modules/iidx.cpp
+        api/modules/sdvx.cpp
+        api/serial.cpp
+        api/modules/drs.cpp
+        api/modules/lcd.cpp
+        api/modules/ddr.cpp
+        api/modules/resize.cpp
+
+        # avs
+        avs/core.cpp
+        avs/ea3.cpp
+        avs/game.cpp
+        avs/automap.cpp
+        avs/ssl.cpp
+
+        # build
+        build/defs.cpp
+
+        # cfg
+        cfg/spicecfg.cpp
+        cfg/analog.cpp
+        cfg/game.cpp
+        cfg/button.cpp
+        cfg/config.cpp
+        cfg/api.cpp
+        cfg/option.cpp
+        cfg/light.cpp
+        cfg/configurator.cpp
+        cfg/configurator_wnd.cpp
+        cfg/screen_resize.cpp
+        cfg/controller_presets.cpp
+
+        # easrv
+        easrv/easrv.cpp
+        easrv/smartea.cpp
+
+        # external asio
+        external/asio/asiolist.cpp
+
+        # external cardio
+        external/cardio/cardio_hid.cpp
+        external/cardio/cardio_window.cpp
+        external/cardio/cardio_runner.cpp
+
+        # external misc
+        external/stackwalker/stackwalker.cpp
+        external/tinyxml2/tinyxml2.cpp
+        external/http-parser/http_parser.c
+        external/usbhidusage/usb-hid-usage.c
+        external/fpng/fpng.cpp
+        external/scard/scard.cpp
+
+        # games
+        games/game.cpp
+        games/io.cpp
+        games/shared/lcdhandle.cpp
+        games/shared/printer.cpp
+        games/shared/twtouch.cpp
+        games/popn/popn.cpp
+        games/popn/io.cpp
+        games/popn/bi3a_hook.cpp
+        games/bbc/bbc.cpp
+        games/bbc/io.cpp
+        games/hpm/hpm.cpp
+        games/hpm/io.cpp
+        games/iidx/iidx.cpp
+        games/iidx/io.cpp
+        games/iidx/poke.cpp
+        games/iidx/bi2a.cpp
+        games/iidx/bi2x.cpp
+        games/iidx/bi2x_hook.cpp
+        games/iidx/ezusb.cpp
+        games/iidx/legacy_camera.cpp
+        games/iidx/local_camera.cpp
+        games/iidx/camera.cpp
+        games/iidx/mf_wrappers.cpp
+        games/sdvx/bi2x_hook.cpp
+        games/sdvx/sdvx.cpp
+        games/sdvx/sdvx_live2d.cpp
+        games/sdvx/io.cpp
+        games/sdvx/camera.cpp
+        games/jb/bi2x_hook.cpp
+        games/jb/jb.cpp
+        games/jb/jb_touch.cpp
+        games/jb/io.cpp
+        games/nost/nost.cpp
+        games/nost/io.cpp
+        games/nost/poke.cpp
+        games/nost/touch_mode.cpp
+        games/gitadora/gitadora.cpp
+        games/gitadora/legacy.cpp
+        games/gitadora/legacy_config.cpp
+        games/gitadora/legacy_profile.cpp
+        games/gitadora/asio.cpp
+        games/gitadora/io.cpp
+        games/gitadora/handle.cpp
+        games/gitadora/j32d.cpp
+        games/gitadora/j33i.cpp
+        games/gitadora/bi2x_hook.cpp
+        games/mga/mga.cpp
+        games/mga/io.cpp
+        games/mga/gunio.cpp
+        games/sc/sc.cpp
+        games/sc/io.cpp
+        games/rb/rb.cpp
+        games/rb/io.cpp
+        games/rb/touch.cpp
+        games/rb/touch_debug.cpp
+        games/bs/bs.cpp
+        games/bs/io.cpp
+        games/rf3d/rf3d.cpp
+        games/rf3d/io.cpp
+        games/museca/io.cpp
+        games/museca/museca.cpp
+        games/dea/dea.cpp
+        games/dea/io.cpp
+        games/qma/qma.cpp
+        games/qma/io.cpp games/qma/ezusb.cpp
+        games/ddr/ddr.cpp
+        games/ddr/io.cpp
+        games/ddr/p3io/foot.cpp
+        games/ddr/p3io/p3io.cpp
+        games/ddr/p3io/sate.cpp
+        games/ddr/p3io/usbmem.cpp
+        games/ddr/p4io/p4io.cpp
+        games/ddr/p4io/p4io.h
+        games/mfc/mfc.cpp
+        games/mfc/io.cpp
+        games/ftt/ftt.cpp
+        games/ftt/io.cpp
+        games/loveplus/loveplus.cpp
+        games/loveplus/io.cpp
+        games/scotto/scotto.cpp
+        games/scotto/io.cpp
+        games/drs/drs.cpp
+        games/drs/io.cpp
+        games/drs/motion_cam.cpp
+        games/drs/rgb_cam.cpp
+        games/we/we.cpp
+        games/we/io.cpp
+        games/we/touchpanel.cpp
+        games/shogikai/shogikai.cpp
+        games/shogikai/io.cpp
+        games/otoca/otoca.cpp
+        games/otoca/io.cpp
+        games/otoca/p4io.cpp
+        games/silentscope/silentscope.cpp
+        games/silentscope/io.cpp
+        games/silentscope/projector.cpp
+        games/pcm/pcm.cpp
+        games/pcm/io.cpp
+        games/onpara/onpara.cpp
+        games/onpara/io.cpp
+        games/onpara/westboard.cpp
+        games/onpara/touchpanel.cpp
+        games/bc/bc.cpp
+        games/bc/io.cpp
+        games/ccj/ccj.cpp
+        games/ccj/io.cpp
+        games/ccj/bi2x_hook.cpp
+        games/ccj/trackball.cpp
+        games/qks/qks.cpp
+        games/qks/io.cpp
+        games/qks/bi2x_hook.cpp
+        games/mfg/mfg.cpp
+        games/mfg/io.cpp
+        games/mfg/bi2a_hook.cpp
+        games/pc/pc.cpp
+        games/pc/io.cpp
+        games/pc/bi2x_hook.cpp
+        games/udn/udn.cpp
+        games/udn/io.cpp
+        games/udn/bi2x_hook.cpp
+        games/cardconnect/cardconnect.cpp
+        games/cardconnect/io.cpp
+        games/cardconnect/bi2x_hook.cpp
+        games/cardconnect/printer.cpp
+
+        # hooks
+        hooks/audio/acm.cpp
+        hooks/audio/audio.cpp
+        hooks/audio/asio_driver_scan.cpp
+        hooks/audio/asio_proxy.cpp
+        hooks/audio/buffer.cpp
+        hooks/audio/mme.cpp
+        hooks/audio/util.cpp
+        hooks/audio/xact.cpp
+        hooks/audio/backends/dsound/dsound_backend.cpp
+        hooks/audio/backends/mmdevice/audio_endpoint_volume.cpp
+        hooks/audio/backends/mmdevice/device.cpp
+        hooks/audio/backends/mmdevice/device_collection.cpp
+        hooks/audio/backends/mmdevice/device_enumerator.cpp
+        hooks/audio/backends/mmdevice/null_device.cpp
+        hooks/audio/backends/mmdevice/null_discard_backend.cpp
+        hooks/audio/backends/wasapi/audio_client.cpp
+        hooks/audio/backends/wasapi/audio_render_client.cpp
+        hooks/audio/backends/wasapi/downmix.cpp
+        hooks/audio/backends/wasapi/resample.cpp
+        hooks/audio/backends/wasapi/shared.cpp
+        hooks/audio/backends/wasapi/dummy_audio_client.cpp
+        hooks/audio/backends/wasapi/dummy_audio_clock.cpp
+        hooks/audio/backends/wasapi/dummy_audio_render_client.cpp
+        hooks/audio/backends/wasapi/dummy_audio_session_control.cpp
+        hooks/audio/backends/wasapi/low_latency_client.cpp
+        hooks/audio/backends/wasapi/util.cpp
+        hooks/audio/implementations/asio.cpp
+        hooks/audio/implementations/wave_out.cpp
+        hooks/avshook.cpp
+        hooks/cfgmgr32hook.cpp
+        hooks/debughook.cpp
+        hooks/devicehook.cpp
+        hooks/graphics/graphics.cpp
+        hooks/graphics/graphics_windowed.cpp
+        hooks/graphics/jpeg_encoder.cpp
+        hooks/graphics/nvapi_impl.cpp
+        hooks/graphics/nvapi_hook.cpp
+        hooks/graphics/nvenc_hook.cpp
+        hooks/graphics/backends/d3d9/d3d9_backend.cpp
+        hooks/graphics/backends/d3d9/d3d9_readback.cpp
+        hooks/graphics/backends/d3d9/d3d9_screenshot.cpp
+        hooks/graphics/backends/d3d9/d3d9_device.cpp
+        hooks/graphics/backends/d3d9/d3d9_gfdm.cpp
+        hooks/graphics/backends/d3d9/d3d9_live2d.cpp
+        hooks/graphics/backends/d3d9/d3d9_fake_swapchain.cpp
+        hooks/graphics/backends/d3d9/d3d9_swapchain.cpp
+        hooks/graphics/backends/d3d9/d3d9_texture.cpp
+        hooks/graphics/backends/d3d11/d3d11_backend.cpp
+        hooks/graphics/backends/d3d11/d3d11_swapchain.cpp
+        hooks/graphics/backends/d3d11/d3d11_swapchain_udn.cpp
+        hooks/graphics/backends/d3d11/d3d11_factory.cpp
+        hooks/graphics/backends/d3d11/d3d11_vtable_capture.cpp
+        hooks/graphics/backends/d3d11/d3d11_screenshot.cpp
+        hooks/input/dinput8/fake_backend.cpp
+        hooks/input/dinput8/fake_device.cpp
+        hooks/input/dinput8/hook.cpp
+        hooks/lang.cpp
+        hooks/libraryhook.cpp
+        hooks/networkhook.cpp
+        hooks/icmphook_net.cpp
+        hooks/icmphook_iphlpapi.cpp
+        hooks/nicspoof.cpp
+        hooks/nicspoof_tunnel.cpp
+        hooks/powrprof.cpp
+        #hooks/rom.cpp
+        hooks/setupapihook.cpp
+        hooks/sleephook.cpp
+        hooks/unisintrhook.cpp
+        hooks/winuser.cpp
+
+        # launcher
+        launcher/launcher.cpp
+        launcher/signal.cpp
+        launcher/superexit.cpp
+        launcher/logger.cpp
+        launcher/richpresence.cpp
+        launcher/shutdown.cpp
+        launcher/options.cpp
+
+        # misc
+        misc/bt5api.cpp
+        misc/clipboard.cpp
+        misc/device.cpp
+        misc/eamuse.cpp
+        misc/extdev.cpp
+        misc/hotkeys.cpp
+        misc/sciunit.cpp
+        misc/sde.cpp
+        misc/wintouchemu.cpp
+        misc/ami2000.cpp
+
+        # nvapi
+        nvapi/nvapi.cpp
+
+        # overlay
+        overlay/overlay.cpp
+        overlay/notifications.cpp
+        overlay/window.cpp
+        overlay/imgui/extensions.cpp
+        overlay/imgui/impl_spice.cpp
+        overlay/imgui/impl_sw.cpp
+        overlay/windows/acio_status_buffers.cpp
+        overlay/windows/camera_control.cpp
+        overlay/windows/card_manager.cpp
+        overlay/windows/drs_dancefloor.cpp
+        overlay/windows/gfdm_sub.cpp
+        overlay/windows/screen_resize.cpp
+        overlay/windows/sdvx_sub.cpp
+        overlay/windows/config.cpp
+        overlay/windows/controller_presets.cpp
+        overlay/windows/control.cpp
+        overlay/windows/eadev.cpp
+        overlay/windows/fps.cpp
+        overlay/windows/generic_sub.cpp
+        overlay/windows/iidx_seg.cpp
+        overlay/windows/iidx_sub.cpp
+        overlay/windows/iopanel.cpp
+        overlay/windows/iopanel_ddr.cpp
+        overlay/windows/iopanel_gfdm.cpp
+        overlay/windows/iopanel_iidx.cpp
+        overlay/windows/keypad.cpp
+        overlay/windows/log.cpp
+        overlay/windows/midi.cpp
+        overlay/windows/nostalgia_touch_piano.cpp
+        overlay/windows/obs.cpp
+        overlay/windows/obs_websocket.cpp
+        overlay/windows/patch_manager.cpp
+        overlay/windows/popn_sub.cpp
+        overlay/windows/wnd_manager.cpp
+
+        # patcher
+        patcher/config.cpp
+        patcher/lifecycle.cpp
+        patcher/loader.cpp
+        patcher/loader_group.cpp
+        patcher/runtime.cpp
+
+        # external
+        external/easywsclient/easywsclient.cpp
+
+        # rawinput
+        rawinput/rawinput.cpp
+        rawinput/rawinput_handles.cpp
+        rawinput/midi.cpp
+        rawinput/sextet.cpp
+        rawinput/piuio.cpp
+        rawinput/touch.cpp
+        rawinput/hotplug.cpp
+        rawinput/smx.cpp
+        rawinput/smx.h
+        rawinput/smxstage.cpp
+        rawinput/smxstage.h
+        rawinput/smxdedicab.cpp
+        rawinput/smxdedicab.h
+        rawinput/xinput.cpp
+        rawinput/xinput.h
+
+        # reader
+        reader/reader.cpp
+        reader/message.cpp
+        reader/structuredmessage.cpp
+        reader/crypt.cpp
+
+        # sdk
+        sdk/d3d9.cpp
+        sdk/modules.cpp
+        sdk/sdk.cpp
+
+        # stubs
+        stubs/stubs.cpp
+
+        # touch
+        touch/gdi_overlay.cpp
+        touch/native/inject.cpp
+        touch/native/inject_mouse.cpp
+        touch/native/inject_synthetic.cpp
+        touch/native/nativetouchhook.cpp
+        touch/native/transform.cpp
+        touch/touch.cpp
+        touch/touch_gestures.cpp
+        touch/win7.cpp
+        touch/win8.cpp
+
+        # util
+        util/sigscan.cpp
+        util/detour.cpp
+        util/logging.cpp
+        util/detour.cpp
+        util/peb.cpp
+        util/libutils.cpp
+        util/fileutils.cpp
+        util/resutils.cpp
+        util/unity_player.cpp
+        util/utils.cpp
+        util/memutils.cpp
+        util/rc4.cpp
+        util/crypt.cpp
+        util/time.cpp
+        util/cpuutils.cpp
+        util/netutils.cpp
+        util/precise_timer.cpp
+        util/sysutils.cpp
+        util/lz77.cpp
+        util/tapeled.cpp
+        util/execexe.cpp
+        util/dependencies.cpp
+        util/deferlog.cpp
+        util/socd_cleaner.cpp
+)
+
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} PREFIX "Source Files" FILES ${SOURCE_FILES})
+
+# guard against statically importing DLLs that must always be loaded dynamically:
+#   * DLLs users override via the modules directory (e.g. DXVK's d3d9.dll) - a
+#     static import loads the system copy at startup and preempts the override
+#     (issue #779).
+#   * Media Foundation DLLs (mf/mfplat/mfreadwrite) - a static import breaks
+#     Unity games.
+# the check runs objdump on each produced binary and fails the build if any
+# forbidden DLL is imported.
+set(SPICE_FORBIDDEN_STATIC_IMPORTS
+        d3d8.dll d3d9.dll d3d10core.dll d3d11.dll dxgi.dll opengl32.dll
+        mf.dll mfplat.dll mfreadwrite.dll)
+
+function(spice_guard_dll_imports target)
+    if(MSVC)
+        # objdump-based parsing assumes a GNU/LLVM toolchain
+        return()
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                -DOBJDUMP=${CMAKE_OBJDUMP}
+                -DTARGET_FILE=$<TARGET_FILE:${target}>
+                "-DFORBIDDEN=${SPICE_FORBIDDEN_STATIC_IMPORTS}"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_static_dll_imports.cmake
+            VERBATIM
+            COMMENT "Checking ${target} for forbidden static DLL imports")
+endfunction()
+
+# spice.exe / spice_laa.exe shared objects
+###########################################
+# spice.exe and spice_laa.exe are compiled identically; the only difference is
+# the large-address-aware bit, which is set at link time. Compile the sources
+# once into a shared OBJECT library so spice_laa.exe only costs an extra link
+# instead of a full recompile.
+
+add_library(spicetools_spice_objs OBJECT ${SOURCE_FILES})
+target_link_libraries(spicetools_spice_objs
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features spice_jpeg spice_x264)
+target_link_libraries(spicetools_spice_objs PUBLIC winscard)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_spice_objs PROPERTIES COMPILE_FLAGS "-m32")
+endif()
+
+# spice.exe
+###########
+
+set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_spice ${RESOURCE_FILES})
+target_link_libraries(spicetools_spice PRIVATE spicetools_spice_objs)
+set_target_properties(spicetools_spice PROPERTIES PREFIX "")
+set_target_properties(spicetools_spice PROPERTIES OUTPUT_NAME "spice")
+
+IF(NOT MSVC)
+    set_target_properties(spicetools_spice PROPERTIES LINK_FLAGS "-m32")
+endif()
+
+# spice_laa.exe
+###########
+
+set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_spice_laa ${RESOURCE_FILES})
+target_link_libraries(spicetools_spice_laa PRIVATE spicetools_spice_objs)
+set_target_properties(spicetools_spice_laa PROPERTIES PREFIX "")
+set_target_properties(spicetools_spice_laa PROPERTIES OUTPUT_NAME "spice_laa")
+
+IF(NOT MSVC)
+    set_target_properties(spicetools_spice_laa PROPERTIES LINK_FLAGS "-m32 -Wl,--large-address-aware")
+endif()
+
+# spice_linux.exe
+###########
+
+set(RESOURCE_FILES build/manifest.manifest build/manifest.rc build/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_spice_linux ${SOURCE_FILES} ${RESOURCE_FILES})
+target_link_libraries(spicetools_spice_linux
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features spice_jpeg spice_x264)
+set_target_properties(spicetools_spice_linux PROPERTIES PREFIX "")
+set_target_properties(spicetools_spice_linux PROPERTIES OUTPUT_NAME "spice_linux")
+target_compile_definitions(spicetools_spice_linux PRIVATE NO_SCARD=1 PRIVATE SPICE_LINUX=1)
+
+IF(NOT MSVC)
+    set_target_properties(spicetools_spice_linux PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# spice64.exe
+#############
+
+set(RESOURCE_FILES build/manifest.manifest build/manifest64.rc build/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_spice64 ${SOURCE_FILES} ${RESOURCE_FILES})
+
+# do NOT link against: mf, mfplat, mfreadwrite; otherwise unity games will break
+target_link_libraries(spicetools_spice64
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp mfuuid strmiids dxva2
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features spice_jpeg spice_x264)
+target_link_libraries(spicetools_spice64 PUBLIC winscard)
+set_target_properties(spicetools_spice64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_spice64 PROPERTIES OUTPUT_NAME "spice64")
+target_compile_definitions(spicetools_spice64 PRIVATE SPICE64=1)
+if(NOT SPICE_XP)
+    target_link_libraries(spicetools_spice64 PUBLIC d3d11 dxgi)
+    target_compile_definitions(spicetools_spice64 PRIVATE SPICE_D3D11=1)
+endif()
+
+IF(NOT MSVC)
+    set_target_properties(spicetools_spice64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# spice64_linux.exe
+#############
+
+set(RESOURCE_FILES build/manifest.manifest build/manifest64.rc build/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_spice64_linux ${SOURCE_FILES} ${RESOURCE_FILES})
+
+# do NOT link against: mf, mfplat, mfreadwrite; otherwise unity games will break
+target_link_libraries(spicetools_spice64_linux
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp mfuuid strmiids dxva2
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features spice_jpeg spice_x264)
+set_target_properties(spicetools_spice64_linux PROPERTIES PREFIX "")
+set_target_properties(spicetools_spice64_linux PROPERTIES OUTPUT_NAME "spice64_linux")
+target_compile_definitions(spicetools_spice64_linux PRIVATE SPICE64=1)
+target_compile_definitions(spicetools_spice64_linux PRIVATE NO_SCARD=1 PRIVATE SPICE_LINUX=1)
+# spice64_linux is never built under the WinXP toolchain, so dx11 is always on.
+target_link_libraries(spicetools_spice64_linux PUBLIC d3d11 dxgi)
+target_compile_definitions(spicetools_spice64_linux PRIVATE SPICE_D3D11=1)
+
+IF(NOT MSVC)
+    set_target_properties(spicetools_spice64_linux PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# spicecfg.exe
+##############
+
+set(SOURCE_FILES ${SOURCE_FILES} launcher/options.h launcher/options.cpp)
+set(RESOURCE_FILES cfg/manifest.manifest cfg/manifest.rc cfg/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_cfg WIN32 ${SOURCE_FILES} ${RESOURCE_FILES})
+# the configurator serves neither the API nor the video stream, so it needs no codecs
+target_link_libraries(spicetools_cfg
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp strmiids
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features)
+target_link_libraries(spicetools_cfg PUBLIC winscard)
+set_target_properties(spicetools_cfg PROPERTIES PREFIX "")
+set_target_properties(spicetools_cfg PROPERTIES OUTPUT_NAME "spicecfg")
+target_compile_definitions(spicetools_cfg PRIVATE SPICETOOLS_SPICECFG_STANDALONE=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_cfg PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# spicecfg_linux.exe
+##############
+
+set(SOURCE_FILES ${SOURCE_FILES} launcher/options.h launcher/options.cpp)
+set(RESOURCE_FILES cfg/manifest.manifest cfg/manifest.rc cfg/icon.rc cfg/Win32D.rc)
+add_executable(spicetools_cfg_linux WIN32 ${SOURCE_FILES} ${RESOURCE_FILES})
+target_link_libraries(spicetools_cfg_linux
+        PUBLIC d3d9 ws2_32 version comctl32 shlwapi iphlpapi hid secur32 setupapi psapi winmm winhttp strmiids
+        PRIVATE fmt::fmt-header-only discord-rpc imgui hash-library minhook wslay imm32 dwmapi CpuFeatures::cpu_features)
+set_target_properties(spicetools_cfg_linux PROPERTIES PREFIX "")
+set_target_properties(spicetools_cfg_linux PROPERTIES OUTPUT_NAME "spicecfg_linux")
+target_compile_definitions(spicetools_cfg_linux PRIVATE SPICETOOLS_SPICECFG_STANDALONE=1)
+target_compile_definitions(spicetools_cfg_linux PRIVATE NO_SCARD=1 PRIVATE SPICE_LINUX=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_cfg_linux PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# stubs
+#######
+
+# kbt.dll
+set(SOURCE_FILES stubs/stubs.cpp)
+add_library(spicetools_stubs_kbt SHARED ${SOURCE_FILES} stubs/stubs.def)
+target_link_libraries(spicetools_stubs_kbt PRIVATE fmt::fmt-header-only)
+set_target_properties(spicetools_stubs_kbt PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_kbt PROPERTIES OUTPUT_NAME "kbt")
+target_compile_definitions(spicetools_stubs_kbt PRIVATE STUB=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_kbt PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# kbt.dll 64bit
+add_library(spicetools_stubs_kbt64 SHARED ${SOURCE_FILES} stubs/stubs.def)
+target_link_libraries(spicetools_stubs_kbt64 PRIVATE fmt::fmt-header-only)
+set_target_properties(spicetools_stubs_kbt64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_kbt64 PROPERTIES OUTPUT_NAME "kbt")
+target_compile_definitions(spicetools_stubs_kbt64 PRIVATE STUB=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_kbt64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# kld.dll
+set(SOURCE_FILES stubs/stubs.cpp)
+add_library(spicetools_stubs_kld SHARED ${SOURCE_FILES} stubs/stubs.def)
+target_link_libraries(spicetools_stubs_kld PRIVATE fmt::fmt-header-only)
+set_target_properties(spicetools_stubs_kld PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_kld PROPERTIES OUTPUT_NAME "kld")
+target_compile_definitions(spicetools_stubs_kld PRIVATE STUB=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_kld PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# kld.dll 64bit
+add_library(spicetools_stubs_kld64 SHARED ${SOURCE_FILES} stubs/stubs.def)
+target_link_libraries(spicetools_stubs_kld64 PRIVATE fmt::fmt-header-only)
+set_target_properties(spicetools_stubs_kld64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_kld64 PROPERTIES OUTPUT_NAME "kld")
+target_compile_definitions(spicetools_stubs_kld64 PRIVATE STUB=1)
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_kld64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# nvcuda.dll
+set(SOURCE_FILES stubs/nvcuda.cpp)
+set(RESOURCE_FILES stubs/manifest.rc)
+add_library(spicetools_stubs_nvcuda SHARED ${SOURCE_FILES} ${RESOURCE_FILES} stubs/nvcuda.def)
+set_target_properties(spicetools_stubs_nvcuda PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_nvcuda PROPERTIES OUTPUT_NAME "nvcuda")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_nvcuda PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# nvcuvid.dll
+set(SOURCE_FILES stubs/nvcuvid.cpp)
+set(RESOURCE_FILES stubs/manifest.rc)
+add_library(spicetools_stubs_nvcuvid SHARED ${SOURCE_FILES} ${RESOURCE_FILES} stubs/nvcuvid.def)
+set_target_properties(spicetools_stubs_nvcuvid PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_nvcuvid PROPERTIES OUTPUT_NAME "nvcuvid")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_nvcuvid PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# nvEncodeAPI64.dll
+set(SOURCE_FILES stubs/nvEncodeAPI64.cpp)
+set(RESOURCE_FILES stubs/manifest.rc)
+add_library(spicetools_stubs_nvEncodeAPI64 SHARED ${SOURCE_FILES} ${RESOURCE_FILES} stubs/nvEncodeAPI64.def)
+set_target_properties(spicetools_stubs_nvEncodeAPI64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_nvEncodeAPI64 PROPERTIES OUTPUT_NAME "nvEncodeAPI64")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_nvEncodeAPI64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# cpusbxpkm.dll (32 bit)
+set(SOURCE_FILES stubs/cpusbxpkm.cpp)
+set(RESOURCE_FILES stubs/manifest.rc)
+add_library(spicetools_stubs_cpusbxpkm SHARED ${SOURCE_FILES} ${RESOURCE_FILES} stubs/cpusbxpkm.def)
+set_target_properties(spicetools_stubs_cpusbxpkm PROPERTIES PREFIX "")
+set_target_properties(spicetools_stubs_cpusbxpkm PROPERTIES OUTPUT_NAME "cpusbxpkm")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_stubs_cpusbxpkm PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# sdk_sample_v0_flat_c.dll (32 bit)
+set(SOURCE_FILES sdk/sample/v0/flat_c/v0_flat_c.c)
+add_library(spicetools_sdk_sample_v0_flat_c_32 SHARED ${SOURCE_FILES} ${RESOURCE_FILES} sdk/sample/v0/flat_c/v0_flat_c.def)
+set_target_properties(spicetools_sdk_sample_v0_flat_c_32 PROPERTIES PREFIX "")
+set_target_properties(spicetools_sdk_sample_v0_flat_c_32 PROPERTIES OUTPUT_NAME "sdk_sample_v0_flat_c")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_sdk_sample_v0_flat_c_32 PROPERTIES COMPILE_FLAGS "-m32" LINK_FLAGS "-m32")
+endif()
+
+# sdk_sample_v0_flat_c.dll (64 bit)
+set(SOURCE_FILES sdk/sample/v0/flat_c/v0_flat_c.c)
+add_library(spicetools_sdk_sample_v0_flat_c_64 SHARED ${SOURCE_FILES} ${RESOURCE_FILES} sdk/sample/v0/flat_c/v0_flat_c.def)
+set_target_properties(spicetools_sdk_sample_v0_flat_c_64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_sdk_sample_v0_flat_c_64 PROPERTIES OUTPUT_NAME "sdk_sample_v0_flat_c")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_sdk_sample_v0_flat_c_64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# sdk_sample_v0_cpp.dll (64 bit)
+set(SOURCE_FILES
+    sdk/sample/v0/cpp/v0_cpp.cpp
+    sdk/sample/v0/cpp/v0_cpp_imgui.cpp
+    external/imgui/imgui.cpp
+    external/imgui/imgui_draw.cpp
+    external/imgui/imgui_tables.cpp
+    external/imgui/imgui_widgets.cpp
+    external/imgui/backends/imgui_impl_dx9.cpp)
+add_library(spicetools_sdk_sample_v0_cpp_64 SHARED ${SOURCE_FILES} ${RESOURCE_FILES} sdk/sample/v0/cpp/v0_cpp.def)
+target_link_libraries(spicetools_sdk_sample_v0_cpp_64 PRIVATE imm32)
+set_target_properties(spicetools_sdk_sample_v0_cpp_64 PROPERTIES PREFIX "")
+set_target_properties(spicetools_sdk_sample_v0_cpp_64 PROPERTIES OUTPUT_NAME "sdk_sample_v0_cpp")
+
+if(NOT MSVC)
+    set_target_properties(spicetools_sdk_sample_v0_cpp_64 PROPERTIES COMPILE_FLAGS "-m64" LINK_FLAGS "-m64")
+endif()
+
+# output directories
+####################
+
+# output config
+set_target_properties(spicetools_cfg spicetools_cfg_linux
+        PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spicetools")
+
+# output 32bit
+set_target_properties(spicetools_spice spicetools_spice_laa spicetools_spice_linux spicetools_stubs_kbt spicetools_stubs_kld spicetools_stubs_cpusbxpkm spicetools_sdk_sample_v0_flat_c_32
+        PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/archive32"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spicetools/32"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spicetools/32")
+
+# output 64bit
+set_target_properties(spicetools_spice64 spicetools_spice64_linux spicetools_stubs_kbt64 spicetools_stubs_kld64 spicetools_stubs_nvcuda spicetools_stubs_nvcuvid spicetools_stubs_nvEncodeAPI64 spicetools_sdk_sample_v0_flat_c_64 spicetools_sdk_sample_v0_cpp_64
+        PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/archive64"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spicetools/64"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spicetools/64")
+
+# forbidden static DLL import guard
+###################################
+# apply the check to every executable and DLL produced by this project.
+get_property(spice_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY BUILDSYSTEM_TARGETS)
+foreach(spice_target IN LISTS spice_all_targets)
+    get_target_property(spice_target_type ${spice_target} TYPE)
+    if(spice_target_type STREQUAL "EXECUTABLE"
+            OR spice_target_type STREQUAL "SHARED_LIBRARY"
+            OR spice_target_type STREQUAL "MODULE_LIBRARY")
+        spice_guard_dll_imports(${spice_target})
+    endif()
+endforeach()

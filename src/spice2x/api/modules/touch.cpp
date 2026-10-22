@@ -1,0 +1,260 @@
+#include "touch.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+
+#include "external/rapidjson/document.h"
+#include "avs/game.h"
+#include "hooks/graphics/graphics.h"
+#include "misc/eamuse.h"
+#include "launcher/launcher.h"
+#include "touch/touch.h"
+#include "touch/native/inject.h"
+#include "touch/native/nativetouchhook.h"
+#include "touch/native/transform.h"
+#include "util/utils.h"
+#include "games/gitadora/gitadora.h"
+#include "games/iidx/iidx.h"
+
+using namespace std::placeholders;
+using namespace rapidjson;
+
+
+namespace api::modules {
+
+    static bool inject_native_touch(
+            const std::vector<TouchPoint> &touch_points, int canvas_w, int canvas_h) {
+        if (touch_points.empty()) {
+            // no active touches remain; release the synthetic contact
+            return nativetouch::inject::inject_synthetic_touch({ 0, 0 }, false);
+        }
+
+        // only a single synthetic contact is supported, so just use the first touch point
+        const auto &touch = touch_points.front();
+        POINT position { touch.x, touch.y };
+        if (canvas_w > 0 && canvas_h > 0) {
+            return nativetouch::inject::inject_synthetic_touch_from_canvas(
+                position,
+                { canvas_w, canvas_h },
+                true);
+        }
+        return nativetouch::inject::inject_synthetic_touch(position, true);
+    }
+
+    // map API coordinates onto the touch space SDVX reads, which depends on how it is displayed
+    static void sdvx_touch_errata(
+            int &x, int &y, bool use_native, int canvas_w, int canvas_h) {
+
+        // windowed coordinates already match the sub screen window they land on
+        if (GRAPHICS_WINDOWED) {
+            return;
+        }
+
+        // landscape mode: native injection hands the game these coordinates
+        // unchanged, so apply the rotation the touchscreen gets, while wintouchemu instead
+        // rotates them later through the subscreen overlay
+        if (GRAPHICS_FS_ORIENTATION_SWAP) {
+            if (use_native) {
+                POINT position { x, y };
+                if (nativetouch::transform::sdvx_landscape_rotate(&position, canvas_w, canvas_h)) {
+                    x = position.x;
+                    y = position.y;
+                }
+            }
+            return;
+        }
+
+        // rotate into the portrait touch space
+        const int x_raw = x;
+        x = canvas_w - y;
+        y = x_raw;
+    }
+
+    Touch::Touch() : Module("touch") {
+        is_sdvx = avs::game::is_model("KFC");
+
+        is_tdj_fhd = (avs::game::is_model("LDJ") && games::iidx::is_tdj_fhd());
+        // special case: when windowed subscreen is in use, use the original coords
+        if (GRAPHICS_IIDX_WSUB) {
+            is_tdj_fhd = false;
+        }
+
+        use_native = nativetouch::is_hooked();
+
+        // resolution the API/companion sends native touch coordinates in (after errata)
+        native_canvas_w = 0;
+        native_canvas_h = 0;
+        if (is_sdvx) {
+            // windowed API coordinates land on the sub screen window as-is; fullscreen
+            // coordinates are rotated into the game's touch space by apply_touch_errata
+            const bool landscape_coordinates =
+                GRAPHICS_WINDOWED || GRAPHICS_FS_ORIENTATION_SWAP;
+            native_canvas_w = landscape_coordinates ? 1920 : 1080;
+            native_canvas_h = landscape_coordinates ? 1080 : 1920;
+        } else if (avs::game::is_model("LDJ")) {
+            // TDJ subscreen; FHD models are upscaled to 1080p by apply_touch_errata
+            native_canvas_w = is_tdj_fhd ? 1920 : 1280;
+            native_canvas_h = is_tdj_fhd ? 1080 : 720;
+        } else if (avs::game::is_model("M39")) {
+            // pop'n music API touch surface
+            native_canvas_w = 1280;
+            native_canvas_h = 800;
+        } else if (games::gitadora::is_arena_model()) {
+            // GITADORA arena SMALL subscreen, either in its own window or in the overlay
+            native_canvas_w = games::gitadora::ARENA_SUBSCREEN_WIDTH;
+            native_canvas_h = games::gitadora::ARENA_SUBSCREEN_HEIGHT;
+        }
+
+        functions["read"] = std::bind(&Touch::read, this, _1, _2);
+        functions["write"] = std::bind(&Touch::write, this, _1, _2);
+        functions["write_reset"] = std::bind(&Touch::write_reset, this, _1, _2);
+    }
+
+    /**
+     * read()
+     */
+    void Touch::read(api::Request &req, Response &res) {
+
+        // get touch points
+        std::vector<TouchPoint> touch_points;
+        touch_get_points(touch_points);
+
+        // add state for each touch point
+        for (auto &touch : touch_points) {
+            Value state(kArrayType);
+            Value id((uint64_t) touch.id);
+            Value x((int64_t) touch.x);
+            Value y((int64_t) touch.y);
+            Value mouse((bool) touch.mouse);
+            state.PushBack(id, res.doc()->GetAllocator());
+            state.PushBack(x, res.doc()->GetAllocator());
+            state.PushBack(y, res.doc()->GetAllocator());
+            state.PushBack(mouse, res.doc()->GetAllocator());
+            res.add_data(state);
+        }
+    }
+
+    /**
+     * write([id: uint, x: int, y: int], ...)
+     */
+    void Touch::write(Request &req, Response &res) {
+
+        // get all touch points
+        std::vector<TouchPoint> touch_points;
+        for (Value &param : req.params.GetArray()) {
+
+            // check params
+            if (param.Size() < 3) {
+                error_params_insufficient(res);
+                continue;
+            }
+            if (!param[0].IsUint()) {
+                error_type(res, "id", "uint");
+                continue;
+            }
+            if (!param[1].IsInt()) {
+                error_type(res, "x", "int");
+                continue;
+            }
+            if (!param[2].IsInt()) {
+                error_type(res, "y", "int");
+                continue;
+            }
+            // TODO: optional mouse parameter
+
+            // get params
+            auto touch_id = param[0].GetUint();
+            auto touch_x = param[1].GetInt();
+            auto touch_y = param[2].GetInt();
+
+            apply_touch_errata(touch_x, touch_y);
+
+            touch_points.emplace_back(TouchPoint {
+                .id = touch_id,
+                .x = touch_x,
+                .y = touch_y,
+                .mouse = false,
+            });
+        }
+
+        // apply touch points
+        if (use_native) {
+            write_native(touch_points);
+        } else {
+            touch_write_points(&touch_points);
+        }
+    }
+
+    /**
+     * write_reset(id: uint, ...)
+     */
+    void Touch::write_reset(Request &req, Response &res) {
+
+        // get all IDs
+        std::vector<DWORD> touch_point_ids;
+        for (Value &param : req.params.GetArray()) {
+
+            // check params
+            if (!param.IsUint()) {
+                error_type(res, "id", "uint");
+                continue;
+            }
+
+            // remember touch ID
+            auto touch_id = param.GetUint();
+            touch_point_ids.emplace_back(touch_id);
+        }
+
+        // remove all IDs
+        if (use_native) {
+            write_reset_native(touch_point_ids);
+        } else {
+            touch_remove_points(&touch_point_ids);
+        }
+    }
+
+    void Touch::write_native(const std::vector<TouchPoint> &touch_points) {
+        if (touch_points.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(native_touch_mutex);
+        const auto touch_id = touch_points.front().id;
+        if (native_touch_id && *native_touch_id != touch_id) {
+            if (!inject_native_touch({}, native_canvas_w, native_canvas_h)) {
+                return;
+            }
+            native_touch_id.reset();
+        }
+        if (inject_native_touch(touch_points, native_canvas_w, native_canvas_h)) {
+            native_touch_id = touch_id;
+        }
+    }
+
+    void Touch::write_reset_native(const std::vector<DWORD> &touch_point_ids) {
+        std::lock_guard<std::mutex> lock(native_touch_mutex);
+        if (!native_touch_id ||
+                std::find(
+                    touch_point_ids.begin(),
+                    touch_point_ids.end(),
+                    *native_touch_id) == touch_point_ids.end()) {
+            return;
+        }
+        if (inject_native_touch({}, native_canvas_w, native_canvas_h)) {
+            native_touch_id.reset();
+        }
+    }
+
+    void Touch::apply_touch_errata(int &x, int &y) {
+        if (is_tdj_fhd) {
+            // deal with TDJ FHD resolution mismatch (upgrade 720p to 1080p)
+            // we don't know what screen is being shown on the companion and the API doesn't specify
+            // the target of the touch events so just assume it's the sub screen
+            x = x * 1920 / 1280;
+            y = y * 1080 / 720;
+        } else if (is_sdvx) {
+            sdvx_touch_errata(x, y, use_native, native_canvas_w, native_canvas_h);
+        }
+    }
+}
