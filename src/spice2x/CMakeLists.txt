@@ -478,6 +478,9 @@ set(SOURCE_FILES ${SOURCE_FILES}
         games/nost/touch_mode.cpp
         games/gitadora/gitadora.cpp
         games/gitadora/legacy.cpp
+        games/gitadora/legacy_codec.cpp
+        games/gitadora/legacy_movie.cpp
+        games/gitadora/legacy_movie_pool.cpp
         games/gitadora/legacy_config.cpp
         games/gitadora/legacy_profile.cpp
         games/gitadora/asio.cpp

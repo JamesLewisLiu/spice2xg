@@ -1,4 +1,5 @@
 #include "legacy.h"
+#include "legacy_movie.h"
 #include "legacy_profile.h"
 
 #include <filesystem>
@@ -25,6 +26,9 @@ namespace games::gitadora::legacy {
 #if SPICE64
         log_fatal("gdxg-legacy", "XG1 requires the 32-bit spice.exe");
 #else
+        // Reserve the movie address space while parsing launcher options,
+        // before AVS heaps, renderers, or native game modules are initialized.
+        movie::prepare();
         auto absolute_path = std::filesystem::absolute(std::filesystem::u8path(path));
         std::ifstream input(absolute_path, std::ios::binary);
         if (!input) {

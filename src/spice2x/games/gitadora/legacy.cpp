@@ -1,4 +1,6 @@
 #include "legacy.h"
+#include "legacy_codec.h"
+#include "legacy_movie.h"
 
 #include <atomic>
 #include <map>
@@ -384,6 +386,11 @@ namespace games::gitadora::legacy {
         }
         exit_requests_enabled.store(true, std::memory_order_release);
         load();
+        // The launcher's global audio COM hook runs after load(). Install the
+        // narrow movie hook here so it chains to audio instead of being replaced
+        // by the global IAT sweep before the first native movie request.
+        codec::attach(libutils::get_module("libmovie.dll"));
+        movie::attach(libutils::get_module("libmovie.dll"), avs::game::DLL_INSTANCE);
         host.quit = false;
         host.timer_initialized = timeBeginPeriod(1) == TIMERR_NOERROR;
         native.debug_memory_initialize();
