@@ -1,6 +1,7 @@
 #include "legacy.h"
 #include "legacy_codec.h"
 #include "legacy_movie.h"
+#include "legacy_texture.h"
 
 #include <atomic>
 #include <map>
@@ -391,6 +392,7 @@ namespace games::gitadora::legacy {
         // by the global IAT sweep before the first native movie request.
         codec::attach(libutils::get_module("libmovie.dll"));
         movie::attach(libutils::get_module("libmovie.dll"), avs::game::DLL_INSTANCE);
+        texture::attach(libutils::get_module("libgftools.dll"));
         host.quit = false;
         host.timer_initialized = timeBeginPeriod(1) == TIMERR_NOERROR;
         native.debug_memory_initialize();

@@ -9,6 +9,7 @@
 
 #include "acio/acio.h"
 #include "external/stackwalker/stackwalker.h"
+#include "games/gitadora/legacy.h"
 #include "hooks/libraryhook.h"
 #include "launcher/shutdown.h"
 #include "util/deferlog.h"
@@ -344,14 +345,15 @@ static void log_exception_context(struct _EXCEPTION_POINTERS *ExceptionInfo, DWO
 #endif
 }
 
-static void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo) {
+static void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo,
+        const char *filename = "minidump.dmp") {
     if (MiniDumpWriteDump_local == nullptr) {
         log_warning("signal", "minidump creation function not available, skipping");
         return;
     }
 
     HANDLE minidump_file = CreateFileA(
-        "minidump.dmp",
+        filename,
         GENERIC_WRITE,
         0,
         nullptr,
@@ -360,8 +362,8 @@ static void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo) {
         nullptr);
 
     if (minidump_file == INVALID_HANDLE_VALUE) {
-        log_warning("signal", "failed to create 'minidump.dmp' for minidump: 0x{:08x}",
-                GetLastError());
+        log_warning("signal", "failed to create '{}' for minidump: 0x{:08x}",
+                filename, GetLastError());
         return;
     }
 
@@ -418,14 +420,14 @@ static void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo) {
 
     if (minidump_written) {
         if (minidump_size_available) {
-            log_info("signal", "wrote minidump to 'minidump.dmp' (type=0x{:08x}, size={} bytes)",
-                    static_cast<unsigned>(written_type), minidump_size.QuadPart);
+            log_info("signal", "wrote minidump to '{}' (type=0x{:08x}, size={} bytes)",
+                    filename, static_cast<unsigned>(written_type), minidump_size.QuadPart);
         } else {
-            log_info("signal", "wrote minidump to 'minidump.dmp' (type=0x{:08x})",
-                    static_cast<unsigned>(written_type));
+            log_info("signal", "wrote minidump to '{}' (type=0x{:08x})",
+                    filename, static_cast<unsigned>(written_type));
         }
     } else {
-        log_warning("signal", "failed to write 'minidump.dmp': 0x{:08x}", minidump_error);
+        log_warning("signal", "failed to write '{}': 0x{:08x}", filename, minidump_error);
     }
 }
 
@@ -586,6 +588,48 @@ void launcher::signal::attach() {
     // set a `std::terminate` handler so `std::abort()` is not called by default
     std::set_terminate([]() {
         log_warning("signal", "std::terminate called");
+
+        if (games::gitadora::legacy::enabled() &&
+                InterlockedCompareExchange(&EXCEPTION_HANDLER_ACTIVE, 1, 0) == 0) {
+            // terminate does not raise a Windows exception. Save its own context
+            // before allocating diagnostic strings; this is NOT the throw site.
+            CONTEXT context {};
+            RtlCaptureContext(&context);
+            EXCEPTION_RECORD record {};
+            record.ExceptionCode = 0xe0000001; // diagnostic marker, not an observed SEH code
+            record.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+#ifdef _WIN64
+            record.ExceptionAddress = reinterpret_cast<void *>(context.Rip);
+#else
+            record.ExceptionAddress = reinterpret_cast<void *>(context.Eip);
+#endif
+            EXCEPTION_POINTERS info { &record, &context };
+            write_minidump(&info, "terminate-minidump.dmp");
+            log_warning("signal", "terminate snapshot: synthetic marker 0xe0000001; context is the terminate handler, not the original throw");
+            try {
+                if (const auto exception = std::current_exception()) {
+                    try {
+                        std::rethrow_exception(exception);
+                    } catch (const std::exception &error) {
+                        log_warning("signal", "active C++ exception: {}", error.what());
+                    } catch (...) {
+                        log_warning("signal", "active exception has no compatible std::exception description");
+                    }
+                } else {
+                    log_warning("signal", "no compatible active C++ exception available");
+                }
+                memutils::show_available_memory();
+                void *frames[32] {};
+                const auto count = CaptureStackBackTrace(0, 32, frames, nullptr);
+                for (USHORT i = 0; i < count; ++i) {
+                    log_warning("signal", "terminate frame {}: {}", i, fmt::ptr(frames[i]));
+                    log_exception_module(frames[i]);
+                }
+            } catch (...) {
+                // Diagnostics must never resume gameplay or replace the dump
+                // with a recursive failure when memory is already exhausted.
+            }
+        }
 
         launcher::kill();
     });

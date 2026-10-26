@@ -11,6 +11,7 @@
 #include "external/tinyxml2/tinyxml2.h"
 #include "util/libutils.h"
 #include "util/logging.h"
+#include "util/sysutils.h"
 
 namespace games::gitadora::legacy {
     static std::string selected_identity;
@@ -26,9 +27,12 @@ namespace games::gitadora::legacy {
 #if SPICE64
         log_fatal("gdxg-legacy", "XG1 requires the 32-bit spice.exe");
 #else
-        // Reserve the movie address space while parsing launcher options,
-        // before AVS heaps, renderers, or native game modules are initialized.
+        // No fixed movie reservation: preserve address space for native heaps
+        // and D3D resources. A 32-bit host still benefits from LAA on 64-bit OS.
         movie::prepare();
+        if (!sysutils::is_large_address_aware()) {
+            log_warning("gdxg-legacy", "XG1 is using a 2 GiB address space; use spice_laa.exe on 64-bit Windows for more virtual address space");
+        }
         auto absolute_path = std::filesystem::absolute(std::filesystem::u8path(path));
         std::ifstream input(absolute_path, std::ios::binary);
         if (!input) {

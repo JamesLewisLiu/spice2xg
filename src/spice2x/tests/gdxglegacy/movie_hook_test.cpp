@@ -63,6 +63,24 @@ MEMORY_BASIC_INFORMATION query(void *p) {
   return info;
 }
 
+#ifdef GDXG_MOVIE_TEST_DEMAND
+uint64_t address_space_used() {
+  uint64_t used = 0;
+  uintptr_t cursor = 0;
+  MEMORY_BASIC_INFORMATION info{};
+  while (VirtualQuery(reinterpret_cast<void *>(cursor), &info, sizeof(info)) ==
+         sizeof(info)) {
+    if (info.State != MEM_FREE)
+      used += info.RegionSize;
+    const auto next = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    if (next <= cursor)
+      break;
+    cursor = next;
+  }
+  return used;
+}
+#endif
+
 struct ImageView {
   BYTE *base;
   DWORD size;
@@ -113,7 +131,7 @@ int inspect_image(const char *movie_path, const char *game_path) {
               reinterpret_cast<HMODULE>(movie.base),
               reinterpret_cast<HMODULE>(game.base)),
           "exact game/libmovie pair accepted by production patcher");
-  std::puts("PASS exact game/libmovie images accepted; all five callsites "
+  std::puts("PASS exact game/libmovie images accepted; all six callsites "
             "patched without executing game code");
   VirtualFree(game.base, 0, MEM_RELEASE);
   VirtualFree(movie.base, 0, MEM_RELEASE);
@@ -191,11 +209,15 @@ int main(int argc, char **argv) {
   nt->OptionalHeader.SizeOfImage = 0x52000;
   const DWORD alloc = jp ? 0x4c87 : 0x4c67;
   const DWORD failure = jp ? 0x4d01 : 0x4ce1;
+  constexpr DWORD copy_alloc = 0x2c3b;
   const BYTE after[] = {0x8b, 0xe8, 0x83, 0xc4, 0x04, 0x85, 0xed};
   const BYTE dtor[] = {0x8b, 0x86, 0xec, 0x19, 0,   0,
                        0x85, 0xc0, 0x74, 0x09, 0x50};
   const BYTE prologue[] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c};
   std::memcpy(base + alloc + 5, after, sizeof(after));
+  const BYTE after_copy[] = {0x8b, 0xf8, 0x83, 0xc4, 0x04, 0x3b, 0xfb};
+  base[copy_alloc - 1] = 0x55;
+  std::memcpy(base + copy_alloc + 5, after_copy, sizeof(after_copy));
   std::memcpy(base + 0x2887, dtor, sizeof(dtor));
   std::memcpy(base + 0xa512, prologue, sizeof(prologue));
   const BYTE new_body_prefix[] = {0xff, 0x75, 0x08, 0xb8};
@@ -209,6 +231,7 @@ int main(int argc, char **argv) {
   branch(base + 0xa57c, 0xe9, base + 0xa512);
   branch(base + 0xa5ab, 0xe9, base + 0xa46a);
   branch(base + alloc, 0xe8, base + 0xa57c);
+  branch(base + copy_alloc, 0xe8, base + 0xa57c);
   branch(base + failure, 0xe8, base + 0xa5ab);
   branch(base + 0x2892, 0xe8, base + 0xa5ab);
   auto *game = make_game_fixture(jp);
@@ -226,6 +249,10 @@ int main(int argc, char **argv) {
           ->FileHeader.TimeDateStamp = 0;
     else if (std::strcmp(argv[2], "game-release") == 0)
       game[preload_free] ^= 1;
+    else if (std::strcmp(argv[2], "copy-call") == 0)
+      base[copy_alloc + 1] ^= 1;
+    else if (std::strcmp(argv[2], "copy-context") == 0)
+      base[copy_alloc + 5] ^= 1;
     else
       base[failure] ^= 1;
   }
@@ -235,6 +262,9 @@ int main(int argc, char **argv) {
   const std::vector<BYTE> before(base, base + 0x52000);
   DWORD old;
   require(VirtualProtect(base, 0x52000, PAGE_EXECUTE_READ, &old), "fixture RX");
+#ifdef GDXG_MOVIE_TEST_DEMAND
+  const auto used_before_attach = address_space_used();
+#endif
   const bool installed =
       attach(reinterpret_cast<HMODULE>(base), reinterpret_cast<HMODULE>(game));
   if (corrupt) {
@@ -250,16 +280,20 @@ int main(int argc, char **argv) {
   require(installed && attach(reinterpret_cast<HMODULE>(base),
                               reinterpret_cast<HMODULE>(game)),
           "attach and repeat attach");
+#ifdef GDXG_MOVIE_TEST_DEMAND
+  require(address_space_used() < used_before_attach + 16u * 1024u * 1024u,
+          "production attach reserves no movie arena (including repeat attach)");
+#endif
   require(query(base + alloc).Protect == PAGE_EXECUTE_READ &&
               query(base + 0x2892).Protect == PAGE_EXECUTE_READ &&
               query(game + preload_site).Protect == PAGE_EXECUTE_READ,
           "RX protection restored, including shared callsite page");
   for (size_t i = 0; i < before.size(); ++i) {
     bool displacement = false;
-    for (DWORD site : {alloc, failure, DWORD(0x2892)})
+    for (DWORD site : {alloc, failure, DWORD(0x2892), copy_alloc})
       displacement |= i > site && i < site + 5;
     require(displacement || before[i] == base[i],
-            "only three CALL displacements change");
+            "only four movie CALL displacements change");
   }
   for (size_t i = 0; i < game_before.size(); ++i) {
     bool displacement = false;
@@ -275,8 +309,97 @@ int main(int argc, char **argv) {
   using New = void *(__cdecl *)(size_t);
   using Free = void(__cdecl *)(void *);
   auto allocate = consumer<New>(base + alloc);
+  auto copy_allocate = consumer<New>(base + copy_alloc);
   auto failed_load = consumer<Free>(base + failure);
   auto destroy = consumer<Free>(base + 0x2892);
+#ifdef GDXG_MOVIE_TEST_DEMAND
+  auto preload = consumer<New>(game + preload_site);
+  auto preload_failure = consumer<Free>(game + preload_free);
+  std::array<BYTE *, 3> cache{};
+  const std::array<size_t, 3> cache_sizes = {jp ? 119999875u : 119999874u,
+                                          44999875u, 17249877u};
+  for (size_t i = 0; i < cache.size(); ++i) {
+    cache[i] = static_cast<BYTE *>(preload(cache_sizes[i]));
+    require(cache[i] && preload_native_allocations == 0 &&
+                query(cache[i]).AllocationBase == cache[i],
+            "startup request owns on-demand pages without CRT allocation");
+    std::memset(cache[i], int(0x31 + i), cache_sizes[i]);
+  }
+  for (unsigned iteration = 0; iteration < 3; ++iteration) {
+    std::array<BYTE *, 3> copies{};
+    const auto allocations_before = native_allocations;
+    const auto frees_before = native_frees;
+    for (size_t i = 0; i < copies.size(); ++i) {
+      copies[i] = static_cast<BYTE *>(copy_allocate(cache_sizes[i]));
+      require(copies[i] && native_allocations == allocations_before &&
+                  query(copies[i]).AllocationBase == copies[i],
+              "owned cached copy owns independent pages");
+      std::memcpy(copies[i], cache[i], cache_sizes[i]);
+      require(std::memcmp(copies[i], cache[i], cache_sizes[i]) == 0,
+              "native owned copy matches complete persistent source");
+    }
+    failed_load(copies[0]);
+    destroy(copies[1]);
+    destroy(copies[2]);
+    for (auto *copy : copies)
+      require(query(copy).State == MEM_FREE, "copy destruction returns entire VA");
+    require(native_frees == frees_before && preload_native_frees == 0,
+            "page failure and destructor never reach either native CRT");
+    auto *music = static_cast<BYTE *>(allocate(161999874));
+    auto *theme = static_cast<BYTE *>(allocate(89999876));
+    require(music && theme && music != theme,
+            "historical third-song pair coexists with persistent caches");
+    music[161999873] = 0x61;
+    theme[89999875] = 0x62;
+    destroy(music);
+    destroy(theme);
+    require(query(music).State == MEM_FREE && query(theme).State == MEM_FREE,
+            "third-song destruction returns complete ranges without retained reserve");
+    require(native_allocations == native_frees,
+            "transient pages never reach either native allocator");
+    for (size_t i = 0; i < cache.size(); ++i)
+      require(cache[i][0] == BYTE(0x31 + i) &&
+                  cache[i][cache_sizes[i] - 1] == BYTE(0x31 + i),
+              "persistent startup source survives transient frees");
+  }
+  for (auto *cached : cache) {
+    preload_failure(cached);
+    require(query(cached).State == MEM_FREE, "startup failure returns entire VA range");
+  }
+  require(preload_native_allocations == 0 && preload_native_frees == 0,
+          "startup pages never reach game CRT");
+  // Small requests and exhausted bookkeeping retain module-specific CRT pairing.
+  destroy(allocate(1024));
+  preload_failure(preload(1024));
+  require(native_allocations == 1 && native_frees == 1 &&
+              preload_native_allocations == 1 && preload_native_frees == 1,
+          "small native allocations pair with the correct module's CRT");
+  std::array<void *, 64> live{};
+  for (auto &p : live) p = allocate(1024 * 1024);
+  auto *fallback_movie = allocate(1024 * 1024);
+  auto *fallback_cache = preload(1024 * 1024);
+  require(fallback_movie && fallback_cache && native_allocations == 2 &&
+              preload_native_allocations == 2,
+          "full ownership table falls back to each original allocator");
+  destroy(fallback_movie);
+  preload_failure(fallback_cache);
+  for (auto p : live) {
+    require(p != nullptr, "tracking capacity allocated");
+    destroy(p);
+    require(query(p).State == MEM_FREE, "tracked fallback test pages fully returned");
+  }
+  require(native_allocations == native_frees &&
+              preload_native_allocations == preload_native_frees,
+          "all fallback CRT allocations balanced");
+  const auto before_direct = native_allocations;
+  auto native = reinterpret_cast<New>(base + 0xa57c);
+  auto direct_free = reinterpret_cast<Free>(base + 0xa5ab);
+  direct_free(native(1024));
+  require(native_allocations == before_direct + 1 && native_allocations == native_frees,
+          "unhooked non-video operator new/free remains native");
+  std::puts("PASS production on-demand pages, no fixed reservation, exact x86 CALL consumers, full copies, paired CRT fallback and complete VA release");
+  return 0;
+#else
   auto *a = static_cast<BYTE *>(allocate(119999874));
   auto *b = static_cast<BYTE *>(allocate(114133210));
   require(a && b && a != b && native_allocations == 0,
@@ -320,6 +443,32 @@ int main(int argc, char **argv) {
   }
   require(native_allocations == 2 && preload_native_allocations == 0,
           "startup preload bypasses native CRT");
+  // Exercise the distinct optional memory-input copy call.
+  // The three persistent caches must survive destruction of each owned copy.
+  for (unsigned iteration = 0; iteration < 12; ++iteration) {
+    const auto previous_native = native_allocations;
+    std::array<BYTE *, 3> copies{};
+    for (size_t i = 0; i < copies.size(); ++i) {
+      copies[i] = static_cast<BYTE *>(copy_allocate(cache_sizes[i]));
+      require(copies[i] && native_allocations == previous_native,
+              "cached video copies use reservations");
+      std::memcpy(copies[i], cache[i], cache_sizes[i]);
+      require(copies[i][0] == BYTE(10 + i) &&
+                  copies[i][cache_sizes[i] - 1] == BYTE(20 + i),
+              "owned cached copies preserve complete source boundaries");
+    }
+    for (auto *copy : copies)
+      destroy(copy);
+    for (auto *copy : copies)
+      require(query(copy).State == MEM_RESERVE,
+              "cached copies decommit through the movie pool");
+    require(native_frees == 2,
+            "cached copies never reach the native CRT free");
+    for (size_t i = 0; i < cache.size(); ++i)
+      require(cache[i][0] == BYTE(10 + i) &&
+                  cache[i][cache_sizes[i] - 1] == BYTE(20 + i),
+              "destroying copies preserves persistent caches");
+  }
   for (unsigned iteration = 0; iteration < 20; ++iteration) {
     auto *video = static_cast<BYTE *>(allocate(114133210));
     require(
@@ -379,4 +528,5 @@ int main(int argc, char **argv) {
     preload_failure(cached);
   std::puts("PASS x86 JP/CN CALL ABI, native fallback, both frees, source "
             "replacement, RX protection");
+#endif
 }
