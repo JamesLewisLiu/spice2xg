@@ -453,6 +453,7 @@ namespace avs {
         void load_dll();
         void boot();
         void attach_legacy_storage_hooks();
+        bool is_legacy_storage_device(const char *device);
         void copy_defaults();
         void shutdown();
 

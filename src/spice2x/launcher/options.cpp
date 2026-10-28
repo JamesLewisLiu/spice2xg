@@ -1536,15 +1536,13 @@ static const std::vector<OptionDefinition> OPTION_DEFINITIONS = std::invoke([]()
         .category = "Advanced Game Options",
     };
     c[launcher::Options::GitaDoraLegacyIdentity] = {
-        .title = "XG1 / XG1CN Configuration",
+        .title = "XG1 / XG1CN Instrument",
         .name = "gdxg",
-        .desc = "Use the native 32-bit XG1 host with a standard ea3-config.xml (<ea3><soft>) or an older ea3-ident XML. Destination J/C selects Japan/China; J33/J32 selects GF/DM. Missing datecodes are read from the original libsystem.dll. Must be passed via the command line.",
+        .desc = "Use GF or DM to launch XG1. Region and date are detected from the original modules. Settings and saves default to DEV/GF or DEV/DM. Must be passed via the command line. Older identity XML paths remain supported for compatibility.",
         .type = OptionType::Text,
         .game_name = "GitaDora",
         .category = "Advanced Game Options",
         .disabled = true,
-        .picker = OptionPickerType::FilePath,
-        .file_extension = "XML",
     };
     c[launcher::Options::PathToModules] = {
         .title = "Modules Folder Override",

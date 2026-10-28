@@ -16,6 +16,7 @@
 #include "external/robin_hood.h"
 #include "util/time.h"
 #include "util/utils.h"
+#include "cfg/configurator.h"
 
 #include "piuio.h"
 #include "touch.h"
@@ -317,6 +318,10 @@ void rawinput::RawInputManager::devices_scan_rawinput(RAWINPUTDEVICELIST *device
             new_device.type = HID;
             HIDDriver hid_driver = HIDDriver::Default;
             HIDD_ATTRIBUTES hid_attributes {};
+            hid_attributes.Size = sizeof(hid_attributes);
+            hid_attributes.VendorID = static_cast<USHORT>(rawinput_device_info.hid.dwVendorId);
+            hid_attributes.ProductID = static_cast<USHORT>(rawinput_device_info.hid.dwProductId);
+            hid_attributes.VersionNumber = static_cast<USHORT>(rawinput_device_info.hid.dwVersionNumber);
 
             // get preparsed information
             UINT preparsed_size = 0;
@@ -386,7 +391,12 @@ void rawinput::RawInputManager::devices_scan_rawinput(RAWINPUTDEVICELIST *device
                     nullptr,
                     OPEN_EXISTING,
                     0, nullptr);
-            if (hid_handle != INVALID_HANDLE_VALUE) {
+            // Optional USB string requests can each wait five seconds on some
+            // controllers. spicecfg already has the registry device description;
+            // its bindings use the unchanged device path, not these labels.
+            const bool need_product_name = !cfg::CONFIGURATOR_STANDALONE ||
+                    (hid_vid == 0x1CCF && hid_pid == 0x8048); // DAO analog-range erratum below
+            if (hid_handle != INVALID_HANDLE_VALUE && need_product_name) {
 
                 // check manufacturer string
                 std::string man_ws;
@@ -566,7 +576,7 @@ void rawinput::RawInputManager::devices_scan_rawinput(RAWINPUTDEVICELIST *device
                         }
 
                         // lookup string
-                        if (string_index > 0 && HidD_GetIndexedString(
+                        if (!cfg::CONFIGURATOR_STANDALONE && string_index > 0 && HidD_GetIndexedString(
                             hid_handle,
                             string_index,
                             reinterpret_cast<void*>(custom_name),
@@ -739,7 +749,7 @@ void rawinput::RawInputManager::devices_scan_rawinput(RAWINPUTDEVICELIST *device
                             }
 
                             // lookup string
-                            if (string_index > 0 && HidD_GetIndexedString(
+                            if (!cfg::CONFIGURATOR_STANDALONE && string_index > 0 && HidD_GetIndexedString(
                                     hid_handle,
                                     string_index,
                                     reinterpret_cast<void *>(custom_name),
@@ -780,7 +790,7 @@ void rawinput::RawInputManager::devices_scan_rawinput(RAWINPUTDEVICELIST *device
                         }
 
                         // lookup string
-                        if (string_index > 0 && HidD_GetIndexedString(
+                        if (!cfg::CONFIGURATOR_STANDALONE && string_index > 0 && HidD_GetIndexedString(
                                 hid_handle,
                                 string_index,
                                 reinterpret_cast<void *>(custom_name),
@@ -1254,7 +1264,8 @@ std::string rawinput::RawInputManager::rawinput_get_device_description(const raw
                         0, nullptr);
                 if (hid_handle != INVALID_HANDLE_VALUE) {
                     wchar_t product_buffer[126] {};
-                    if (HidD_GetProductString(hid_handle, product_buffer, sizeof(product_buffer))) {
+                    if (!cfg::CONFIGURATOR_STANDALONE &&
+                            HidD_GetProductString(hid_handle, product_buffer, sizeof(product_buffer))) {
                         auto const product_str = wchar_to_u8(product_buffer);
                         if (!product_str.empty() && device_description != product_str) {
                             device_description += " - " + product_str;

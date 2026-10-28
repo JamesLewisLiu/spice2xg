@@ -1,10 +1,13 @@
 #include "legacy.h"
 #include "legacy_movie.h"
 #include "legacy_profile.h"
+#include "legacy_native.h"
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <algorithm>
+#include <cctype>
 #include "avs/game.h"
 #include "launcher/launcher.h"
 #include "launcher/options.h"
@@ -17,11 +20,20 @@ namespace games::gitadora::legacy {
     static std::string selected_identity;
     static std::string selected_ea3_config;
     static bool chinese = false;
+    static std::filesystem::path selected_directory;
 
     bool enabled() { return !selected_identity.empty(); }
     bool is_cn() { return enabled() && chinese; }
     const std::string &identity_path() { return selected_identity; }
     const std::string &ea3_config_path() { return selected_ea3_config; }
+    const std::filesystem::path &mode_directory() { return selected_directory; }
+
+    bool detect_native() {
+        Identity identity;
+        return std::filesystem::exists(MODULE_PATH / "boot.dll") &&
+                std::filesystem::exists(MODULE_PATH / "libgftools.dll") &&
+                inspect_native_identity(MODULE_PATH / "libsystem.dll", identity);
+    }
 
     void configure(const std::string &path, const std::string &bootstrap) {
 #if SPICE64
@@ -33,21 +45,32 @@ namespace games::gitadora::legacy {
         if (!sysutils::is_large_address_aware()) {
             log_warning("gdxg-legacy", "XG1 is using a 2 GiB address space; use spice_laa.exe on 64-bit Windows for more virtual address space");
         }
-        auto absolute_path = std::filesystem::absolute(std::filesystem::u8path(path));
-        std::ifstream input(absolute_path, std::ios::binary);
-        if (!input) {
-            log_fatal("gdxg-legacy", "cannot read identity: {}", path);
-        }
-        const std::string xml((std::istreambuf_iterator<char>(input)), {});
         Identity identity;
-        std::string error;
-        if (!parse_identity(xml, identity, error)) {
-            log_fatal("gdxg-legacy", "{}: {}", path, error);
-        }
-        tinyxml2::XMLDocument document;
-        document.Parse(xml.c_str(), xml.size());
-        if (document.FirstChildElement("ea3")) {
-            selected_ea3_config = absolute_path.string();
+        std::string mode = path;
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char ch) { return std::toupper(ch); });
+        if (mode == "GF" || mode == "DM") {
+            if (!inspect_native_identity(MODULE_PATH / "libsystem.dll", identity)) {
+                log_fatal("gdxg-legacy", "cannot identify XG1 region/date from libsystem.dll");
+            }
+            identity.model = mode == "DM" ? "J32" : "J33";
+            selected_identity = mode;
+        } else {
+            auto absolute_path = std::filesystem::absolute(std::filesystem::u8path(path));
+            std::ifstream input(absolute_path, std::ios::binary);
+            if (!input) {
+                log_fatal("gdxg-legacy", "cannot read identity: {}", path);
+            }
+            const std::string xml((std::istreambuf_iterator<char>(input)), {});
+            std::string error;
+            if (!parse_identity(xml, identity, error)) {
+                log_fatal("gdxg-legacy", "{}: {}", path, error);
+            }
+            tinyxml2::XMLDocument document;
+            document.Parse(xml.c_str(), xml.size());
+            if (document.FirstChildElement("ea3")) {
+                selected_ea3_config = absolute_path.string();
+            }
+            selected_identity = absolute_path.string();
         }
         if (!bootstrap.empty() || std::filesystem::exists("prop/bootstrap.xml")) {
             auto release = launcher::detect_bootstrap_release_code(bootstrap);
@@ -62,7 +85,10 @@ namespace games::gitadora::legacy {
         std::strcpy(avs::game::REV, identity.rev.c_str());
         std::strcpy(avs::game::EXT, identity.ext.c_str());
         chinese = identity.dest == "C";
-        selected_identity = absolute_path.string();
+        selected_directory = MODULE_PATH / "DEV" / (identity.model == "J32" ? "DM" : "GF");
+        if (selected_ea3_config.empty() && std::filesystem::exists(selected_directory / "ea3-config.xml")) {
+            selected_ea3_config = (selected_directory / "ea3-config.xml").string();
+        }
         log_info("gdxg-legacy", "selected {} from {}", avs::game::get_identifier(), selected_identity);
 #endif
     }

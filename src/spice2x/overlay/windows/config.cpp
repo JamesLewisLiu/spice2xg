@@ -180,11 +180,15 @@ namespace overlay::windows {
             for (size_t i = 0; i < games_names.size(); i++) {
                 if (games_names[i] == eamuse_get_game()) {
                     this->games_selected = i;
+                    this->games_selected_name = games_names[i];
                 }
             }
         }
 
         // add games to the config and window
+        if (!this->games_selected_name.empty()) {
+            log_info("config", "selected game: {}", this->games_selected_name);
+        }
         auto &config = ::Config::getInstance();
         for (auto &game : games_list) {
             config.addGame(game, /* save */ false);
