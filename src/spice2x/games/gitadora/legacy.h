@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <filesystem>
 
 namespace games::gitadora::legacy {
     // Selected explicitly before per-game configuration and input discovery.
@@ -11,6 +12,8 @@ namespace games::gitadora::legacy {
     // Called after AVS boot, before Patch Manager and game DLL load.
     void resolve_datecode();
     const std::string &ea3_config_path();
+    const std::filesystem::path &mode_directory();
+    bool detect_native();
 
     // The native host replaces gdxg.exe, not any original game DLL.
     void load();

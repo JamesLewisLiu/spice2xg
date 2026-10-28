@@ -344,7 +344,8 @@ namespace avs {
             if (CFG_PATH.empty()) {
                 if (!games::gitadora::legacy::ea3_config_path().empty()) {
                     CFG_PATH = games::gitadora::legacy::ea3_config_path();
-                } else {
+                } else if (games::gitadora::legacy::identity_path() != "GF" &&
+                        games::gitadora::legacy::identity_path() != "DM") {
                     for (auto candidate : {"prop/ea3-config.xml", "prop/ea3-cfg.xml", "prop/eamuse-config.xml",
                             "prop/config.xml"}) {
                         if (fileutils::file_exists(candidate)) {

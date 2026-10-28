@@ -20,6 +20,7 @@
 #define ALLOC_CONSOLE 0
 
 int spicecfg_run(const std::vector<std::string> &sextet_devices) {
+    cfg::CONFIGURATOR_STANDALONE = true;
 
     // initialize config
     auto &config = Config::getInstance();

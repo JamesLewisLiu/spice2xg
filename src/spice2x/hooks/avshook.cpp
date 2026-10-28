@@ -268,6 +268,7 @@ static int avs_fs_mount(const char *mountpoint, const char *fsroot, const char *
 
     // remap drive mounts to `dev/vfs/drive_x` where x is the drive letter
     if (!config::DISABLE_VFS_DRIVE_REDIRECTION &&
+        !avs::core::is_legacy_storage_device(fsroot) &&
         (_strnicmp(fsroot, "d:", 2) == 0 ||
         _strnicmp(fsroot, "e:", 2) == 0 ||
         _strnicmp(fsroot, "f:", 2) == 0) &&

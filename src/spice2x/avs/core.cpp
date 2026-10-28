@@ -10,6 +10,7 @@
 #include "external/robin_hood.h"
 #include "games/popn/popn.h"
 #include "games/gitadora/legacy.h"
+#include "games/gitadora/legacy_storage.h"
 #include "launcher/logger.h"
 #include "launcher/signal.h"
 #include "util/deferlog.h"
@@ -1908,72 +1909,49 @@ namespace avs {
         }
 
 
-        static std::string legacy_storage_paths[6];
+        static games::gitadora::legacy::StorageLayout legacy_storage;
         static decltype(&CreateDirectoryA) legacy_create_directory;
         static AVS_FS_MOUNT_T legacy_fs_mount;
 
-        static void prepare_legacy_storage() {
-            static constexpr const char *folders[] = {
-                "CONF", "CONF/NVRAM", "CONF/RAW", "TMP", "CACHE", "CACHE/PROXY"
-            };
-            auto base = std::filesystem::current_path();
-            for (size_t i = 0; i < std::size(folders); ++i) {
-                auto path = base / folders[i];
+        bool is_legacy_storage_device(const char *device) {
+            return games::gitadora::legacy::enabled() && legacy_storage.contains_device(device);
+        }
+
+        static void prepare_legacy_storage(property_ptr config) {
+            legacy_storage.configure(games::gitadora::legacy::mode_directory(), MODULE_PATH.parent_path(),
+                    [&](const char *key) {
+                        char value[4096] {};
+                        if (property_search(config, nullptr, key)) {
+                            property_node_refer(config, nullptr, key, NODE_TYPE_str, value, sizeof(value));
+                        }
+                        return std::string(value);
+                    });
+            for (const auto &device : legacy_storage.paths) {
+                const auto path = std::filesystem::u8path(device);
                 std::error_code error;
                 std::filesystem::create_directories(path, error);
                 if (error || !std::filesystem::is_directory(path)) {
-                    log_fatal("avs-core", "cannot create legacy storage directory {}: {}", path.string(), error.message());
+                    log_fatal("avs-core", "cannot create legacy storage directory {}: {}", device, error.message());
                 }
-                legacy_storage_paths[i] = path.string();
+                log_info("avs-core", "XG1 storage: {}", device);
             }
-        }
-
-        static const char *legacy_storage_redirect(const char *path) {
-            if (!path) {
-                return path;
-            }
-            std::string normalized(path);
-            std::replace(normalized.begin(), normalized.end(), '\\', '/');
-            if (!normalized.empty() && normalized.back() == '/') {
-                normalized.pop_back();
-            }
-            const char *relative = normalized.c_str();
-            bool conf = false;
-            bool cache = false;
-            if (_strnicmp(relative, "E:/", 3) == 0) {
-                relative += 3;
-                conf = true;
-            } else if (_strnicmp(relative, "F:/", 3) == 0) {
-                relative += 3;
-                cache = true;
-            } else if (strncmp(relative, "./", 2) == 0) {
-                relative += 2;
-                conf = cache = true;
-            } else {
-                return path;
-            }
-            static constexpr const char *folders[] = {
-                "CONF", "CONF/NVRAM", "CONF/RAW", "TMP", "CACHE", "CACHE/PROXY"
-            };
-            for (size_t i = 0; i < std::size(folders); ++i) {
-                if ((i < 3 ? conf : cache) && _stricmp(relative, folders[i]) == 0) {
-                    return legacy_storage_paths[i].c_str();
-                }
-            }
-            return path;
         }
 
         static BOOL WINAPI legacy_CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES attributes) {
             // Preserve the original result, attributes and GetLastError.
-            return legacy_create_directory(legacy_storage_redirect(path), attributes);
+            return legacy_create_directory(legacy_storage.redirect(path), attributes);
         }
 
         static int legacy_mount(const char *mountpoint, const char *device, const char *fstype, void *data) {
             if (mountpoint && (strcmp(mountpoint, "/tmp/") == 0 || strcmp(mountpoint, "/tmp") == 0)) {
-                device = legacy_storage_paths[3].c_str();
+                device = legacy_storage.paths[3].c_str();
             } else if (mountpoint && (strcmp(mountpoint, "/proxy/") == 0 || strcmp(mountpoint, "/proxy") == 0)) {
-                device = legacy_storage_paths[5].c_str();
+                device = legacy_storage.paths[5].c_str();
             }
+            device = legacy_storage.redirect(device);
+            // These are resolved host paths, including custom AVS devices on
+            // E:/F:. Do not send them through arcade drive redirection again.
+            if (is_legacy_storage_device(device)) return avs_fs_mount(mountpoint, device, fstype, data);
             return legacy_fs_mount(mountpoint, device, fstype, data);
         }
 
@@ -1998,10 +1976,11 @@ namespace avs {
         }
 
         static property_ptr legacy_config() {
-            prepare_legacy_storage();
             property_ptr config;
-            if (CFG_PATH.empty() && fileutils::file_exists("prop/avs-config.xml")) {
-                CFG_PATH = "prop/avs-config.xml";
+            if (CFG_PATH.empty()) {
+                const auto mode_config = games::gitadora::legacy::mode_directory() / "avs-config.xml";
+                if (fileutils::file_exists(mode_config)) CFG_PATH = mode_config.string();
+                else if (fileutils::file_exists("prop/avs-config.xml")) CFG_PATH = "prop/avs-config.xml";
             }
             if (!CFG_PATH.empty()) {
                 log_info("avs-core", "booting legacy game (using {})", CFG_PATH);
@@ -2042,11 +2021,15 @@ namespace avs {
                     log_fatal("avs-core", "cannot create legacy AVS root device");
                 }
             }
-            // Also contain explicitly configured save devices; never inherit the original E:/CONF.
+            // Resolve user configuration before creating anything. Defaults are
+            // isolated per instrument; explicit AVS devices remain authoritative.
+            prepare_legacy_storage(config);
+            property_search_remove_safe(config, nullptr, "/config/fs/root/device");
+            property_node_create(config, nullptr, NODE_TYPE_str, "/config/fs/root/device", legacy_storage.asset_root.c_str());
             property_search_remove_safe(config, nullptr, "/config/fs/nvram/device");
             property_search_remove_safe(config, nullptr, "/config/fs/raw/device");
-            property_node_create(config, nullptr, NODE_TYPE_str, "/config/fs/nvram/device", legacy_storage_paths[1].c_str());
-            property_node_create(config, nullptr, NODE_TYPE_str, "/config/fs/raw/device", legacy_storage_paths[2].c_str());
+            property_node_create(config, nullptr, NODE_TYPE_str, "/config/fs/nvram/device", legacy_storage.paths[1].c_str());
+            property_node_create(config, nullptr, NODE_TYPE_str, "/config/fs/raw/device", legacy_storage.paths[2].c_str());
             return config;
         }
 

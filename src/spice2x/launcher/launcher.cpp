@@ -279,6 +279,16 @@ int main_implementation(int argc, char *argv[]) {
     // parse arguments
     LAUNCHER_OPTIONS = launcher::parse_options(argc, argv);
 
+    // Identify legacy modules without executing them, including in spicecfg.
+    const auto &early_modules = LAUNCHER_OPTIONS->at(launcher::Options::PathToModules);
+    auto &legacy_mode = LAUNCHER_OPTIONS->at(launcher::Options::GitaDoraLegacyIdentity);
+    if (early_modules.is_active() && (legacy_mode.is_active() || cfg::CONFIGURATOR_STANDALONE)) {
+        MODULE_PATH = std::filesystem::absolute(early_modules.value_text());
+    }
+    if (cfg::CONFIGURATOR_STANDALONE && !legacy_mode.is_active() && games::gitadora::legacy::detect_native()) {
+        legacy_mode.value = "GF";
+    }
+
     // command line override (must be done before merging options with cfg)
     if (LAUNCHER_OPTIONS->at(launcher::Options::OptionConflictResolution).value_bool()) {
         launcher::USE_CMD_OVERRIDE = true;
@@ -296,6 +306,11 @@ int main_implementation(int argc, char *argv[]) {
     if (legacy_identity.is_active()) {
         games::gitadora::legacy::configure(legacy_identity.value_text(),
                 LAUNCHER_OPTIONS->at(launcher::Options::PathToBootstrap).value);
+        if (!cfg_path.is_active()) {
+            const auto &directory = games::gitadora::legacy::mode_directory();
+            std::filesystem::create_directories(directory);
+            CONFIG_PATH_OVERRIDE = (directory / "spicetools.xml").string();
+        }
         eamuse_autodetect_game();
     } else {
         options_version = launcher::detect_gameversion(

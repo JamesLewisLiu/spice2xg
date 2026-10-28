@@ -396,7 +396,9 @@ namespace games::gitadora::legacy {
         host.quit = false;
         host.timer_initialized = timeBeginPeriod(1) == TIMERR_NOERROR;
         native.debug_memory_initialize();
-        host.command_line = "gdxg.exe -I \"" + identity_path() + "\"";
+        // Identity is published through AVS /env/profile/mcode, as consumed by
+        // native libsystem. No synthetic identity file is needed.
+        host.command_line = "gdxg.exe";
         host.command_line += is_drum() ? " -d" : " -g";
         native.gdbase_cmdline(host.command_line.data());
         native.debug_cmdline(host.command_line.data());
