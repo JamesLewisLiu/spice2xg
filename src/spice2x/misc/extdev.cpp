@@ -132,14 +132,19 @@ static int __cdecl cardunit_card_read2(int unit, void *card, int *status) {
 
         // copy card, return success
         memcpy(card, EXTDEV_CARD[unit], 8);
-        *status = is_card_uid_felica(EXTDEV_CARD[unit]) ? 2 : 1;
+        // The legacy two-argument API does not request a card-type status.
+        if (status) {
+            *status = is_card_uid_felica(EXTDEV_CARD[unit]) ? 2 : 1;
+        }
         return 0;
 
     } else {
 
         // tried to read card with no card inserted, return fail
         memset(card, 0, 8);
-        *status = 0;
+        if (status) {
+            *status = 0;
+        }
         return 1;
     }
 }
