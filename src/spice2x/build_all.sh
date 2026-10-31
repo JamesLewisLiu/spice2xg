@@ -70,7 +70,7 @@ DIST_NAME_EXTRAS="spice2x-$(date +%y)-$(date +%m)-$(date +%d)-full.zip"
 DIST_COMMENT=${DIST_NAME}$'\n'"$GIT_BRANCH - $GIT_HEAD"$'\nThank you for playing.'
 TARGETS_32="spicetools_stubs_kbt spicetools_stubs_kld spicetools_cfg spicetools_cfg_linux spicetools_spice spicetools_spice_laa spicetools_spice_linux spicetools_stubs_cpusbxpkm spicetools_sdk_sample_v0_flat_c_32"
 TARGETS_64="spicetools_stubs_kbt64 spicetools_stubs_kld64 spicetools_stubs_nvEncodeAPI64 spicetools_stubs_nvcuvid spicetools_stubs_nvcuda spicetools_spice64 spicetools_spice64_linux spicetools_sdk_sample_v0_flat_c_64 spicetools_sdk_sample_v0_cpp_64"
-TARGETS_XP32="spicetools_cfg spicetools_spice"
+TARGETS_XP32="spicetools_cfg spicetools_spice spicetools_spice_laa"
 TARGETS_XP64="spicetools_spice64"
 
 # determine build type
@@ -244,7 +244,8 @@ then
 		then
 			windows_dll_compat_checker -s PREMADE/konami_winxp_jubeat_i686.ini \
 				${BUILDDIR_WINXP_32}/spicetools/spicecfg.exe \
-				${BUILDDIR_WINXP_32}/spicetools/32/spice.exe
+				${BUILDDIR_WINXP_32}/spicetools/32/spice.exe \
+				${BUILDDIR_WINXP_32}/spicetools/32/spice_laa.exe
 		fi
 	fi
 fi
@@ -339,7 +340,7 @@ else
 	if ((BUILD_XP_32 > 0))
 	then
 		cp ${BUILDDIR_WINXP_32}/spicetools/spicecfg.exe ${OUTDIR_EXTRAS}/winxp 2>/dev/null
-		cp ${BUILDDIR_WINXP_32}/spicetools/32/spice.exe ${OUTDIR_EXTRAS}/winxp 2>/dev/null
+		cp ${BUILDDIR_WINXP_32}/spicetools/32/spice_laa.exe ${OUTDIR_EXTRAS}/winxp/spice.exe 2>/dev/null
 	fi
 	if ((BUILD_XP_64 > 0))
 	then
