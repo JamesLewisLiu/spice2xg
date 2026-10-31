@@ -1686,6 +1686,11 @@ int main_implementation(int argc, char *argv[]) {
             log_info("launcher", "SpiceTools Bootstrap (x32 - Large Address Aware) (spice2x)");
         } else {
             log_info("launcher", "SpiceTools Bootstrap (x32) (spice2x)");
+            if (games::gitadora::legacy::enabled()) {
+                log_warning("gdxg-legacy", "XG1 is using the non-LAA launcher with a 2 GiB address space; "
+                    "use spice_laa.exe from the same build to avoid video-cache allocation failures. "
+                    "If your start script runs spice.exe, replace it with the LAA binary.");
+            }
         }
     #endif
 #endif
